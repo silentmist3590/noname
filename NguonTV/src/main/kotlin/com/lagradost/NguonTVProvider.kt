@@ -24,9 +24,11 @@ class NguonTVProvider : MainAPI() {
     private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     private val headers = mapOf(
         "User-Agent" to ua,
-        "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
         "Origin" to mainUrl,
-        "Referer" to "$mainUrl/"
+        "Referer" to "$mainUrl/",
+        "X-Requested-With" to "XMLHttpRequest"
     )
 
     private data class FilmItem(val title: String, val url: String, val poster: String?)
@@ -51,9 +53,10 @@ class NguonTVProvider : MainAPI() {
         if (page > 1) return newHomePageResponse(emptyList(), hasNext = false)
 
         val doc = app.get("$mainUrl/", headers = headers).document
-        val items = doc.select("div.item-file-index").mapNotNull { item ->
-            val link = item.selectFirst(".info-item-file-index h3 a[href]")
-                ?: item.selectFirst(".img-item-file-index a[href]")
+        val items = doc.select(".categories-file-index .item-file-index, div.item-file-index").mapNotNull { item ->
+            val link = item.selectFirst(".info-item-file-index h3 a[href*='-f']")
+                ?: item.selectFirst(".img-item-file-index a[href*='-f']")
+                ?: item.selectFirst("a[href*='-f']")
                 ?: return@mapNotNull null
 
             val href = link.attr("abs:href").ifBlank { absolute(link.attr("href")) ?: "" }
@@ -83,22 +86,73 @@ class NguonTVProvider : MainAPI() {
     }
 
     private suspend fun searchItems(query: String): List<FilmItem> {
+        if (query.isBlank()) return emptyList()
+
         val response = app.post(
             "$mainUrl/tim-kiem-a.html",
-            data = mapOf("q" to query, "t" to "film"),
-            headers = headers
+            data = mapOf("q" to query.trim(), "t" to "film"),
+            headers = headers + mapOf(
+                "Accept" to "application/json, text/javascript, */*; q=0.01",
+                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"
+            )
         ).text
-        val json = JSONObject(response)
-        val html = json.optString("html", "")
+
+        // Endpoint normally returns {"code":200,"html":"..."}.
+        // Fall back to parsing raw HTML if a proxy/server returns the fragment directly.
+        val html = try {
+            val json = JSONObject(response)
+            if (json.optInt("code", 200) != 200) return emptyList()
+            json.optString("html", "")
+        } catch (_: Exception) {
+            response
+        }
         if (html.isBlank()) return emptyList()
-        val doc = Jsoup.parse(html, mainUrl)
-        return doc.select(".result-item a[href], a[href*='-f']").mapNotNull { a ->
-            val href = a.attr("abs:href").ifBlank { absolute(a.attr("href")) ?: "" }
-            if (!href.contains(Regex("-f\\d+\\.html"))) return@mapNotNull null
-            val title = a.attr("title").ifBlank { a.text().trim() }
+
+        val doc = Jsoup.parse(html, "$mainUrl/")
+        val items = doc.select("li.result-item").mapNotNull { item ->
+            val link = item.selectFirst("a[href*='-f'], a[href]")
+                ?: return@mapNotNull null
+            val href = link.attr("abs:href").ifBlank {
+                absolute(link.attr("href")) ?: ""
+            }
+            if (href.isBlank() ||
+                !Regex("-f\\d+\\.html", RegexOption.IGNORE_CASE).containsMatchIn(href)
+            ) return@mapNotNull null
+
+            val title = link.attr("title").ifBlank {
+                item.selectFirst(".result-item-title")?.text()?.trim()
+                    ?: link.text().trim()
+            }
             if (title.isBlank()) return@mapNotNull null
-            val img = a.selectFirst("img")
-            val poster = absolute(img?.let { it.attr("data-src").ifBlank { it.attr("src") } })
+
+            val image = item.selectFirst("img")
+            val poster = image?.let {
+                val src = it.attr("data-src").ifBlank {
+                    it.attr("data-original").ifBlank { it.attr("src") }
+                }
+                absolute(src)
+            }
+            FilmItem(title, href, poster)
+        }.distinctBy { it.url }
+
+        if (items.isNotEmpty()) return items
+
+        // Secondary selector for alternate markup.
+        return doc.select("a[href*='-f']").mapNotNull { link ->
+            val href = link.attr("abs:href").ifBlank {
+                absolute(link.attr("href")) ?: ""
+            }
+            if (href.isBlank() ||
+                !Regex("-f\\d+\\.html", RegexOption.IGNORE_CASE).containsMatchIn(href)
+            ) return@mapNotNull null
+            val title = link.attr("title").ifBlank { link.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
+            val image = link.selectFirst("img")
+            val poster = image?.let {
+                absolute(it.attr("data-src").ifBlank {
+                    it.attr("data-original").ifBlank { it.attr("src") }
+                })
+            }
             FilmItem(title, href, poster)
         }.distinctBy { it.url }
     }
