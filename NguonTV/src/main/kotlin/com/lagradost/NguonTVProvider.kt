@@ -2,6 +2,8 @@ package com.nguontv
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.json.JSONObject
@@ -101,7 +103,11 @@ class NguonTVProvider : MainAPI() {
         if (isSeries && episodeLinks.isNotEmpty()) {
             val episodes = episodeLinks.map { (num, href, label) ->
                 // Preserve both the public detail page (for its dynamic key) and the episode POST URL.
-                Episode("$pageUrl||$href", name = label, season = 1, episode = num)
+                newEpisode("$pageUrl||$href") {
+                    name = label
+                    season = 1
+                    episode = num
+                }
             }
             return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
@@ -183,7 +189,13 @@ class NguonTVProvider : MainAPI() {
                     val embedHtml = app.get(embed, headers = headers + ("Referer" to playerPage)).text
                     val hls = findHls(embedHtml)
                     if (hls != null) {
-                        callback(ExtractorLink(name, "$name HLS", hls, embed, Qualities.Unknown, true))
+                        callback(
+                            newExtractorLink(name, "$name HLS", hls, ExtractorLinkType.M3U8) {
+                                referer = embed
+                                this.headers = headers
+                                quality = Qualities.Unknown.value
+                            }
+                        )
                         return true
                     }
                     // Let CloudStream's common extractors handle the embed if the playlist is assembled by JavaScript.
@@ -196,7 +208,13 @@ class NguonTVProvider : MainAPI() {
             if (!iframe.isNullOrBlank()) {
                 val iframeHtml = app.get(iframe, headers = headers + ("Referer" to playerPage)).text
                 val hls = findHls(iframeHtml)
-                if (hls != null) callback(ExtractorLink(name, "$name HLS", hls, iframe, Qualities.Unknown, true))
+                if (hls != null) callback(
+                    newExtractorLink(name, "$name HLS", hls, ExtractorLinkType.M3U8) {
+                        referer = iframe
+                        this.headers = headers
+                        quality = Qualities.Unknown.value
+                    }
+                )
                 else loadExtractor(iframe, playerPage, subtitleCallback, callback)
                 return true
             }
