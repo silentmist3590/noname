@@ -109,11 +109,18 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v4 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v5 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
-        val homePage = if (responses.isEmpty()) emptyList() else
-            listOf(HomePageList("Phim Hot / Phim mới", responses))
+        val homePage = mutableListOf<HomePageList>()
+        if (responses.isNotEmpty()) homePage.add(HomePageList("Phim Hot / Phim mới", responses))
+        // TẠM THỜI: thẻ chẩn đoán các bước lấy link phát
+        homePage.add(
+            HomePageList(
+                "DEBUG",
+                listOf(newMovieSearchResponse("Chẩn đoán phát v5", "$mainUrl/__debug", TvType.Movie))
+            )
+        )
         return newHomePageResponse(homePage, hasNext = false)
     }
 
@@ -192,31 +199,63 @@ class NguonTVProvider : MainAPI() {
     private fun episodeNumber(url: String): Int? = Regex("-(\\d+)-e\\d+\\.html", RegexOption.IGNORE_CASE)
         .find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()
 
-    // Trang chẩn đoán: hiện nội dung thật mà app nhận được từ site (trong phần mô tả)
+    // Trang chẩn đoán: chạy từng bước lấy link phát trên một phim thật và in kết quả
     private suspend fun debugLoad(): LoadResponse {
         fun esc(t: String) = t.replace("<", "‹").replace(">", "›").replace("\n", "<br>")
+        fun head(t: String?, n: Int) = (t ?: "null").replace(Regex("\\s+"), " ").take(n)
         val sb = StringBuilder()
         try {
-            val r = fetch("$mainUrl/")
-            val body = r.text
-            sb.append("[1] GET / code=${r.code} len=${body.length}\n")
-            sb.append("url=${r.url}\n")
-            sb.append("cookies=${r.cookies.keys.joinToString(",")}\n")
-            sb.append("headers=${r.headers.names().joinToString(",")}\n")
-            sb.append("BODY:\n").append(body.take(2500)).append("\n\n")
+            val home = fetch("$mainUrl/")
+            val filmUrl = home.document.select("a[href]").map { it.attr("abs:href") }
+                .firstOrNull { Regex("-f\\d+\\.html", RegexOption.IGNORE_CASE).containsMatchIn(it) && !it.contains("/xem-phim/") }
+            sb.append("[1] trang chủ code=${home.code} len=${home.text.length}\nphim thử=$filmUrl\n\n")
+            if (filmUrl == null) throw Exception("không có phim để thử")
+
+            val page = fetch(filmUrl)
+            val pageDoc = page.document
+            val epLinks = pageDoc.select("a[href]").mapNotNull { a ->
+                val href = a.attr("abs:href")
+                if (episodeNumber(href) != null) href else null
+            }.distinct()
+            val iframes = pageDoc.select("iframe[src]").map { it.attr("abs:src") }
+            sb.append("[2] trang phim code=${page.code} len=${page.text.length} tập=${epLinks.size} iframe=${iframes.joinToString(" ; ").take(150)}\n")
+            val playerPage = epLinks.firstOrNull() ?: toPlayerUrl(filmUrl)
+            sb.append("playerPage=$playerPage\n")
+
+            val state = extractPlayerState(pageDoc, filmUrl)
+            sb.append("[3] state=${state?.let { "fid=${it.fid} time=${it.time} key=${it.key.take(30)}" } ?: "NULL"}\n")
+            if (state == null) {
+                val src = pageDoc.html()
+                val lines = src.lines().map { it.trim() }
+                    .filter { Regex("(?i)\\bkey\\b|film_key|fid|filmId").containsMatchIn(it) }
+                    .take(8).map { it.take(160) }
+                sb.append("dòng có key/fid:\n${lines.joinToString("\n")}\n\n")
+                throw Exception("không tách được fid/time/key")
+            }
+            sb.append("\n")
+
+            val pr = postForm(
+                playerPage,
+                mapOf(
+                    "fid" to state.fid, "time" to state.time, "key" to state.key,
+                    "loadTime" to "0", "indexL" to "0", "indexSL" to "0"
+                )
+            )
+            val prText = pr.text
+            val embed = findEmbedUrl(prText)
+            sb.append("[4] POST player code=${pr.code} len=${prText.length} embed=$embed\n")
+            sb.append("đầu nội dung: ${head(prText, 500)}\n\n")
+            if (embed == null) throw Exception("không có link embed")
+
+            val eh = app.get(embed, headers = headers + ("Referer" to playerPage))
+            val ehText = eh.text
+            val hls = findHls(ehText)
+            sb.append("[5] embed code=${eh.code} len=${ehText.length} hls=$hls\n")
+            sb.append("đầu nội dung: ${head(ehText, 400)}\n")
         } catch (e: Exception) {
-            sb.append("[1] lỗi ${e.javaClass.simpleName}: ${e.message?.take(120)}\n\n")
+            sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        try {
-            val r2 = fetch("$mainUrl/site/site/embed/?url=https%3A%2F%2Fnguontv.life%2F")
-            val b2 = r2.text
-            sb.append("[2] GET /site/site/embed/ code=${r2.code} len=${b2.length}\n")
-            sb.append("cookies=${r2.cookies.keys.joinToString(",")}\n")
-            sb.append("BODY:\n").append(b2.take(1500)).append("\n")
-        } catch (e: Exception) {
-            sb.append("[2] lỗi ${e.javaClass.simpleName}: ${e.message?.take(120)}\n")
-        }
-        return newMovieLoadResponse("DEBUG NguonTV v4", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v5", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
