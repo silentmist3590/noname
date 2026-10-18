@@ -42,6 +42,46 @@ class NguonTVProvider : MainAPI() {
 
     private fun decodeHtml(value: String): String = Jsoup.parse(value).text().trim()
 
+    /**
+     * Lấy danh sách phim ở trang chủ NguonTV để hiển thị trong Home của CloudStream.
+     * NguonTV hiện cung cấp các mục phim ngay trên trang chủ; chưa giả định URL phân trang
+     * vì cấu trúc phân trang chưa được xác nhận từ HTML/HAR đã cung cấp.
+     */
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), hasNext = false)
+
+        val doc = app.get("$mainUrl/", headers = headers).document
+        val items = doc.select("div.item-file-index").mapNotNull { item ->
+            val link = item.selectFirst(".info-item-file-index h3 a[href]")
+                ?: item.selectFirst(".img-item-file-index a[href]")
+                ?: return@mapNotNull null
+
+            val href = link.attr("abs:href").ifBlank { absolute(link.attr("href")) ?: "" }
+            if (href.isBlank() || !Regex("-f\\d+\\.html", RegexOption.IGNORE_CASE).containsMatchIn(href)) {
+                return@mapNotNull null
+            }
+
+            val title = link.attr("title").ifBlank { link.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
+
+            val image = item.selectFirst(".img-item-file-index img, img.hover-img")
+            val poster = image?.let {
+                absolute(it.attr("data-src").ifBlank { it.attr("data-original").ifBlank { it.attr("src") } })
+            }
+            FilmItem(title, href, poster)
+        }.distinctBy { it.url }
+
+        val responses = items.map { item ->
+            newMovieSearchResponse(item.title, item.url, TvType.Movie) {
+                posterUrl = item.poster
+            }
+        }
+
+        val homePage = if (responses.isEmpty()) emptyList() else
+            listOf(HomePageList("Phim Hot / Phim mới", responses))
+        return newHomePageResponse(homePage, hasNext = false)
+    }
+
     private suspend fun searchItems(query: String): List<FilmItem> {
         val response = app.post(
             "$mainUrl/tim-kiem-a.html",
