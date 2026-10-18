@@ -109,7 +109,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v6 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v7 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = mutableListOf<HomePageList>()
@@ -118,7 +118,7 @@ class NguonTVProvider : MainAPI() {
         homePage.add(
             HomePageList(
                 "DEBUG",
-                listOf(newMovieSearchResponse("Chẩn đoán phát v6", "$mainUrl/__debug", TvType.Movie))
+                listOf(newMovieSearchResponse("Chẩn đoán phát v7", "$mainUrl/__debug", TvType.Movie))
             )
         )
         return newHomePageResponse(homePage, hasNext = false)
@@ -242,14 +242,15 @@ class NguonTVProvider : MainAPI() {
                     sb.append("> ").append(head(ppText.substring(x, y), 220)).append("\n")
                 }
             sb.append("\n")
-            val state = state1 ?: state2 ?: throw Exception("không tách được fid/time/key")
+            val state = state2 ?: state1 ?: throw Exception("không tách được fid/time/key")
 
             val pr = postForm(
                 playerPage,
                 mapOf(
                     "fid" to state.fid, "time" to state.time, "key" to state.key,
                     "loadTime" to "0", "indexL" to "0", "indexSL" to "0"
-                )
+                ),
+                xhrHeaders(playerPage)
             )
             val prText = pr.text
             val embed = findEmbedUrl(prText)
@@ -265,7 +266,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v6", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v7", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -321,22 +322,30 @@ class NguonTVProvider : MainAPI() {
 
     private data class PlayerState(val fid: String, val time: String, val key: String)
 
+    // Trang phát của tập có đoạn JS: npPhim = { key: 'xxx', ... } và
+    // $.ajax({ data: { 'fid':74165, 'time':1792322811, 'key': this.getKey(), ... } })
     private fun extractPlayerState(doc: Document, pageUrl: String): PlayerState? {
         val source = doc.html()
-        val fid = Regex("(?:fid|film_id|filmId)\\s*[:=]\\s*['\"]?(\\d+)", RegexOption.IGNORE_CASE)
+        val fid = Regex("['\"]fid['\"]\\s*[:=]\\s*['\"]?(\\d+)", RegexOption.IGNORE_CASE)
             .find(source)?.groupValues?.get(1)
-            ?: Regex("-f(\\d+)\\.html").find(pageUrl)?.groupValues?.get(1)
+            ?: Regex("-f(\\d+)(?:-|\\.html)").find(pageUrl)?.groupValues?.get(1)
             ?: return null
-        val time = Regex("(?:time|loadTime)\\s*[:=]\\s*['\"]?(\\d{9,})", RegexOption.IGNORE_CASE)
+        val time = Regex("['\"]time['\"]\\s*[:=]\\s*['\"]?(\\d{9,})", RegexOption.IGNORE_CASE)
             .find(source)?.groupValues?.get(1)
             ?: (System.currentTimeMillis() / 1000L).toString()
-        val key = Regex("(?:key|film_key)\\s*[:=]\\s*['\"]([A-Za-z0-9+/=_-]{4,})['\"]", RegexOption.IGNORE_CASE)
+        // Chỉ nhận dạng  key: 'xxx'  (dấu hai chấm). Không nhận jwplayer.key="..." (khóa bản quyền JW Player).
+        val key = Regex("(?<![.\\w])['\"]?key['\"]?\\s*:\\s*['\"]([A-Za-z0-9+/=_-]{4,})['\"]")
             .find(source)?.groupValues?.get(1)
-            ?: Regex("['\"]key['\"]\\s*:\\s*['\"]([^'\"]+)['\"]", RegexOption.IGNORE_CASE)
-                .find(source)?.groupValues?.get(1)
             ?: return null
         return PlayerState(fid, time, key)
     }
+
+    // Header giống lời gọi $.ajax của trang phát
+    private fun xhrHeaders(referer: String) = mapOf(
+        "X-Requested-With" to "XMLHttpRequest",
+        "Accept" to "application/json, text/javascript, */*; q=0.01",
+        "Referer" to referer
+    )
 
     private fun findEmbedUrl(html: String): String? {
         val decoded = html.replace("\\/", "/").replace("\\u0026", "&")
@@ -361,7 +370,9 @@ class NguonTVProvider : MainAPI() {
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
         return try {
             val pageDoc = fetch(basePage).document
-            val state = extractPlayerState(pageDoc, basePage)
+            val playerDoc = runCatching { fetch(playerPage, mapOf("Referer" to basePage)).document }.getOrNull()
+            val state = playerDoc?.let { extractPlayerState(it, playerPage) }
+                ?: extractPlayerState(pageDoc, basePage)
             if (state != null) {
                 val playerResponse = postForm(
                     playerPage,
@@ -372,7 +383,8 @@ class NguonTVProvider : MainAPI() {
                         "loadTime" to "0",
                         "indexL" to "0",
                         "indexSL" to "0"
-                    )
+                    ),
+                    xhrHeaders(playerPage)
                 ).text
                 val embed = findEmbedUrl(playerResponse)
                 if (embed != null) {
