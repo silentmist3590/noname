@@ -86,20 +86,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            val body = res.text.replace(Regex("\\s+"), " ")
-            val redir = Regex("""(?:location(?:\.href)?\s*=|location\.replace\(|http-equiv=.refresh)[^;>]{0,100}""", RegexOption.IGNORE_CASE)
-                .find(body)?.value
-            return debugHome(
-                "v2 code=${res.code} len=${body.length}",
-                "url=${res.url}",
-                "title=${doc.title()}",
-                "cookies=${res.cookies.keys.joinToString(",")}",
-                "redir=${redir ?: "none"}",
-                "a=" + body.take(70),
-                "b=" + body.drop(70).take(70),
-                "c=" + body.drop(140).take(70),
-                "d=" + body.drop(210).take(70)
-            )
+            return debugHome("Bấm vào đây xem chẩn đoán v3 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = if (responses.isEmpty()) emptyList() else
@@ -110,7 +97,7 @@ class NguonTVProvider : MainAPI() {
     // Hiện thông tin chẩn đoán thành các thẻ phim ngay ở trang chủ
     private fun debugHome(vararg lines: String): HomePageResponse {
         val cards = lines.mapIndexed { i, t ->
-            newMovieSearchResponse(t.replace("<", "‹").replace(">", "›"), "https://debug.invalid/$i", TvType.Movie)
+            newMovieSearchResponse(t.replace("<", "‹").replace(">", "›"), "$mainUrl/__debug$i", TvType.Movie)
         }
         return newHomePageResponse(listOf(HomePageList("DEBUG NguonTV", cards)), hasNext = false)
     }
@@ -182,7 +169,40 @@ class NguonTVProvider : MainAPI() {
     private fun episodeNumber(url: String): Int? = Regex("-(\\d+)-e\\d+\\.html", RegexOption.IGNORE_CASE)
         .find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()
 
+    // Trang chẩn đoán: hiện nội dung thật mà app nhận được từ site (trong phần mô tả)
+    private suspend fun debugLoad(): LoadResponse {
+        fun esc(t: String) = t.replace("<", "‹").replace(">", "›").replace("\n", "<br>")
+        val sb = StringBuilder()
+        try {
+            val r = app.get("$mainUrl/", headers = headers)
+            val body = r.text
+            sb.append("[1] GET / code=${r.code} len=${body.length}\n")
+            sb.append("url=${r.url}\n")
+            sb.append("cookies=${r.cookies.keys.joinToString(",")}\n")
+            sb.append("headers=${r.headers.names().joinToString(",")}\n")
+            sb.append("BODY:\n").append(body.take(2500)).append("\n\n")
+        } catch (e: Exception) {
+            sb.append("[1] lỗi ${e.javaClass.simpleName}: ${e.message?.take(120)}\n\n")
+        }
+        try {
+            val r2 = app.get(
+                "$mainUrl/site/site/embed/?url=https%3A%2F%2Fnguontv.life%2F",
+                headers = headers
+            )
+            val b2 = r2.text
+            sb.append("[2] GET /site/site/embed/ code=${r2.code} len=${b2.length}\n")
+            sb.append("cookies=${r2.cookies.keys.joinToString(",")}\n")
+            sb.append("BODY:\n").append(b2.take(1500)).append("\n")
+        } catch (e: Exception) {
+            sb.append("[2] lỗi ${e.javaClass.simpleName}: ${e.message?.take(120)}\n")
+        }
+        return newMovieLoadResponse("DEBUG NguonTV v3", "$mainUrl/__debug", TvType.Movie, "debug") {
+            this.plot = esc(sb.toString())
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse? {
+        if (url.contains("__debug")) return debugLoad()
         val pageUrl = absolute(url) ?: return null
         val doc = app.get(pageUrl, headers = headers).document
         val title = parseTitle(doc, doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "NguonTV")
