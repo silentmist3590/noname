@@ -52,11 +52,12 @@ class NguonTVProvider : MainAPI() {
         if (page > 1) return newHomePageResponse(emptyList(), hasNext = false)
 
         // Do not send the AJAX header on normal page requests.
-        val doc = try {
-            app.get("$mainUrl/", headers = headers).document
-        } catch (_: Exception) {
-            return newHomePageResponse(emptyList(), hasNext = false)
+        val res = try {
+            app.get("$mainUrl/", headers = headers)
+        } catch (e: Exception) {
+            return debugHome("lỗi tải: ${e.javaClass.simpleName} ${e.message?.take(80)}")
         }
+        val doc = res.document
         val items = doc.select(".categories-file-index .item-file-index, .item-file-index").mapNotNull { item ->
             val link = item.selectFirst(".info-item-file-index h3 a[href*='-f']")
                 ?: item.selectFirst(".img-item-file-index a[href*='-f']")
@@ -84,9 +85,34 @@ class NguonTVProvider : MainAPI() {
             }
         }
 
+        if (responses.isEmpty()) {
+            val body = res.text.replace(Regex("\\s+"), " ")
+            val redir = Regex("""(?:location(?:\.href)?\s*=|location\.replace\(|http-equiv=.refresh)[^;>]{0,100}""", RegexOption.IGNORE_CASE)
+                .find(body)?.value
+            return debugHome(
+                "v2 code=${res.code} len=${body.length}",
+                "url=${res.url}",
+                "title=${doc.title()}",
+                "cookies=${res.cookies.keys.joinToString(",")}",
+                "redir=${redir ?: "none"}",
+                "a=" + body.take(70),
+                "b=" + body.drop(70).take(70),
+                "c=" + body.drop(140).take(70),
+                "d=" + body.drop(210).take(70)
+            )
+        }
+
         val homePage = if (responses.isEmpty()) emptyList() else
             listOf(HomePageList("Phim Hot / Phim mới", responses))
         return newHomePageResponse(homePage, hasNext = false)
+    }
+
+    // Hiện thông tin chẩn đoán thành các thẻ phim ngay ở trang chủ
+    private fun debugHome(vararg lines: String): HomePageResponse {
+        val cards = lines.mapIndexed { i, t ->
+            newMovieSearchResponse(t.replace("<", "‹").replace(">", "›"), "https://debug.invalid/$i", TvType.Movie)
+        }
+        return newHomePageResponse(listOf(HomePageList("DEBUG NguonTV", cards)), hasNext = false)
     }
 
     private suspend fun searchItems(query: String): List<FilmItem> {
