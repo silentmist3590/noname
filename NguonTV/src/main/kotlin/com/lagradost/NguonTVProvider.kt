@@ -30,6 +30,29 @@ class NguonTVProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
+    // Cookie phiên của site. Site trả trang "NP Checker" (đặt cookie rồi tự chuyển về trang thật
+    // sau 1 giây) cho client chưa có cookie, nên phải giữ cookie và gọi lại như trình duyệt.
+    private var sessionCookies: Map<String, String> = emptyMap()
+
+    private suspend fun fetch(url: String, extra: Map<String, String> = emptyMap()) = run {
+        val h = headers + extra
+        var r = app.get(url, headers = h, cookies = sessionCookies)
+        var tries = 0
+        while (tries < 2 && r.text.contains("NP Checker")) {
+            sessionCookies = sessionCookies + r.cookies
+            Thread.sleep(1100)
+            r = app.get(url, headers = h, cookies = sessionCookies)
+            tries++
+        }
+        if (r.cookies.isNotEmpty()) sessionCookies = sessionCookies + r.cookies
+        r
+    }
+
+    private suspend fun postForm(url: String, data: Map<String, String>, extra: Map<String, String> = emptyMap()) = run {
+        if (sessionCookies.isEmpty()) fetch("$mainUrl/")
+        app.post(url, data = data, headers = headers + extra, cookies = sessionCookies)
+    }
+
     private data class FilmItem(val title: String, val url: String, val poster: String?)
 
     private fun absolute(url: String?): String? {
@@ -53,7 +76,7 @@ class NguonTVProvider : MainAPI() {
 
         // Do not send the AJAX header on normal page requests.
         val res = try {
-            app.get("$mainUrl/", headers = headers)
+            fetch("$mainUrl/")
         } catch (e: Exception) {
             return debugHome("lỗi tải: ${e.javaClass.simpleName} ${e.message?.take(80)}")
         }
@@ -86,7 +109,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v3 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v4 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = if (responses.isEmpty()) emptyList() else
@@ -105,10 +128,10 @@ class NguonTVProvider : MainAPI() {
     private suspend fun searchItems(query: String): List<FilmItem> {
         if (query.isBlank()) return emptyList()
 
-        val response = app.post(
+        val response = postForm(
             "$mainUrl/tim-kiem-a.html",
-            data = mapOf("q" to query.trim(), "t" to "film"),
-            headers = headers + mapOf(
+            mapOf("q" to query.trim(), "t" to "film"),
+            mapOf(
                 "Accept" to "application/json, text/javascript, */*; q=0.01",
                 "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
                 "X-Requested-With" to "XMLHttpRequest"
@@ -174,7 +197,7 @@ class NguonTVProvider : MainAPI() {
         fun esc(t: String) = t.replace("<", "‹").replace(">", "›").replace("\n", "<br>")
         val sb = StringBuilder()
         try {
-            val r = app.get("$mainUrl/", headers = headers)
+            val r = fetch("$mainUrl/")
             val body = r.text
             sb.append("[1] GET / code=${r.code} len=${body.length}\n")
             sb.append("url=${r.url}\n")
@@ -185,10 +208,7 @@ class NguonTVProvider : MainAPI() {
             sb.append("[1] lỗi ${e.javaClass.simpleName}: ${e.message?.take(120)}\n\n")
         }
         try {
-            val r2 = app.get(
-                "$mainUrl/site/site/embed/?url=https%3A%2F%2Fnguontv.life%2F",
-                headers = headers
-            )
+            val r2 = fetch("$mainUrl/site/site/embed/?url=https%3A%2F%2Fnguontv.life%2F")
             val b2 = r2.text
             sb.append("[2] GET /site/site/embed/ code=${r2.code} len=${b2.length}\n")
             sb.append("cookies=${r2.cookies.keys.joinToString(",")}\n")
@@ -196,7 +216,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("[2] lỗi ${e.javaClass.simpleName}: ${e.message?.take(120)}\n")
         }
-        return newMovieLoadResponse("DEBUG NguonTV v3", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG NguonTV v4", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -204,7 +224,7 @@ class NguonTVProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         if (url.contains("__debug")) return debugLoad()
         val pageUrl = absolute(url) ?: return null
-        val doc = app.get(pageUrl, headers = headers).document
+        val doc = fetch(pageUrl).document
         val title = parseTitle(doc, doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "NguonTV")
         val poster = absolute(
             doc.selectFirst("meta[property=og:image]")?.attr("content")
@@ -291,20 +311,19 @@ class NguonTVProvider : MainAPI() {
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
         return try {
-            val pageDoc = app.get(basePage, headers = headers).document
+            val pageDoc = fetch(basePage).document
             val state = extractPlayerState(pageDoc, basePage)
             if (state != null) {
-                val playerResponse = app.post(
+                val playerResponse = postForm(
                     playerPage,
-                    data = mapOf(
+                    mapOf(
                         "fid" to state.fid,
                         "time" to state.time,
                         "key" to state.key,
                         "loadTime" to "0",
                         "indexL" to "0",
                         "indexSL" to "0"
-                    ),
-                    headers = headers
+                    )
                 ).text
                 val embed = findEmbedUrl(playerResponse)
                 if (embed != null) {
