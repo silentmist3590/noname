@@ -109,7 +109,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v5 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v6 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = mutableListOf<HomePageList>()
@@ -118,7 +118,7 @@ class NguonTVProvider : MainAPI() {
         homePage.add(
             HomePageList(
                 "DEBUG",
-                listOf(newMovieSearchResponse("Chẩn đoán phát v5", "$mainUrl/__debug", TvType.Movie))
+                listOf(newMovieSearchResponse("Chẩn đoán phát v6", "$mainUrl/__debug", TvType.Movie))
             )
         )
         return newHomePageResponse(homePage, hasNext = false)
@@ -222,17 +222,27 @@ class NguonTVProvider : MainAPI() {
             val playerPage = epLinks.firstOrNull() ?: toPlayerUrl(filmUrl)
             sb.append("playerPage=$playerPage\n")
 
-            val state = extractPlayerState(pageDoc, filmUrl)
-            sb.append("[3] state=${state?.let { "fid=${it.fid} time=${it.time} key=${it.key.take(30)}" } ?: "NULL"}\n")
-            if (state == null) {
-                val src = pageDoc.html()
-                val lines = src.lines().map { it.trim() }
-                    .filter { Regex("(?i)\\bkey\\b|film_key|fid|filmId").containsMatchIn(it) }
-                    .take(8).map { it.take(160) }
-                sb.append("dòng có key/fid:\n${lines.joinToString("\n")}\n\n")
-                throw Exception("không tách được fid/time/key")
-            }
+            val state1 = extractPlayerState(pageDoc, filmUrl)
+            sb.append("[3] state(trang phim)=${state1?.let { "fid=${it.fid} key=${it.key.take(20)}" } ?: "NULL"}\n")
+
+            // Trang phát của tập: có thể chứa fid/key/embed thay vì trang chi tiết phim
+            val pp = fetch(playerPage, mapOf("Referer" to filmUrl))
+            val ppText = pp.text.replace("\\/", "/")
+            val state2 = extractPlayerState(pp.document, playerPage)
+            sb.append("[3b] GET trang phát code=${pp.code} len=${ppText.length}\n")
+            sb.append("state=${state2?.let { "fid=${it.fid} time=${it.time} key=${it.key.take(20)}" } ?: "NULL"} embed=${findEmbedUrl(ppText)} hls=${findHls(ppText)}\n")
+            val ifr = pp.document.select("iframe[src]").map { it.attr("abs:src") }
+            sb.append("iframe=${ifr.joinToString(" ; ").take(200)}\n")
+            val scripts = pp.document.select("script[src]").map { it.attr("abs:src") }.filter { it.contains("nguontv") }
+            sb.append("script=${scripts.joinToString(" ; ").take(300)}\n")
+            Regex("(?i)grab\\.nguontv|\\.m3u8|\\.post\\(|\\\$\\.ajax|fetch\\(|\\bkey\\b|\\bfid\\b|embed")
+                .findAll(ppText).take(10).forEach {
+                    val x = maxOf(0, it.range.first - 90)
+                    val y = minOf(ppText.length, it.range.last + 130)
+                    sb.append("> ").append(head(ppText.substring(x, y), 220)).append("\n")
+                }
             sb.append("\n")
+            val state = state1 ?: state2 ?: throw Exception("không tách được fid/time/key")
 
             val pr = postForm(
                 playerPage,
@@ -255,7 +265,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v5", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v6", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
