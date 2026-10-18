@@ -16,7 +16,7 @@ class NguonTVProvider : MainAPI() {
     override var mainUrl = "https://nguontv.life"
     override var name = "NguonTV"
     override var lang = "vi"
-    override val hasMainPage = false
+    override val hasMainPage = true
     override val hasQuickSearch = true
     override val vpnStatus = VPNStatus.MightBeNeeded
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.Cartoon)
