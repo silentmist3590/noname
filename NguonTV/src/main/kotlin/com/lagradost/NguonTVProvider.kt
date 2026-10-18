@@ -27,8 +27,7 @@ class NguonTVProvider : MainAPI() {
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
         "Origin" to mainUrl,
-        "Referer" to "$mainUrl/",
-        "X-Requested-With" to "XMLHttpRequest"
+        "Referer" to "$mainUrl/"
     )
 
     private data class FilmItem(val title: String, val url: String, val poster: String?)
@@ -52,8 +51,13 @@ class NguonTVProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(emptyList(), hasNext = false)
 
-        val doc = app.get("$mainUrl/", headers = headers).document
-        val items = doc.select(".categories-file-index .item-file-index, div.item-file-index").mapNotNull { item ->
+        // Do not send the AJAX header on normal page requests.
+        val doc = try {
+            app.get("$mainUrl/", headers = headers).document
+        } catch (_: Exception) {
+            return newHomePageResponse(emptyList(), hasNext = false)
+        }
+        val items = doc.select(".categories-file-index .item-file-index, .item-file-index").mapNotNull { item ->
             val link = item.selectFirst(".info-item-file-index h3 a[href*='-f']")
                 ?: item.selectFirst(".img-item-file-index a[href*='-f']")
                 ?: item.selectFirst("a[href*='-f']")
@@ -93,7 +97,8 @@ class NguonTVProvider : MainAPI() {
             data = mapOf("q" to query.trim(), "t" to "film"),
             headers = headers + mapOf(
                 "Accept" to "application/json, text/javascript, */*; q=0.01",
-                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"
+                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With" to "XMLHttpRequest"
             )
         ).text
 
@@ -109,52 +114,29 @@ class NguonTVProvider : MainAPI() {
         if (html.isBlank()) return emptyList()
 
         val doc = Jsoup.parse(html, "$mainUrl/")
-        val items = doc.select("li.result-item").mapNotNull { item ->
-            val link = item.selectFirst("a[href*='-f'], a[href]")
-                ?: return@mapNotNull null
-            val href = link.attr("abs:href").ifBlank {
-                absolute(link.attr("href")) ?: ""
-            }
+        // The HAR response contains <li class="result-item"><a href="/...-f123.html">.
+        // Parse anchors directly instead of relying on a particular list-item class.
+        val items = doc.select("a[href]").mapNotNull { link ->
+            val rawHref = link.attr("href").trim()
+            val href = link.attr("abs:href").ifBlank { absolute(rawHref) ?: "" }
             if (href.isBlank() ||
-                !Regex("-f\\d+\\.html", RegexOption.IGNORE_CASE).containsMatchIn(href)
+                !Regex("-f\\d+\\.html(?:[?#].*)?$", RegexOption.IGNORE_CASE).containsMatchIn(href)
             ) return@mapNotNull null
 
-            val title = link.attr("title").ifBlank {
-                item.selectFirst(".result-item-title")?.text()?.trim()
-                    ?: link.text().trim()
-            }
+            val title = link.attr("title").ifBlank { link.text().trim() }
             if (title.isBlank()) return@mapNotNull null
 
-            val image = item.selectFirst("img")
+            val image = link.selectFirst("img") ?: link.parent()?.selectFirst("img")
             val poster = image?.let {
                 val src = it.attr("data-src").ifBlank {
                     it.attr("data-original").ifBlank { it.attr("src") }
                 }
                 absolute(src)
             }
-            FilmItem(title, href, poster)
+            FilmItem(title, href.substringBefore('#'), poster)
         }.distinctBy { it.url }
 
-        if (items.isNotEmpty()) return items
-
-        // Secondary selector for alternate markup.
-        return doc.select("a[href*='-f']").mapNotNull { link ->
-            val href = link.attr("abs:href").ifBlank {
-                absolute(link.attr("href")) ?: ""
-            }
-            if (href.isBlank() ||
-                !Regex("-f\\d+\\.html", RegexOption.IGNORE_CASE).containsMatchIn(href)
-            ) return@mapNotNull null
-            val title = link.attr("title").ifBlank { link.text().trim() }
-            if (title.isBlank()) return@mapNotNull null
-            val image = link.selectFirst("img")
-            val poster = image?.let {
-                absolute(it.attr("data-src").ifBlank {
-                    it.attr("data-original").ifBlank { it.attr("src") }
-                })
-            }
-            FilmItem(title, href, poster)
-        }.distinctBy { it.url }
+        return items
     }
 
     override suspend fun search(query: String): List<SearchResponse> = searchItems(query).map { item ->
