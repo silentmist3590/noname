@@ -1,8 +1,8 @@
 {
-  "name": "NguonC CloudStream Repository",
-  "description": "Kho phim NguonC cho CloudStream 3 - Hỗ trợ Phim Mới, Hành Động, Hài, Chiến Tranh, Lịch Sử, Phim 18+",
+  "name": "Noname CloudStream Repository",
+  "description": "Kho plugin phim tiếng Việt: NguonTV, PhimNguonC, Kkphim, VsMov, InternetArchive",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/silentmist3590/cloudstream-nguonc/builds/plugins.json"
+    "https://raw.githubusercontent.com/silentmist3590/noname/builds/plugins.json"
   ]
 }
