@@ -1,7 +1,4 @@
-import com.lagradost.cloudstream3.gradle.CloudstreamExtension
-
 plugins {
-    val kotlinVersion = "1.9.22"
     id("com.android.library")
     id("kotlin-android")
     id("com.lagradost.cloudstream3.gradle")
@@ -20,16 +17,21 @@ android {
     }
 
     kotlinOptions {
-        jvmTarget = "1.8"
-        freeCompilerArgs = freeCompilerArgs + listOf(
-            "-opt-in=kotlin.RequiresOptIn"
-        )
+        // Cập nhật cấu hình compilerOptions theo khuyến nghị của Kotlin mới
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+            freeCompilerArgs.addAll(
+                listOf(
+                    "-opt-in=kotlin.RequiresOptIn"
+                )
+            )
+        }
     }
 }
 
 cloudstream {
-    // Nhập URL GitHub Repository của bạn tại đây
-    setRepoUrl("https://github.com/silentmist3590/noname/builds/repo.json)
+    // Đã sửa lại cú pháp thiếu dấu ngoặc kép ở cuối chuỗi
+    setRepoUrl("https://github.com/silentmist3590/noname/builds/repo.json")
 }
 
 dependencies {
