@@ -1,10 +1,10 @@
-version = 18
+version = 19
 
 cloudstream {
     description = "Xem phim từ nguồn phim.nguonc.com trên CloudStream"
     authors = listOf("silentmist3590")
     status = 1
-    tvTypes = listOf("Movie", "TvSeries", "AsianDrama", "NSFW")
+    tvTypes = listOf("Movie", "TvSeries", "AsianDrama")
     requiresResources = false
     language = "vi"
     iconUrl = "https://phim.nguonc.com/favicon.ico"
