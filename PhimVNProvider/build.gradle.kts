@@ -16,7 +16,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
 
-    // Cú pháp compilerOptions DSL bắt buộc cho Kotlin mới
     kotlin {
         compilerOptions {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
@@ -26,8 +25,8 @@ android {
 }
 
 cloudstream {
-    // Sửa lại cú pháp gán thuộc tính repoUrl thay vì dùng hàm setRepoUrl
-    repoUrl = "https://github.com/silentmist3590/noname/builds/repo.json"
+    // Quay lại sử dụng hàm setRepoUrl đúng với phiên bản Gradle plugin hiện tại
+    setRepoUrl("https://github.com/silentmist3590/noname/builds/repo.json")
 }
 
 dependencies {
