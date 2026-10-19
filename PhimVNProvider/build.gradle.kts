@@ -4,7 +4,7 @@ plugins {
     val kotlinVersion = "1.9.22"
     id("com.android.library")
     id("kotlin-android")
-    id("com.lagradost.cloudstream3.gradle") version "0.1.0"
+    id("com.lagradost.cloudstream3.gradle")
 }
 
 android {
