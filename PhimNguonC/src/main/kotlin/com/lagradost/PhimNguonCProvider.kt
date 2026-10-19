@@ -16,6 +16,58 @@ private const val LINK_SEP = "|||"
 // Context của ứng dụng, dùng để hiện thông báo chẩn đoán
 private var appCtx: Context? = null
 
+// Máy chủ HTTP nhỏ trên 127.0.0.1 để phát playlist đã giải mã cho trình phát
+private object LocalPlaylist {
+    private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private var server: java.net.ServerSocket? = null
+
+    @Synchronized
+    fun url(text: String): String {
+        val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
+            server = it
+            start(it)
+        }
+        val id = "pl_${System.nanoTime()}.m3u8"
+        store[id] = text
+        return "http://127.0.0.1:${s.localPort}/$id"
+    }
+
+    private fun start(s: java.net.ServerSocket) {
+        Thread {
+            while (!s.isClosed) {
+                val c = try { s.accept() } catch (e: Exception) { break }
+                Thread { handle(c) }.apply { isDaemon = true }.start()
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun handle(c: java.net.Socket) {
+        runCatching {
+            c.use {
+                val r = c.getInputStream().bufferedReader()
+                val line = r.readLine() ?: return
+                while (true) {
+                    val h = r.readLine() ?: break
+                    if (h.isEmpty()) break
+                }
+                val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
+                val body = path?.let { store[it] }?.toByteArray()
+                val out = c.getOutputStream()
+                if (body == null) {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                } else {
+                    out.write(
+                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray()
+                    )
+                    if (!line.startsWith("HEAD")) out.write(body)
+                }
+                out.flush()
+            }
+        }
+    }
+}
+
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
     override fun load(context: Context) {
@@ -147,11 +199,11 @@ class PhimNguonCProvider : MainAPI() {
             toast(msg)
             copyToClipboard(log.toString())
         }
-        note("v20 loadLinks data=${data.take(160)}")
+        note("v21 loadLinks data=${data.take(160)}")
         return try {
             loadLinksInner(data, callback, ::note)
         } catch (t: Throwable) {
-            note("v20 EXCEPTION ${t.javaClass.simpleName}: ${t.message?.take(160)}")
+            note("v21 EXCEPTION ${t.javaClass.simpleName}: ${t.message?.take(160)}")
             false
         }
     }
@@ -187,22 +239,28 @@ class PhimNguonCProvider : MainAPI() {
         }
 
         // 1) Link m3u8 trực tiếp từ API (nếu có)
-        note("v20 apiM3u8=${apiM3u8 ?: "null"} embed=${embed ?: "null"}")
+        note("v21 apiM3u8=${apiM3u8 ?: "null"} embed=${embed ?: "null"}")
         if (apiM3u8 != null && emit(apiM3u8, embedRef)) return true
         if (embed == null) return false
 
         // 1b) Giao thức bootstrap của chính player embed (AES-GCM), giải mã bằng khóa dẫn xuất công khai
         val boot = runCatching { bootstrapPlaylist(embed, note) }.getOrElse {
-            note("v20 bootstrap lỗi: ${it.javaClass.simpleName} ${it.message?.take(120)}")
+            note("v21 bootstrap lỗi: ${it.javaClass.simpleName} ${it.message?.take(120)}")
             null
         }
         if (boot != null) {
+            val firstSeg = boot.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+            note("v21 đoạn đầu=${firstSeg?.take(120)}")
+            if (firstSeg != null && firstSeg.startsWith("http")) {
+                val pr = runCatching {
+                    app.get(firstSeg, referer = embed, headers = mapOf("User-Agent" to UA))
+                }.getOrNull()
+                note("v21 thử đoạn code=${pr?.code} kích thước=${pr?.text?.length}")
+            }
             val ok = runCatching {
-                val dir = java.io.File(appCtx?.cacheDir ?: java.io.File("/data/local/tmp"), "nguonc").apply { mkdirs() }
-                val f = java.io.File(dir, "pl_${System.currentTimeMillis()}.m3u8")
-                f.writeText(boot)
+                val local = LocalPlaylist.url(boot)
                 callback(
-                    newExtractorLink(name, name, "file://${f.absolutePath}", ExtractorLinkType.M3U8) {
+                    newExtractorLink(name, name, local, ExtractorLinkType.M3U8) {
                         this.referer = embed
                         this.quality = Qualities.Unknown.value
                         this.headers = mapOf("Referer" to embed, "User-Agent" to UA)
@@ -210,13 +268,13 @@ class PhimNguonCProvider : MainAPI() {
                 )
                 true
             }.getOrDefault(false)
-            note("v20 bootstrap phát ok=$ok")
+            note("v21 bootstrap phát ok=$ok")
             if (ok) return true
         }
 
         // 2) Trang embed mã hóa dữ liệu và tự giải mã bằng JS: cho nó chạy trong WebView
         //    thật rồi bắt yêu cầu .m3u8 mà player phát ra.
-        note("v20: đang mở trang phát trong WebView...")
+        note("v21: đang mở trang phát trong WebView...")
         val sniffed = runCatching {
             app.get(
                 embed,
@@ -224,21 +282,21 @@ class PhimNguonCProvider : MainAPI() {
                 interceptor = WebViewResolver(Regex("""\.m3u8"""))
             ).url
         }.getOrElse {
-            note("v20 lỗi WebView: ${it.javaClass.simpleName} ${it.message?.take(80)}")
+            note("v21 lỗi WebView: ${it.javaClass.simpleName} ${it.message?.take(80)}")
             null
         }
         if (sniffed == null || !sniffed.contains(".m3u8")) {
-            note("v20: không bắt được .m3u8. sniff=${sniffed?.take(120)}")
+            note("v21: không bắt được .m3u8. sniff=${sniffed?.take(120)}")
             return false
         }
-        note("v20: bắt được ${sniffed.take(150)}")
+        note("v21: bắt được ${sniffed.take(150)}")
 
         val probe = runCatching { app.get(sniffed, referer = embedRef) }.getOrNull()
         val body = probe?.text
-        note("v20: kiểm tra link code=${probe?.code} nội dung=${headOf(body, 60)}")
+        note("v21: kiểm tra link code=${probe?.code} nội dung=${headOf(body, 60)}")
         if (body?.trimStart()?.startsWith("#EXTM3U") == true) {
             val r = emit(sniffed, embedRef)
-            note("v20 đã gửi link cho trình phát ok=$r")
+            note("v21 đã gửi link cho trình phát ok=$r")
             return r
         }
         return false
@@ -263,10 +321,10 @@ class PhimNguonCProvider : MainAPI() {
     private suspend fun bootstrapPlaylist(embed: String, note: (String) -> Unit): String? {
         val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
         val shell = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA))
-        note("v20 shell code=${shell.code} len=${shell.text.length}")
+        note("v21 shell code=${shell.code} len=${shell.text.length}")
         val api = Regex("""<script id="stream-bootstrap"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
             .find(shell.text)?.groupValues?.get(1)?.let { org.json.JSONObject(it).optString("api") }
-        if (api.isNullOrBlank()) { note("v20 không thấy stream-bootstrap"); return null }
+        if (api.isNullOrBlank()) { note("v21 không thấy stream-bootstrap"); return null }
         val hashFromUrl = Regex("""[?&]hash=([0-9a-f]+)""").find(embed)?.groupValues?.get(1).orEmpty()
 
         val body = org.json.JSONObject().apply {
@@ -284,8 +342,8 @@ class PhimNguonCProvider : MainAPI() {
             requestBody = body.toRequestBody("application/json".toMediaType()),
             headers = mapOf("Origin" to origin, "Referer" to embed, "User-Agent" to UA, "Accept" to "*/*")
         )
-        note("v20 bootstrap POST code=${resp.code} len=${resp.text.length}")
-        if (resp.code != 200) { note("v20 ${headOf(resp.text, 80)}"); return null }
+        note("v21 bootstrap POST code=${resp.code} len=${resp.text.length}")
+        if (resp.code != 200) { note("v21 ${headOf(resp.text, 80)}"); return null }
 
         var j = org.json.JSONObject(resp.text)
         if (j.optString("format") == "aesgcm-v1") {
@@ -295,10 +353,10 @@ class PhimNguonCProvider : MainAPI() {
         }
         val video = j.optString("video").ifBlank { hashFromUrl }
         val pl = j.optJSONObject("preissued")?.optString("playlist")
-        if (pl.isNullOrBlank()) { note("v20 không có preissued (turnstile=${j.optBoolean("turnstileEnabled")})"); return null }
+        if (pl.isNullOrBlank()) { note("v21 không có preissued (turnstile=${j.optBoolean("turnstileEnabled")})"); return null }
 
         val plResp = app.get(pl, referer = embed, headers = mapOf("User-Agent" to UA))
-        note("v20 playlist code=${plResp.code} đầu=${headOf(plResp.text, 40)}")
+        note("v21 playlist code=${plResp.code} đầu=${headOf(plResp.text, 40)}")
         var text = plResp.text
         if (text.contains("#ENC-AESGCM")) {
             val iv = Regex("""iv=([0-9a-fA-F]+)""").find(text)?.groupValues?.get(1) ?: return null
