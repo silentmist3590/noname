@@ -17,20 +17,14 @@ android {
     }
 
     kotlinOptions {
-        // Cập nhật cấu hình compilerOptions theo khuyến nghị của Kotlin mới
-        compilerOptions {
-            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
-            freeCompilerArgs.addAll(
-                listOf(
-                    "-opt-in=kotlin.RequiresOptIn"
-                )
-            )
-        }
+        jvmTarget = "1.8"
+        freeCompilerArgs = listOf(
+            "-opt-in=kotlin.RequiresOptIn"
+        )
     }
 }
 
 cloudstream {
-    // Đã sửa lại cú pháp thiếu dấu ngoặc kép ở cuối chuỗi
     setRepoUrl("https://github.com/silentmist3590/noname/builds/repo.json")
 }
 
