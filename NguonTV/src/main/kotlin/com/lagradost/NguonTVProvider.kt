@@ -168,7 +168,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v9 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v10 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = mutableListOf<HomePageList>()
@@ -177,7 +177,7 @@ class NguonTVProvider : MainAPI() {
         homePage.add(
             HomePageList(
                 "DEBUG",
-                listOf(newMovieSearchResponse("Chẩn đoán phát v9", "$mainUrl/__debug", TvType.Movie))
+                listOf(newMovieSearchResponse("Chẩn đoán phát v10", "$mainUrl/__debug", TvType.Movie))
             )
         )
         return newHomePageResponse(homePage, hasNext = false)
@@ -326,7 +326,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v9", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v10", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -554,6 +554,24 @@ class NguonTVProvider : MainAPI() {
         return scan(embed, 0)
     }
 
+
+    // Trang embed của NguonTV giấu nguồn phát trong biến chuỗi base64 (tên biến đổi mỗi lần tải),
+    // ví dụ [{"file":"https://.../index.m3u8","type":"hls"}]. Giải mọi chuỗi base64 dài và tìm link .m3u8.
+    private suspend fun viaB64(embed: String, page: String): Stream? {
+        val html = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text
+        for (m in Regex("""["']([A-Za-z0-9+/=_-]{40,})["']""").findAll(html)) {
+            val decoded = runCatching {
+                String(android.util.Base64.decode(m.groupValues[1], android.util.Base64.DEFAULT))
+            }.getOrNull() ?: continue
+            if (!decoded.contains("http")) continue
+            val text = decoded.replace("\\/", "/")
+            val url = Regex("""https?://[^\s"'<>\\]+""").findAll(text).map { it.value }
+                .firstOrNull { it.contains(".m3u8") } ?: continue
+            direct(url, embed, "base64")?.let { return it }
+        }
+        return null
+    }
+
     private suspend fun viaWebView(embed: String, page: String): Stream? {
         val sniffed = app.get(
             embed,
@@ -565,11 +583,12 @@ class NguonTVProvider : MainAPI() {
     }
 
     private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit): Stream? {
-        for (tag in listOf("bootstrap", "data-obf", "scan", "webview")) {
+        for (tag in listOf("bootstrap", "data-obf", "base64", "scan", "webview")) {
             val st = runCatching {
                 when (tag) {
                     "bootstrap" -> viaBootstrap(embed, page)
                     "data-obf" -> viaDataObf(embed, page)
+                    "base64" -> viaB64(embed, page)
                     "scan" -> viaScan(embed, page)
                     else -> viaWebView(embed, page)
                 }
