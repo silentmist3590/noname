@@ -1,16 +1,75 @@
 package com.nguontv
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
 import java.util.Locale
+
+
+private const val TAG = "NguonTV"
+
+/** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist đã giải mã cho trình phát. */
+private object LocalPlaylist {
+    private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private var server: java.net.ServerSocket? = null
+
+    @Synchronized
+    fun url(text: String): String {
+        val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
+            server = it
+            start(it)
+        }
+        val id = "pl_${System.nanoTime()}.m3u8"
+        store[id] = text
+        return "http://127.0.0.1:${s.localPort}/$id"
+    }
+
+    private fun start(s: java.net.ServerSocket) {
+        Thread {
+            while (!s.isClosed) {
+                val c = try { s.accept() } catch (e: Exception) { break }
+                Thread { handle(c) }.apply { isDaemon = true }.start()
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun handle(c: java.net.Socket) {
+        runCatching {
+            c.use {
+                val r = c.getInputStream().bufferedReader()
+                val line = r.readLine() ?: return
+                while (true) {
+                    val h = r.readLine() ?: break
+                    if (h.isEmpty()) break
+                }
+                val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
+                val body = path?.let { store[it] }?.toByteArray()
+                val out = c.getOutputStream()
+                if (body == null) {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                } else {
+                    out.write(
+                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray()
+                    )
+                    if (!line.startsWith("HEAD")) out.write(body)
+                }
+                out.flush()
+            }
+        }
+    }
+}
 
 class NguonTVProvider : MainAPI() {
     override var mainUrl = "https://nguontv.life"
@@ -109,7 +168,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v7 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v8 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = mutableListOf<HomePageList>()
@@ -118,7 +177,7 @@ class NguonTVProvider : MainAPI() {
         homePage.add(
             HomePageList(
                 "DEBUG",
-                listOf(newMovieSearchResponse("Chẩn đoán phát v7", "$mainUrl/__debug", TvType.Movie))
+                listOf(newMovieSearchResponse("Chẩn đoán phát v8", "$mainUrl/__debug", TvType.Movie))
             )
         )
         return newHomePageResponse(homePage, hasNext = false)
@@ -260,13 +319,14 @@ class NguonTVProvider : MainAPI() {
 
             val eh = app.get(embed, headers = headers + ("Referer" to playerPage))
             val ehText = eh.text
-            val hls = findHls(ehText)
-            sb.append("[5] embed code=${eh.code} len=${ehText.length} hls=$hls\n")
-            sb.append("đầu nội dung: ${head(ehText, 400)}\n")
+            sb.append("[5] embed code=${eh.code} len=${ehText.length} hls=${findHls(ehText)}\n")
+            val st = resolveEmbed(embed, playerPage) { sb.append(it).append("\n") }
+            sb.append("[6] kết quả: ${st?.via ?: "KHÔNG LẤY ĐƯỢC"}\n")
+            if (st == null) sb.append(embedDigest(ehText))
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v7", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v8", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -359,6 +419,198 @@ class NguonTVProvider : MainAPI() {
             .find(decoded)?.value?.replace("&amp;", "&")
     }
 
+
+    // ================= Lấy luồng phát từ trang embed (nhiều tầng dự phòng) =================
+
+    private class Stream(val url: String?, val text: String?, val via: String)
+
+    private fun segHeaders(embed: String) = mapOf(
+        "User-Agent" to ua,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "en-us,en;q=0.5",
+        "Sec-Fetch-Mode" to "navigate",
+        "Referer" to embed
+    )
+
+    private fun originOf(url: String): String =
+        Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1).orEmpty()
+
+    private fun looksLikePlaylist(t: String?): Boolean =
+        t != null && t.trimStart().startsWith("#EXTM3U") && t.lines().any { it.isNotBlank() && !it.startsWith("#") }
+
+    private fun hashOf(embed: String): String =
+        Regex("""[?&]hash=([0-9a-fA-F]+)""").find(embed)?.groupValues?.get(1).orEmpty()
+
+    private fun absolutize(text: String, base: String): String {
+        val origin = originOf(base)
+        val dir = base.substringBefore('?').substringBeforeLast('/') + "/"
+        return text.lines().joinToString("\n") { line ->
+            val l = line.trim()
+            when {
+                l.isEmpty() || l.startsWith("#") || l.startsWith("http") -> line
+                l.startsWith("/") -> origin + l
+                else -> dir + l
+            }
+        }
+    }
+
+    private fun sha256(b: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(b)
+
+    private fun gcm(key: ByteArray, iv: ByteArray, data: ByteArray, aad: ByteArray?): ByteArray {
+        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(
+            javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, iv)
+        )
+        if (aad != null) c.updateAAD(aad)
+        return c.doFinal(data)
+    }
+
+    private fun hex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+    private fun decryptPlaylist(text: String, videoHash: String): String? {
+        if (!text.contains("#ENC-AESGCM")) return text
+        val iv = Regex("""iv=([0-9a-fA-F]+)""").find(text)?.groupValues?.get(1) ?: return null
+        val line = text.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return null
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec("stream-derive-v1".toByteArray(), "HmacSHA256"))
+        val key = mac.doFinal(videoHash.toByteArray())
+        return String(gcm(key, hex(iv), android.util.Base64.decode(line, android.util.Base64.DEFAULT), null))
+    }
+
+    private suspend fun direct(url: String, embed: String, via: String, hashes: List<String> = emptyList()): Stream? {
+        val r = app.get(url, referer = embed, headers = segHeaders(embed))
+        if (r.code != 200) return null
+        val body = r.text
+        if (body.contains("#ENC-AESGCM")) {
+            for (h in (hashes + hashOf(embed)).filter { it.isNotBlank() }.distinct()) {
+                val plain = runCatching { decryptPlaylist(body, h) }.getOrNull()
+                if (looksLikePlaylist(plain)) return Stream(null, absolutize(plain!!, url), "$via+giải mã")
+            }
+            return null
+        }
+        return if (looksLikePlaylist(body)) Stream(url, null, via) else null
+    }
+
+    private suspend fun viaBootstrap(embed: String, page: String): Stream? {
+        val origin = originOf(embed)
+        val shell = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua))
+        val cfg = Regex("""<script id="stream-bootstrap"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
+            .find(shell.text)?.groupValues?.get(1) ?: return null
+        val api = JSONObject(cfg).optString("api").takeIf { it.isNotBlank() } ?: return null
+        val body = JSONObject().apply {
+            put("action", "bootstrap")
+            put("referrer", page)
+            put("frame_origins", org.json.JSONArray().put(mainUrl))
+            put("request_grant", true)
+            put("playlist_format", "aesgcm-v2")
+            put("pretty_url", true)
+            put("path_chunks", true)
+            put("bootstrap_format", "aesgcm-v1")
+        }.toString()
+        val resp = app.post(
+            api,
+            requestBody = body.toRequestBody("application/json".toMediaType()),
+            headers = mapOf("Origin" to origin, "Referer" to embed, "User-Agent" to ua, "Accept" to "*/*")
+        )
+        if (resp.code != 200) return null
+        var j = JSONObject(resp.text)
+        if (j.optString("format") == "aesgcm-v1") {
+            val aad = "stream-bootstrap-v1\n$api".toByteArray()
+            val plain = gcm(
+                sha256(aad), hex(j.getString("iv")),
+                android.util.Base64.decode(j.getString("data"), android.util.Base64.DEFAULT), aad
+            )
+            j = JSONObject(String(plain))
+        }
+        val video = j.optString("video").ifBlank { hashOf(embed) }
+        val playlist = j.optJSONObject("preissued")?.optString("playlist")?.takeIf { it.isNotBlank() } ?: return null
+        return direct(playlist, embed, "bootstrap", listOf(video))
+    }
+
+    private suspend fun viaDataObf(embed: String, page: String): Stream? {
+        val origin = originOf(embed)
+        val html = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text
+        val obf = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.get(1) ?: return null
+        val j = JSONObject(String(android.util.Base64.decode(obf, android.util.Base64.DEFAULT)))
+        val sub = j.optString("sUb").takeIf { it.isNotBlank() } ?: return null
+        return direct("$origin/$sub.m3u8", embed, "data-obf", listOf(j.optString("hD")))
+    }
+
+    private suspend fun viaScan(embed: String, page: String): Stream? {
+        val seen = mutableSetOf<String>()
+        suspend fun scan(url: String, depth: Int): Stream? {
+            if (!seen.add(url) || depth > 1) return null
+            val html = app.get(url, referer = page, headers = mapOf("User-Agent" to ua)).text.replace("\\/", "/")
+            for (m in Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").findAll(html)) {
+                direct(m.value, embed, "scan", listOf(hashOf(embed)))?.let { return it }
+            }
+            for (m in Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html)) {
+                val src = m.groupValues[1].let { if (it.startsWith("//")) "https:$it" else it }
+                if (src.startsWith("http")) scan(src, depth + 1)?.let { return it }
+            }
+            return null
+        }
+        return scan(embed, 0)
+    }
+
+    private suspend fun viaWebView(embed: String, page: String): Stream? {
+        val sniffed = app.get(
+            embed,
+            referer = page,
+            interceptor = WebViewResolver(Regex("""\.m3u8"""))
+        ).url
+        if (!sniffed.contains(".m3u8")) return null
+        return direct(sniffed, embed, "webview", listOf(hashOf(embed)))
+    }
+
+    private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit): Stream? {
+        for (tag in listOf("bootstrap", "data-obf", "scan", "webview")) {
+            val st = runCatching {
+                when (tag) {
+                    "bootstrap" -> viaBootstrap(embed, page)
+                    "data-obf" -> viaDataObf(embed, page)
+                    "scan" -> viaScan(embed, page)
+                    else -> viaWebView(embed, page)
+                }
+            }.onFailure {
+                log("tầng $tag lỗi: ${it.javaClass.simpleName} ${it.message?.take(100)}")
+            }.getOrNull()
+            if (st == null) { log("tầng $tag: không có kết quả"); continue }
+            log("tầng $tag: dùng được (${st.via})")
+            return st
+        }
+        return null
+    }
+
+    private suspend fun emitStream(st: Stream, embed: String, callback: (ExtractorLink) -> Unit): Boolean = runCatching {
+        val link = if (st.text != null) LocalPlaylist.url(st.text) else st.url!!
+        callback(
+            newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
+                this.referer = embed
+                this.quality = Qualities.Unknown.value
+                this.headers = segHeaders(embed)
+            }
+        )
+        true
+    }.getOrDefault(false)
+
+    // Tóm tắt trang embed để chẩn đoán khi không tầng nào lấy được link
+    private fun embedDigest(html: String): String {
+        val t = html.replace("\\/", "/")
+        val sb = StringBuilder()
+        sb.append("script src: ").append(
+            Regex("""<script[^>]+src=["']([^"']+)["']""").findAll(t).map { it.groupValues[1] }.take(8).joinToString(" ; ")
+        ).append("\n")
+        Regex("""(?i)stream-bootstrap|data-obf|jwplayer|\.setup\(|sources|"file"|file:|m3u8|atob\(|fetch\(|XMLHttpRequest|\$\.ajax|\.post\(|iframe|token|api=""")
+            .findAll(t).take(14).forEach {
+                val x = maxOf(0, it.range.first - 70)
+                val y = minOf(t.length, it.range.last + 150)
+                sb.append("> ").append(t.substring(x, y).replace(Regex("\\s+"), " ")).append("\n")
+            }
+        return sb.toString()
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -388,6 +640,8 @@ class NguonTVProvider : MainAPI() {
                 ).text
                 val embed = findEmbedUrl(playerResponse)
                 if (embed != null) {
+                    val st = resolveEmbed(embed, playerPage) { Log.d(TAG, it) }
+                    if (st != null && emitStream(st, embed, callback)) return true
                     val embedHtml = app.get(embed, headers = headers + ("Referer" to playerPage)).text
                     val hls = findHls(embedHtml)
                     if (hls != null) {
