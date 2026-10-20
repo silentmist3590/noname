@@ -1,22 +1,23 @@
 package com.phimvn
 
 import android.content.Context
+import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 
-// Ngăn cách giữa link m3u8 và link embed trong dữ liệu của mỗi tập
+private const val TAG = "PhimVN"
 private const val LINK_SEP = "|||"
 
-// Context của ứng dụng, dùng để hiện thông báo chẩn đoán
-private var appCtx: Context? = null
+private const val UA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-// Máy chủ HTTP nhỏ trên 127.0.0.1 để phát playlist đã giải mã cho trình phát
+/** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist đã giải mã cho trình phát. */
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var server: java.net.ServerSocket? = null
@@ -71,11 +72,19 @@ private object LocalPlaylist {
 @CloudstreamPlugin
 class PhimVNPlugin : Plugin() {
     override fun load(context: Context) {
-        appCtx = context.applicationContext ?: context
         registerMainAPI(PhimVNProvider())
     }
 }
 
+/**
+ * PhimVN lấy luồng phát theo nhiều tầng, thử lần lượt và kiểm tra kết quả ở từng tầng,
+ * để khi trang đổi cách phát thì tầng khác vẫn có thể cứu được:
+ *  1. m3u8 trực tiếp từ API
+ *  2. giao thức bootstrap (AES-GCM) của player embed
+ *  3. kiểu cũ data-obf
+ *  4. quét HTML embed (và iframe con) tìm .m3u8, tự giải mã playlist nếu bị mã hóa
+ *  5. WebView chạy player thật và bắt yêu cầu .m3u8
+ */
 class PhimVNProvider : MainAPI() {
     override var mainUrl = "https://phim.nguonc.com"
     override var name = "PhimVN"
@@ -86,106 +95,79 @@ class PhimVNProvider : MainAPI() {
         TvType.Movie,
         TvType.TvSeries,
         TvType.AsianDrama,
-        TvType.NSFW
+        TvType.Anime
     )
 
     override val mainPage = mainPageOf(
         "phim-moi-cap-nhat" to "Phim Mới Cập Nhật",
-        "the-loai/hanh-dong" to "Phim Hành Động",
-        "the-loai/phim-hai" to "Phim Hài",
-        "the-loai/chien-tranh" to "Phim Chiến Tranh",
-        "the-loai/lich-su" to "Phim Lịch Sử",
-        "the-loai/phim-18" to "Phim 18+",
         "danh-sach/phim-bo" to "Phim Bộ",
-        "danh-sach/phim-le" to "Phim Lẻ"
+        "danh-sach/phim-le" to "Phim Lẻ",
+        "danh-sach/hoat-hinh" to "Hoạt Hình"
     )
 
-    override suspend fun getMainPage(
-        page: Int,
-        request: MainPageRequest
-    ): HomePageResponse {
-        val url = "$mainUrl/api/films/${request.data}?page=$page"
-        val res = app.get(url).parsedSafe<NguonCListResponse>()
-        val homeItems = res?.items?.mapNotNull { it.toSearchResponse() } ?: emptyList()
+    // ---------------------------------------------------------------- danh sách / chi tiết
 
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val res = app.get("$mainUrl/api/films/${request.data}?page=$page").parsedSafe<PageResponse>()
+        val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
         val hasNext = (res?.paginate?.currentPage ?: 0) < (res?.paginate?.totalPage ?: 0)
-        return newHomePageResponse(request.name, homeItems, hasNext = hasNext)
+        return newHomePageResponse(request.name, list, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/api/films/search?keyword=$query"
-        val res = app.get(url).parsedSafe<NguonCListResponse>()
-        return res?.items?.mapNotNull { it.toSearchResponse() } ?: emptyList()
+        val res = app.get("$mainUrl/api/films/search?keyword=$query").parsedSafe<PageResponse>()
+        return res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
     }
 
-    private fun NguonCItem.toSearchResponse(): SearchResponse? {
+    private fun Item.toSearch(): SearchResponse? {
         val title = name ?: return null
+        val s = slug ?: return null
         val poster = posterUrl ?: thumbUrl
-        val yearInt = year?.toIntOrNull()
-        return newMovieSearchResponse(title, "$mainUrl/api/film/$slug", TvType.Movie) {
+        val yr = year?.toIntOrNull()
+        return newMovieSearchResponse(title, "$mainUrl/api/film/$s", TvType.Movie) {
             this.posterUrl = poster
-            this.year = yearInt
+            this.year = yr
         }
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val res = app.get(url).parsedSafe<NguonCDetailResponse>() ?: return null
-        val movie = res.movie ?: return null
+        val movie = app.get(url).parsedSafe<DetailResponse>()?.movie ?: return null
         val title = movie.name ?: return null
-        val poster = movie.posterUrl ?: movie.thumbUrl
-        val desc = movie.description
         val episodes = mutableListOf<Episode>()
-
         movie.episodes?.forEach { server ->
             val serverName = server.serverName ?: "NguonC"
             server.items?.forEach { ep ->
-                val epName = ep.name ?: "1"
-                val epNum = epName.toIntOrNull()
                 val embed = ep.embed
                 val m3u8 = ep.m3u8
                 if (!embed.isNullOrBlank() || !m3u8.isNullOrBlank()) {
                     episodes.add(
                         newEpisode("${m3u8.orEmpty()}$LINK_SEP${embed.orEmpty()}") {
-                            this.name = "$serverName - Tập $epName"
-                            this.episode = epNum
+                            this.name = "$serverName - Tập ${ep.name ?: "1"}"
+                            this.episode = ep.name?.toIntOrNull()
                         }
                     )
                 }
             }
         }
-
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-            this.posterUrl = poster
-            this.plot = desc
+            this.posterUrl = movie.posterUrl ?: movie.thumbUrl
+            this.plot = movie.description
             this.year = movie.year
         }
     }
 
-    private fun headOf(text: String?, n: Int = 70): String =
-        text?.trimStart()?.take(n)?.replace(Regex("\\s+"), " ") ?: "null"
+    // ---------------------------------------------------------------- phát
 
-    // Hiện thông báo nổi để xem chẩn đoán khi không có công cụ xem log
-    private fun toast(msg: String) {
-        val c = appCtx ?: return
-        runCatching {
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                android.widget.Toast.makeText(c, msg.take(200), android.widget.Toast.LENGTH_LONG).show()
-            }
-        }
-    }
+    /** Kết quả của một tầng: hoặc URL m3u8 dùng được ngay, hoặc nội dung playlist đã giải mã. */
+    private class Stream(val url: String?, val text: String?, val via: String)
 
-    // Chép nhật ký chẩn đoán vào clipboard để người dùng dán ra xem
-    private fun copyToClipboard(text: String) {
-        val c = appCtx ?: return
-        runCatching {
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                runCatching {
-                    val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                    cm.setPrimaryClip(android.content.ClipData.newPlainText("PhimVN log", text))
-                }
-            }
-        }
-    }
+    private fun segHeaders(embed: String) = mapOf(
+        "User-Agent" to UA,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "en-us,en;q=0.5",
+        "Sec-Fetch-Mode" to "navigate",
+        "Referer" to embed
+    )
 
     override suspend fun loadLinks(
         data: String,
@@ -193,157 +175,102 @@ class PhimVNProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val log = StringBuilder()
-        fun note(msg: String) {
-            log.append(msg).append('\n')
-            toast(msg)
-            copyToClipboard(log.toString())
-        }
-        note("v1 loadLinks data=${data.take(160)}")
-        return try {
-            loadLinksInner(data, callback, ::note)
-        } catch (t: Throwable) {
-            note("v1 EXCEPTION ${t.javaClass.simpleName}: ${t.message?.take(160)}")
-            false
-        }
-    }
-
-    private suspend fun loadLinksInner(
-        data: String,
-        callback: (ExtractorLink) -> Unit,
-        note: (String) -> Unit
-    ): Boolean {
         val parts = data.split(LINK_SEP, limit = 2)
-        val embed = (if (parts.size == 2) parts[1] else data).takeIf { it.isNotBlank() }
-        val apiM3u8 = (if (parts.size == 2) parts[0] else "").takeIf { it.isNotBlank() && it.contains(".m3u8") }
-        val embedRef = embed?.let { originOf(it) } ?: "$mainUrl/"
+        val embed = (if (parts.size == 2) parts[1] else data).trim().takeIf { it.isNotBlank() }
+        val apiM3u8 = (if (parts.size == 2) parts[0] else "").trim()
+            .takeIf { it.contains(".m3u8") }
 
-        suspend fun emit(url: String, ref: String): Boolean {
-            var ok = false
-            runCatching {
-                M3u8Helper.generateM3u8(name, url, ref).forEach {
-                    callback(it)
-                    ok = true
+        val e = embed ?: "$mainUrl/"
+        for (tag in listOf("api", "bootstrap", "data-obf", "scan", "webview")) {
+            val st = runCatching {
+                when (tag) {
+                    "api" -> apiM3u8?.let { direct(it, e, "api") }
+                    "bootstrap" -> embed?.let { viaBootstrap(it) }
+                    "data-obf" -> embed?.let { viaDataObf(it) }
+                    "scan" -> embed?.let { viaScan(it) }
+                    else -> embed?.let { viaWebView(it) }
                 }
+            }.onFailure {
+                Log.d(TAG, "tầng $tag lỗi: ${it.javaClass.simpleName} ${it.message?.take(120)}")
+            }.getOrNull()
+            if (st == null) {
+                Log.d(TAG, "tầng $tag: không có kết quả")
+                continue
             }
-            if (!ok) {
-                callback(
-                    newExtractorLink(name, name, url, ExtractorLinkType.M3U8) {
-                        this.referer = ref
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                ok = true
-            }
-            return ok
-        }
-
-        // 1) Link m3u8 trực tiếp từ API (nếu có)
-        note("v1 apiM3u8=${apiM3u8 ?: "null"} embed=${embed ?: "null"}")
-        if (apiM3u8 != null && emit(apiM3u8, embedRef)) return true
-        if (embed == null) return false
-
-        // 1b) Giao thức bootstrap của chính player embed (AES-GCM), giải mã bằng khóa dẫn xuất công khai
-        val boot = runCatching { bootstrapPlaylist(embed, note) }.getOrElse {
-            note("v1 bootstrap lỗi: ${it.javaClass.simpleName} ${it.message?.take(120)}")
-            null
-        }
-        if (boot != null) {
-            val firstSeg = boot.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
-            note("v1 đoạn đầu=${firstSeg?.take(120)}")
-            val embedOrigin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1).orEmpty()
-            val browser = mapOf(
-                "User-Agent" to UA,
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language" to "en-us,en;q=0.5",
-                "Sec-Fetch-Mode" to "navigate",
-                "Referer" to embed
-            )
-            val candidates = listOf(
-                "A" to browser,
-                "B" to browser + mapOf("Accept-Encoding" to "gzip, deflate"),
-                "C" to browser + mapOf("Origin" to embedOrigin),
-                "D" to mapOf("User-Agent" to UA, "Referer" to "$embedOrigin/")
-            )
-            var segHeaders: Map<String, String> = browser
-            if (firstSeg != null && firstSeg.startsWith("http")) {
-                var found = false
-                for ((tag, h) in candidates) {
-                    val pr = runCatching { app.get(firstSeg, headers = h) }.getOrNull()
-                    note("v1 thử đoạn [$tag] code=${pr?.code} kích thước=${pr?.text?.length}")
-                    if (pr != null && pr.code in 200..299) { segHeaders = h; found = true; break }
-                }
-                if (!found) note("v1 không bộ header nào qua được")
-            }
-            val ok = runCatching {
-                val local = LocalPlaylist.url(boot)
-                callback(
-                    newExtractorLink(name, name, local, ExtractorLinkType.M3U8) {
-                        this.referer = embed
-                        this.quality = Qualities.Unknown.value
-                        this.headers = segHeaders
-                    }
-                )
-                true
-            }.getOrDefault(false)
-            note("v1 bootstrap phát ok=$ok")
-            if (ok) return true
-        }
-
-        // 2) Trang embed mã hóa dữ liệu và tự giải mã bằng JS: cho nó chạy trong WebView
-        //    thật rồi bắt yêu cầu .m3u8 mà player phát ra.
-        note("v1: đang mở trang phát trong WebView...")
-        val sniffed = runCatching {
-            app.get(
-                embed,
-                referer = "$mainUrl/",
-                interceptor = WebViewResolver(Regex("""\.m3u8"""))
-            ).url
-        }.getOrElse {
-            note("v1 lỗi WebView: ${it.javaClass.simpleName} ${it.message?.take(80)}")
-            null
-        }
-        if (sniffed == null || !sniffed.contains(".m3u8")) {
-            note("v1: không bắt được .m3u8. sniff=${sniffed?.take(120)}")
-            return false
-        }
-        note("v1: bắt được ${sniffed.take(150)}")
-
-        val probe = runCatching { app.get(sniffed, referer = embedRef) }.getOrNull()
-        val body = probe?.text
-        note("v1: kiểm tra link code=${probe?.code} nội dung=${headOf(body, 60)}")
-        if (body?.trimStart()?.startsWith("#EXTM3U") == true) {
-            val r = emit(sniffed, embedRef)
-            note("v1 đã gửi link cho trình phát ok=$r")
-            return r
+            Log.d(TAG, "tầng $tag: dùng được (${st.via})")
+            if (emit(st, e, callback)) return true
         }
         return false
     }
 
+    private suspend fun emit(st: Stream, embed: String, callback: (ExtractorLink) -> Unit): Boolean = runCatching {
+        val link = if (st.text != null) LocalPlaylist.url(st.text) else st.url!!
+        callback(
+            newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
+                this.referer = embed
+                this.quality = Qualities.Unknown.value
+                this.headers = segHeaders(embed)
+            }
+        )
+        true
+    }.getOrDefault(false)
 
-    private val UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    // ----- kiểm tra / giải mã playlist dùng chung cho mọi tầng
 
-    private fun sha256(b: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(b)
+    private fun looksLikePlaylist(t: String?): Boolean =
+        t != null && t.trimStart().startsWith("#EXTM3U") && t.lines().any { it.isNotBlank() && !it.startsWith("#") }
 
-    private fun gcmDecrypt(key: ByteArray, iv: ByteArray, data: ByteArray, aad: ByteArray?): ByteArray {
-        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-        c.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"),
-            javax.crypto.spec.GCMParameterSpec(128, iv))
-        if (aad != null) c.updateAAD(aad)
-        return c.doFinal(data)
+    private fun hashOf(embed: String): String =
+        Regex("""[?&]hash=([0-9a-fA-F]+)""").find(embed)?.groupValues?.get(1).orEmpty()
+
+    /** Biến các dòng đường dẫn tương đối thành tuyệt đối để phát được từ máy chủ cục bộ. */
+    private fun absolutize(text: String, base: String): String {
+        val origin = Regex("""^(https?://[^/]+)""").find(base)?.groupValues?.get(1) ?: return text
+        val dir = base.substringBefore('?').substringBeforeLast('/') + "/"
+        return text.lines().joinToString("\n") { line ->
+            val l = line.trim()
+            when {
+                l.isEmpty() || l.startsWith("#") || l.startsWith("http") -> line
+                l.startsWith("/") -> origin + l
+                else -> dir + l
+            }
+        }
     }
 
-    private fun hex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+    private fun decryptPlaylist(text: String, videoHash: String): String? {
+        if (!text.contains("#ENC-AESGCM")) return text
+        val iv = Regex("""iv=([0-9a-fA-F]+)""").find(text)?.groupValues?.get(1) ?: return null
+        val line = text.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return null
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec("stream-derive-v1".toByteArray(), "HmacSHA256"))
+        val key = mac.doFinal(videoHash.toByteArray())
+        return String(gcm(key, hex(iv), android.util.Base64.decode(line, android.util.Base64.DEFAULT), null))
+    }
 
-    // Luồng giống player của trang embed (tham khảo NguonC-Downloader, GPL-3.0)
-    private suspend fun bootstrapPlaylist(embed: String, note: (String) -> Unit): String? {
+    /** Tải một URL m3u8, giải mã nếu cần, và trả về Stream nếu hợp lệ. */
+    private suspend fun direct(url: String, embed: String, via: String, hashes: List<String> = emptyList()): Stream? {
+        val r = app.get(url, referer = embed, headers = segHeaders(embed))
+        if (r.code != 200) return null
+        val body = r.text
+        if (body.contains("#ENC-AESGCM")) {
+            val tryHashes = (hashes + hashOf(embed)).filter { it.isNotBlank() }.distinct()
+            for (h in tryHashes) {
+                val plain = runCatching { decryptPlaylist(body, h) }.getOrNull()
+                if (looksLikePlaylist(plain)) return Stream(null, absolutize(plain!!, url), "$via+giải mã")
+            }
+            return null
+        }
+        return if (looksLikePlaylist(body)) Stream(url, null, via) else null
+    }
+
+    // ----- tầng 2: bootstrap
+
+    private suspend fun viaBootstrap(embed: String): Stream? {
         val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
         val shell = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA))
-        note("v1 shell code=${shell.code} len=${shell.text.length}")
-        val api = Regex("""<script id="stream-bootstrap"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
-            .find(shell.text)?.groupValues?.get(1)?.let { org.json.JSONObject(it).optString("api") }
-        if (api.isNullOrBlank()) { note("v1 không thấy stream-bootstrap"); return null }
-        val hashFromUrl = Regex("""[?&]hash=([0-9a-f]+)""").find(embed)?.groupValues?.get(1).orEmpty()
+        val cfg = Regex("""<script id="stream-bootstrap"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
+            .find(shell.text)?.groupValues?.get(1) ?: return null
+        val api = org.json.JSONObject(cfg).optString("api").takeIf { it.isNotBlank() } ?: return null
 
         val body = org.json.JSONObject().apply {
             put("action", "bootstrap")
@@ -360,86 +287,110 @@ class PhimVNProvider : MainAPI() {
             requestBody = body.toRequestBody("application/json".toMediaType()),
             headers = mapOf("Origin" to origin, "Referer" to embed, "User-Agent" to UA, "Accept" to "*/*")
         )
-        note("v1 bootstrap POST code=${resp.code} len=${resp.text.length}")
-        if (resp.code != 200) { note("v1 ${headOf(resp.text, 80)}"); return null }
+        if (resp.code != 200) return null
 
         var j = org.json.JSONObject(resp.text)
         if (j.optString("format") == "aesgcm-v1") {
             val aad = "stream-bootstrap-v1\n$api".toByteArray()
-            val plain = gcmDecrypt(sha256(aad), hex(j.getString("iv")), android.util.Base64.decode(j.getString("data"), android.util.Base64.DEFAULT), aad)
+            val plain = gcm(
+                sha256(aad), hex(j.getString("iv")),
+                android.util.Base64.decode(j.getString("data"), android.util.Base64.DEFAULT), aad
+            )
             j = org.json.JSONObject(String(plain))
         }
-        val video = j.optString("video").ifBlank { hashFromUrl }
-        val pl = j.optJSONObject("preissued")?.optString("playlist")
-        if (pl.isNullOrBlank()) { note("v1 không có preissued (turnstile=${j.optBoolean("turnstileEnabled")})"); return null }
+        val video = j.optString("video").ifBlank { hashOf(embed) }
+        val playlist = j.optJSONObject("preissued")?.optString("playlist")?.takeIf { it.isNotBlank() } ?: return null
+        return direct(playlist, embed, "bootstrap", listOf(video))
+    }
 
-        val plResp = app.get(pl, referer = embed, headers = mapOf("User-Agent" to UA))
-        note("v1 playlist code=${plResp.code} đầu=${headOf(plResp.text, 40)}")
-        var text = plResp.text
-        if (text.contains("#ENC-AESGCM")) {
-            val iv = Regex("""iv=([0-9a-fA-F]+)""").find(text)?.groupValues?.get(1) ?: return null
-            val line = text.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return null
-            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-            mac.init(javax.crypto.spec.SecretKeySpec("stream-derive-v1".toByteArray(), "HmacSHA256"))
-            val key = mac.doFinal(video.toByteArray())
-            text = String(gcmDecrypt(key, hex(iv), android.util.Base64.decode(line, android.util.Base64.DEFAULT), null))
+    // ----- tầng 3: data-obf (kiểu cũ)
+
+    private suspend fun viaDataObf(embed: String): Stream? {
+        val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
+        val html = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
+        val obf = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.get(1) ?: return null
+        val j = org.json.JSONObject(String(android.util.Base64.decode(obf, android.util.Base64.DEFAULT)))
+        val sub = j.optString("sUb").takeIf { it.isNotBlank() } ?: return null
+        return direct("$origin/$sub.m3u8", embed, "data-obf", listOf(j.optString("hD")))
+    }
+
+    // ----- tầng 4: quét HTML (kể cả iframe con)
+
+    private suspend fun viaScan(embed: String): Stream? {
+        val seen = mutableSetOf<String>()
+        suspend fun scan(url: String, depth: Int): Stream? {
+            if (!seen.add(url) || depth > 1) return null
+            val html = app.get(url, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
+                .replace("\\/", "/")
+            for (m in Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").findAll(html)) {
+                direct(m.value, embed, "scan", listOf(hashOf(embed)))?.let { return it }
+            }
+            for (m in Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html)) {
+                val src = m.groupValues[1].let { if (it.startsWith("//")) "https:$it" else it }
+                if (src.startsWith("http")) scan(src, depth + 1)?.let { return it }
+            }
+            return null
         }
-        return text.takeIf { it.trimStart().startsWith("#EXTM3U") }
+        return scan(embed, 0)
     }
 
-    private fun originOf(url: String): String {
-        val m = Regex("""^(https?://[^/]+)""").find(url)
-        return (m?.groupValues?.get(1) ?: mainUrl) + "/"
+    // ----- tầng 5: WebView
+
+    private suspend fun viaWebView(embed: String): Stream? {
+        val sniffed = app.get(
+            embed,
+            referer = "$mainUrl/",
+            interceptor = WebViewResolver(Regex("""\.m3u8"""))
+        ).url
+        if (!sniffed.contains(".m3u8")) return null
+        return direct(sniffed, embed, "webview", listOf(hashOf(embed)))
     }
 
-    data class NguonCPaginate(
+    // ---------------------------------------------------------------- mật mã
+
+    private fun sha256(b: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(b)
+
+    private fun gcm(key: ByteArray, iv: ByteArray, data: ByteArray, aad: ByteArray?): ByteArray {
+        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(
+            javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, iv)
+        )
+        if (aad != null) c.updateAAD(aad)
+        return c.doFinal(data)
+    }
+
+    private fun hex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+    // ---------------------------------------------------------------- dữ liệu
+
+    data class Paginate(
         @JsonProperty("current_page") val currentPage: Int?,
-        @JsonProperty("total_page") val totalPage: Int?,
-        @JsonProperty("total_items") val totalItems: Int?,
-        @JsonProperty("items_per_page") val itemsPerPage: Int?
+        @JsonProperty("total_page") val totalPage: Int?
     )
 
-    data class NguonCItem(
+    data class Item(
         val name: String?,
-        @JsonProperty("original_name") val originalName: String?,
         val slug: String?,
         val year: String?,
-        val description: String?,
         @JsonProperty("poster_url") val posterUrl: String?,
         @JsonProperty("thumb_url") val thumbUrl: String?
     )
 
-    data class NguonCListResponse(
-        val status: String?,
-        val paginate: NguonCPaginate?,
-        val items: List<NguonCItem>?
-    )
+    data class PageResponse(val paginate: Paginate?, val items: List<Item>?)
 
-    data class NguonCEpisodeItem(
+    data class EpisodeItem(val name: String?, val slug: String?, val embed: String?, val m3u8: String?)
+
+    data class Server(@JsonProperty("server_name") val serverName: String?, val items: List<EpisodeItem>?)
+
+    data class Movie(
         val name: String?,
-        val slug: String?,
-        val embed: String?,
-        val m3u8: String?
-    )
-
-    data class NguonCServer(
-        @JsonProperty("server_name") val serverName: String?,
-        val items: List<NguonCEpisodeItem>?
-    )
-
-    data class NguonCMovie(
-        val name: String?,
-        @JsonProperty("original_name") val originalName: String?,
-        val slug: String?,
         val year: Int?,
         val description: String?,
         @JsonProperty("poster_url") val posterUrl: String?,
         @JsonProperty("thumb_url") val thumbUrl: String?,
-        val episodes: List<NguonCServer>?
+        val episodes: List<Server>?
     )
 
-    data class NguonCDetailResponse(
-        val status: String?,
-        val movie: NguonCMovie?
-    )
+    data class DetailResponse(val movie: Movie?)
 }
