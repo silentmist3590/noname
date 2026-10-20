@@ -1,4 +1,4 @@
-version = 11
+version = 14
 
 cloudstream {
     description = "NguonTV movie and series provider. VPN may be needed for some titles."
