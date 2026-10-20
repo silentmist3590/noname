@@ -168,7 +168,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v8 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v9 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = mutableListOf<HomePageList>()
@@ -177,7 +177,7 @@ class NguonTVProvider : MainAPI() {
         homePage.add(
             HomePageList(
                 "DEBUG",
-                listOf(newMovieSearchResponse("Chẩn đoán phát v8", "$mainUrl/__debug", TvType.Movie))
+                listOf(newMovieSearchResponse("Chẩn đoán phát v9", "$mainUrl/__debug", TvType.Movie))
             )
         )
         return newHomePageResponse(homePage, hasNext = false)
@@ -326,7 +326,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v8", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v9", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -595,19 +595,20 @@ class NguonTVProvider : MainAPI() {
         true
     }.getOrDefault(false)
 
-    // Tóm tắt trang embed để chẩn đoán khi không tầng nào lấy được link
+    // Chép các script nội tuyến có dựng JW Player để chẩn đoán cách nguồn phát bị giấu
     private fun embedDigest(html: String): String {
         val t = html.replace("\\/", "/")
         val sb = StringBuilder()
-        sb.append("script src: ").append(
-            Regex("""<script[^>]+src=["']([^"']+)["']""").findAll(t).map { it.groupValues[1] }.take(8).joinToString(" ; ")
-        ).append("\n")
-        Regex("""(?i)stream-bootstrap|data-obf|jwplayer|\.setup\(|sources|"file"|file:|m3u8|atob\(|fetch\(|XMLHttpRequest|\$\.ajax|\.post\(|iframe|token|api=""")
-            .findAll(t).take(14).forEach {
-                val x = maxOf(0, it.range.first - 70)
-                val y = minOf(t.length, it.range.last + 150)
-                sb.append("> ").append(t.substring(x, y).replace(Regex("\\s+"), " ")).append("\n")
-            }
+        val scripts = Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
+            .findAll(t).map { it.groupValues[1] }
+            .filter { it.contains("npJWPlayer") || Regex("""function\s+f\d""").containsMatchIn(it) }
+            .toList()
+        sb.append("số script liên quan=${scripts.size}\n")
+        scripts.take(3).forEachIndexed { i, sc ->
+            val c = sc.replace(Regex("\\s+"), " ").trim()
+            sb.append("SCRIPT $i (dài ${c.length}): ").append(c.take(3200)).append("\n")
+            if (c.length > 3200) sb.append("... cuối: ").append(c.takeLast(500)).append("\n")
+        }
         return sb.toString()
     }
 
