@@ -168,7 +168,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v10 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return debugHome("Bấm vào đây xem chẩn đoán v11 (code=${res.code} len=${res.text.length} title=${doc.title()})")
         }
 
         val homePage = mutableListOf<HomePageList>()
@@ -177,7 +177,7 @@ class NguonTVProvider : MainAPI() {
         homePage.add(
             HomePageList(
                 "DEBUG",
-                listOf(newMovieSearchResponse("Chẩn đoán phát v10", "$mainUrl/__debug", TvType.Movie))
+                listOf(newMovieSearchResponse("Chẩn đoán phát v11", "$mainUrl/__debug", TvType.Movie))
             )
         )
         return newHomePageResponse(homePage, hasNext = false)
@@ -326,7 +326,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v10", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v11", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -422,15 +422,17 @@ class NguonTVProvider : MainAPI() {
 
     // ================= Lấy luồng phát từ trang embed (nhiều tầng dự phòng) =================
 
-    private class Stream(val url: String?, val text: String?, val via: String)
+    private class Stream(val url: String?, val text: String?, val via: String, val ref: String? = null)
 
-    private fun segHeaders(embed: String) = mapOf(
-        "User-Agent" to ua,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language" to "en-us,en;q=0.5",
-        "Sec-Fetch-Mode" to "navigate",
-        "Referer" to embed
-    )
+    private fun segHeaders(embed: String): Map<String, String> {
+        val base = mapOf(
+            "User-Agent" to ua,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-us,en;q=0.5",
+            "Sec-Fetch-Mode" to "navigate"
+        )
+        return if (embed.isBlank()) base else base + ("Referer" to embed)
+    }
 
     private fun originOf(url: String): String =
         Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1).orEmpty()
@@ -478,18 +480,22 @@ class NguonTVProvider : MainAPI() {
         return String(gcm(key, hex(iv), android.util.Base64.decode(line, android.util.Base64.DEFAULT), null))
     }
 
-    private suspend fun direct(url: String, embed: String, via: String, hashes: List<String> = emptyList()): Stream? {
-        val r = app.get(url, referer = embed, headers = segHeaders(embed))
-        if (r.code != 200) return null
+    private suspend fun direct(
+        url: String, embed: String, via: String, hashes: List<String> = emptyList(),
+        ref: String = embed, log: (String) -> Unit = {}
+    ): Stream? {
+        val r = app.get(url, referer = ref.ifBlank { null }, headers = segHeaders(ref))
         val body = r.text
+        log("  GET ${url.take(70)} ref=${ref.take(30)} code=${r.code} đầu=${body.trimStart().take(60).replace(Regex("\\s+"), " ")}")
+        if (r.code != 200) return null
         if (body.contains("#ENC-AESGCM")) {
             for (h in (hashes + hashOf(embed)).filter { it.isNotBlank() }.distinct()) {
                 val plain = runCatching { decryptPlaylist(body, h) }.getOrNull()
-                if (looksLikePlaylist(plain)) return Stream(null, absolutize(plain!!, url), "$via+giải mã")
+                if (looksLikePlaylist(plain)) return Stream(null, absolutize(plain!!, url), "$via+giải mã", ref)
             }
             return null
         }
-        return if (looksLikePlaylist(body)) Stream(url, null, via) else null
+        return if (looksLikePlaylist(body)) Stream(url, null, via, ref) else null
     }
 
     private suspend fun viaBootstrap(embed: String, page: String): Stream? {
@@ -557,8 +563,9 @@ class NguonTVProvider : MainAPI() {
 
     // Trang embed của NguonTV giấu nguồn phát trong biến chuỗi base64 (tên biến đổi mỗi lần tải),
     // ví dụ [{"file":"https://.../index.m3u8","type":"hls"}]. Giải mọi chuỗi base64 dài và tìm link .m3u8.
-    private suspend fun viaB64(embed: String, page: String): Stream? {
+    private suspend fun viaB64(embed: String, page: String, log: (String) -> Unit): Stream? {
         val html = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text
+        var found = 0
         for (m in Regex("""["']([A-Za-z0-9+/=_-]{40,})["']""").findAll(html)) {
             val decoded = runCatching {
                 String(android.util.Base64.decode(m.groupValues[1], android.util.Base64.DEFAULT))
@@ -567,8 +574,13 @@ class NguonTVProvider : MainAPI() {
             val text = decoded.replace("\\/", "/")
             val url = Regex("""https?://[^\s"'<>\\]+""").findAll(text).map { it.value }
                 .firstOrNull { it.contains(".m3u8") } ?: continue
-            direct(url, embed, "base64")?.let { return it }
+            found++
+            log("  base64 -> $url")
+            for (ref in listOf(embed, "$mainUrl/", "${originOf(embed)}/", "")) {
+                direct(url, embed, "base64", emptyList(), ref, log)?.let { return it }
+            }
         }
+        if (found == 0) log("  base64: không có chuỗi nào giải ra link .m3u8")
         return null
     }
 
@@ -588,7 +600,7 @@ class NguonTVProvider : MainAPI() {
                 when (tag) {
                     "bootstrap" -> viaBootstrap(embed, page)
                     "data-obf" -> viaDataObf(embed, page)
-                    "base64" -> viaB64(embed, page)
+                    "base64" -> viaB64(embed, page, log)
                     "scan" -> viaScan(embed, page)
                     else -> viaWebView(embed, page)
                 }
@@ -604,11 +616,12 @@ class NguonTVProvider : MainAPI() {
 
     private suspend fun emitStream(st: Stream, embed: String, callback: (ExtractorLink) -> Unit): Boolean = runCatching {
         val link = if (st.text != null) LocalPlaylist.url(st.text) else st.url!!
+        val r = st.ref ?: embed
         callback(
             newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
-                this.referer = embed
+                this.referer = r
                 this.quality = Qualities.Unknown.value
-                this.headers = segHeaders(embed)
+                this.headers = segHeaders(r)
             }
         )
         true
