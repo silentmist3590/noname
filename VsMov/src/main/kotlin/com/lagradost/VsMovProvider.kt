@@ -15,6 +15,54 @@ private const val VS_SEP = "|||"
 // Đặt false khi đã chạy ổn để tắt việc chép log vào clipboard
 private const val DEBUG = true
 
+/** Máy chủ HTTP nhỏ trên 127.0.0.1: đưa playlist đã tải/kiểm tra sẵn cho trình phát (mỗi lần phát một địa chỉ riêng, không dính cache cũ). */
+private object LocalPlaylist {
+    private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private var server: java.net.ServerSocket? = null
+
+    @Synchronized
+    fun url(text: String): String {
+        val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
+            server = it
+            Thread {
+                while (!it.isClosed) {
+                    val c = try { it.accept() } catch (e: Exception) { break }
+                    Thread { handle(c) }.apply { isDaemon = true }.start()
+                }
+            }.apply { isDaemon = true }.start()
+        }
+        val id = "pl_${System.nanoTime()}.m3u8"
+        store[id] = text
+        return "http://127.0.0.1:${s.localPort}/$id"
+    }
+
+    private fun handle(c: java.net.Socket) {
+        runCatching {
+            c.use {
+                val r = c.getInputStream().bufferedReader()
+                val line = r.readLine() ?: return
+                while (true) {
+                    val h = r.readLine() ?: break
+                    if (h.isEmpty()) break
+                }
+                val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
+                val body = path?.let { store[it] }?.toByteArray()
+                val out = c.getOutputStream()
+                if (body == null) {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                } else {
+                    out.write(
+                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray()
+                    )
+                    if (!line.startsWith("HEAD")) out.write(body)
+                }
+                out.flush()
+            }
+        }
+    }
+}
+
 // Context của ứng dụng, dùng để mở trình duyệt khi không có link phát được
 private var vsAppCtx: Context? = null
 
@@ -247,6 +295,87 @@ class VsMovProvider : MainAPI() {
         return null
     }
 
+    private val vsUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+    private fun playerHeaders(ref: String) = mapOf(
+        "User-Agent" to vsUa,
+        "Accept" to "*/*",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer" to ref
+    )
+
+    private fun resolveUrl(u: String, base: String): String = when {
+        u.startsWith("http") -> u
+        u.startsWith("//") -> "https:$u"
+        u.startsWith("/") -> (Regex("^(https?://[^/]+)").find(base)?.groupValues?.get(1) ?: "") + u
+        else -> base.substringBefore('?').substringBeforeLast('/') + "/" + u
+    }
+
+    // Đổi mọi đường dẫn tương đối (dòng segment, URI="..." của khóa/map) thành URL tuyệt đối
+    private fun absAll(text: String, base: String): String {
+        val withUri = Regex("""URI="([^"]+)"""").replace(text) { """URI="${resolveUrl(it.groupValues[1], base)}"""" }
+        return withUri.lines().joinToString("\n") { l ->
+            val t = l.trim()
+            if (t.isEmpty() || t.startsWith("#")) l else resolveUrl(t, base)
+        }
+    }
+
+    // Tải playlist đủ và hợp lệ: bắt đầu #EXTM3U; playlist VOD (có #EXTINF) phải kết thúc bằng #EXT-X-ENDLIST.
+    // Playlist bị cắt cụt sẽ được coi là "trực tiếp" nên trình phát chạy đến hết đoạn có rồi lỗi 3002.
+    private suspend fun fetchPlaylist(url: String, ref: String): String? {
+        var best: String? = null
+        for (attempt in 1..3) {
+            val body = runCatching { app.get(url, referer = ref, headers = playerHeaders(ref)).text }.getOrNull()
+            if (body != null && body.trimStart().startsWith("#EXTM3U")) {
+                val isMedia = body.contains("#EXTINF")
+                if (!isMedia || body.contains("#EXT-X-ENDLIST")) return body
+                if (best == null || body.length > best.length) best = body
+            }
+        }
+        return best
+    }
+
+    // Từ một link m3u8 (master hoặc media) tạo các link phát qua máy chủ cục bộ; trả về số link đã gửi
+    private suspend fun emitHls(url: String, ref: String, callback: (ExtractorLink) -> Unit): Int {
+        val text = fetchPlaylist(url, ref) ?: return 0
+        val abs = absAll(text, url)
+        var count = 0
+        if (abs.contains("#EXT-X-STREAM-INF")) {
+            val ls = abs.lines()
+            class V(val bw: Long, val h: Int, val url: String)
+            val vs = mutableListOf<V>()
+            for (i in ls.indices) {
+                if (!ls[i].startsWith("#EXT-X-STREAM-INF")) continue
+                val bw = Regex("""BANDWIDTH=(\d+)""").find(ls[i])?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                val h = Regex("""RESOLUTION=\d+x(\d+)""").find(ls[i])?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val u = ls.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }?.trim() ?: continue
+                vs.add(V(bw, h, u))
+            }
+            for (v in vs.sortedByDescending { it.bw }.take(4)) {
+                val vt = fetchPlaylist(v.url, ref) ?: continue
+                val link = LocalPlaylist.url(absAll(vt, v.url))
+                callback(
+                    newExtractorLink(name, if (v.h > 0) "$name ${v.h}p" else name, link, ExtractorLinkType.M3U8) {
+                        this.referer = ref
+                        this.quality = if (v.h > 0) v.h else Qualities.Unknown.value
+                        this.headers = playerHeaders(ref)
+                    }
+                )
+                count++
+            }
+        } else {
+            callback(
+                newExtractorLink(name, name, LocalPlaylist.url(abs), ExtractorLinkType.M3U8) {
+                    this.referer = ref
+                    this.quality = Qualities.Unknown.value
+                    this.headers = playerHeaders(ref)
+                }
+            )
+            count++
+        }
+        return count
+    }
+
     // Chép log vào clipboard để dán ra chat (chỉ khi DEBUG = true)
     private fun copyToClipboard(text: String) {
         val c = vsAppCtx ?: return
@@ -275,6 +404,8 @@ class VsMovProvider : MainAPI() {
 
         // 1) Link m3u8 từ API: chỉ dùng nếu là playlist HLS thật
         if (m3u8.startsWith("http")) {
+            if (emitHls(m3u8, ref, callback) > 0) return true
+            // Dự phòng: cách cũ của CloudStream
             val body = runCatching { app.get(m3u8, referer = ref).text }.getOrNull()
             if (body?.trimStart()?.startsWith("#EXTM3U") == true) {
                 var ok = false
@@ -293,6 +424,7 @@ class VsMovProvider : MainAPI() {
             val log = StringBuilder()
             val found = findM3u8(embed, log)
             if (found != null) {
+                if (emitHls(found, originOf(embed), callback) > 0) return true
                 var ok = false
                 runCatching {
                     M3u8Helper.generateM3u8(name, found, originOf(embed)).forEach {
