@@ -307,7 +307,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v17", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v18", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -403,7 +403,8 @@ class NguonTVProvider : MainAPI() {
 
     // ================= Lấy luồng phát từ trang embed (nhiều tầng dự phòng) =================
 
-    private class Stream(val url: String?, val text: String?, val via: String, val ref: String? = null, val hdr: Map<String, String>? = null)
+    private class Stream(val url: String?, val text: String?, val via: String, val ref: String? = null, val hdr: Map<String, String>? = null,
+                         val token: String? = null, val streamUrl: String? = null)
 
     private fun segHeaders(embed: String): Map<String, String> {
         val base = mapOf(
@@ -557,8 +558,13 @@ class NguonTVProvider : MainAPI() {
                 .firstOrNull { it.contains(".m3u8") } ?: continue
             found++
             log("  base64 -> $url")
+            val token = Regex(""""token"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+            val streamUrl = Regex(""""streamUrl"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+            log("  token=${if (token != null) "có(${token.length})" else "không"} streamUrl=${streamUrl ?: "không"}")
             for (ref in listOf(embed, "$mainUrl/", "${originOf(embed)}/", "")) {
-                direct(url, embed, "base64", emptyList(), ref, log)?.let { return it }
+                direct(url, embed, "base64", emptyList(), ref, log)?.let {
+                    return Stream(it.url, it.text, it.via, it.ref, it.hdr, token, streamUrl)
+                }
             }
         }
         if (found == 0) log("  base64: không có chuỗi nào giải ra link .m3u8")
@@ -644,6 +650,24 @@ class NguonTVProvider : MainAPI() {
     }
 
     // Thử nhiều bộ header trên segment đầu tiên (và key nếu có) rồi chọn bộ chạy được cho ExoPlayer
+    // Trang gốc: với nguồn có token, mọi request /key đổi host sang streamUrl và thêm header "token"
+    private fun rewriteKeyUrl(u: String, streamUrl: String?): String =
+        if (streamUrl.isNullOrBlank() || u.contains(streamUrl)) u
+        else u.replace(Regex("""https?://[^/]*/key""", RegexOption.IGNORE_CASE), streamUrl.trimEnd('/') + "/key")
+
+    private suspend fun fetchKey(u: String, base: Map<String, String>, token: String?, streamUrl: String?, log: (String) -> Unit): ByteArray? {
+        val url = rewriteKeyUrl(u, streamUrl)
+        val h = if (token != null) base + ("token" to token) else base
+        return runCatching {
+            val r = app.get(url, referer = h["Referer"], headers = h)
+            val b = r.okhttpResponse.body.bytes()
+            if (r.code == 200 && b.size == 16) b else {
+                log("  key ${url.takeLast(24)} -> ${r.code}/${r.headers["Content-Type"] ?: "?"}/${b.size}byte")
+                null
+            }
+        }.getOrElse { log("  key lỗi ${it.javaClass.simpleName} ${it.message?.take(60)}"); null }
+    }
+
     private fun headBytes(r: okhttp3.Response, n: Int): ByteArray = runCatching {
         r.body.byteStream().use { st ->
             val buf = ByteArray(n)
@@ -658,7 +682,7 @@ class NguonTVProvider : MainAPI() {
     }.getOrDefault(ByteArray(0))
 
     // Thử tải segment đầu + khóa AES với vài bộ header; chọn bộ chạy được. Không đọc cả segment vào bộ nhớ.
-    private suspend fun probeSegments(text: String, embed: String, cookies: Map<String, String>, log: (String) -> Unit): Pair<Map<String, String>?, ByteArray?> {
+    private suspend fun probeSegments(text: String, embed: String, cookies: Map<String, String>, token: String?, streamUrl: String?, log: (String) -> Unit): Pair<Map<String, String>?, ByteArray?> {
         val lines = text.lines()
         log("  playlist: " + lines.map { it.trim() }.filter { it.isNotEmpty() }.take(7).joinToString(" | ") { it.take(90) })
         val seg = lines.map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return Pair(null, null)
@@ -697,7 +721,7 @@ class NguonTVProvider : MainAPI() {
             var keyOk = key == null
             var kb: ByteArray? = null
             if (key != null) {
-                val kr = runCatching { app.get(key, referer = ref, headers = h, cookies = cookies) }.getOrNull()
+                val kr = runCatching { app.get(rewriteKeyUrl(key, streamUrl), referer = ref, headers = if (token != null) h + ("token" to token) else h, cookies = cookies) }.getOrNull()
                 if (kr == null) res.add("key=LỖI") else {
                     kb = runCatching { kr.okhttpResponse.body.bytes() }.getOrDefault(ByteArray(0))
                     keyOk = kr.code == 200 && kb.size == 16
@@ -751,16 +775,21 @@ class NguonTVProvider : MainAPI() {
                 if (r.code == 200 && looksLikePlaylist(r.text)) text = absAll(r.text, best)
             }
         }
-        val (hdr, keyBytes) = runCatching { probeSegments(text, embed, cookies, log) }
+        val (hdr, keyBytes) = runCatching { probeSegments(text, embed, cookies, st.token, st.streamUrl, log) }
             .getOrElse { log("  probe lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); Pair(null, null) }
-        val keyRe = Regex("""(#EXT-X-KEY:[^\n]*?URI=")([^"]+)(")""")
-        val keyUris = keyRe.findAll(text).map { it.groupValues[2] }.toSet()
-        if (keyBytes != null && keyUris.size == 1) {
-            val local = LocalPlaylist.bytes(keyBytes)
-            text = keyRe.replace(text) { it.groupValues[1] + local + it.groupValues[3] }
-            log("  key AES đã tải sẵn (${keyBytes.size} byte) và phát qua máy chủ cục bộ")
+        val keyRe = Regex("""#EXT-X-KEY:[^\n]*?URI="([^"]+)"""")
+        val keyUris = keyRe.findAll(text).map { it.groupValues[1] }.toList().distinct()
+        if (keyUris.isNotEmpty()) {
+            val base = hdr ?: segHeaders(ref)
+            var okKeys = 0
+            for (u in keyUris.take(300)) {
+                val kb = fetchKey(u, base, st.token, st.streamUrl, log) ?: continue
+                text = text.replace("URI=\"$u\"", "URI=\"${LocalPlaylist.bytes(kb)}\"")
+                okKeys++
+            }
+            log("  khóa AES: $okKeys/${keyUris.size} tải được và phát qua máy chủ cục bộ")
         }
-        Stream(null, text, st.via + "+flat", ref, hdr)
+        Stream(null, text, st.via + "+flat", ref, hdr, st.token, st.streamUrl)
     }.getOrElse { log("  flat lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); st }
 
     private suspend fun resolveFilm(basePage: String, playerPage: String, log: (String) -> Unit): Res? {
@@ -810,7 +839,7 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v17 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        val lines = mutableListOf("NguonTV v18 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
