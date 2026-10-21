@@ -389,7 +389,7 @@ class NguonTVProvider : MainAPI() {
 
     // ================= Lấy luồng phát từ trang embed (nhiều tầng dự phòng) =================
 
-    private class Stream(val url: String?, val text: String?, val via: String, val ref: String? = null)
+    private class Stream(val url: String?, val text: String?, val via: String, val ref: String? = null, val hdr: Map<String, String>? = null)
 
     private fun segHeaders(embed: String): Map<String, String> {
         val base = mapOf(
@@ -586,9 +586,9 @@ class NguonTVProvider : MainAPI() {
         val r = st.ref ?: embed
         callback(
             newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
-                this.referer = r
+                this.referer = st.hdr?.get("Referer") ?: if (st.hdr != null) "" else r
                 this.quality = Qualities.Unknown.value
-                this.headers = segHeaders(r)
+                this.headers = st.hdr ?: segHeaders(r)
             }
         )
         true
@@ -629,6 +629,41 @@ class NguonTVProvider : MainAPI() {
         }
     }
 
+    // Thử nhiều bộ header trên segment đầu tiên (và key nếu có) rồi chọn bộ chạy được cho ExoPlayer
+    private suspend fun probeSegments(text: String, embed: String, log: (String) -> Unit): Map<String, String>? {
+        val lines = text.lines()
+        log("  playlist: " + lines.map { it.trim() }.filter { it.isNotEmpty() }.take(7).joinToString(" | ") { it.take(90) })
+        val seg = lines.map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return null
+        val key = Regex("""#EXT-X-KEY:[^\n]*URI="([^"]+)"""").find(text)?.groupValues?.get(1)
+        val mapUri = Regex("""#EXT-X-MAP:[^\n]*URI="([^"]+)"""").find(text)?.groupValues?.get(1)
+        val origin = originOf(embed)
+        val sets = listOf(
+            "A:embed" to segHeaders(embed),
+            "B:chỉ-UA" to mapOf("User-Agent" to ua),
+            "C:ref-trang-chủ" to mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"),
+            "D:ref+origin" to mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin),
+            "E:accept-all" to mapOf("User-Agent" to ua, "Accept" to "*/*", "Referer" to embed)
+        )
+        var chosen: Map<String, String>? = null
+        for ((tag, h) in sets) {
+            val res = mutableListOf<String>()
+            var allOk = true
+            for ((what, u) in listOfNotNull("seg" to seg, key?.let { "key" to it }, mapUri?.let { "map" to it })) {
+                val r = runCatching { app.get(u, referer = h["Referer"], headers = h) }.getOrNull()
+                if (r == null) { res.add("$what=LỖI"); allOk = false; continue }
+                val b = r.text
+                val ct = r.headers["content-type"] ?: r.headers["Content-Type"] ?: "?"
+                val hexHead = b.take(4).toByteArray().joinToString("") { "%02x".format(it) }
+                res.add("$what=${r.code}/$ct/len=${b.length}/head=$hexHead")
+                if (r.code != 200) allOk = false
+            }
+            log("  probe $tag: ${res.joinToString(" ")} url=${seg.take(60)}")
+            if (allOk && chosen == null) { chosen = h; break }
+        }
+        log("  probe chọn: ${chosen?.let { c -> sets.first { it.second == c }.first } ?: "KHÔNG CÓ (giữ A)"}")
+        return chosen
+    }
+
     // Tải playlist, nếu là master thì chọn chất lượng cao nhất, tải playlist con rồi phát qua máy chủ cục bộ
     private suspend fun flatten(st: Stream, embed: String, log: (String) -> Unit): Stream = runCatching {
         val ref = st.ref ?: embed
@@ -653,7 +688,8 @@ class NguonTVProvider : MainAPI() {
                 if (r.code == 200 && looksLikePlaylist(r.text)) text = absAll(r.text, best)
             }
         }
-        Stream(null, text, st.via + "+flat", ref)
+        val hdr = probeSegments(text, embed, log)
+        Stream(null, text, st.via + "+flat", ref, hdr)
     }.getOrElse { log("  flat lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); st }
 
     private suspend fun resolveFilm(basePage: String, playerPage: String, log: (String) -> Unit): Res? {
@@ -703,7 +739,7 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v13 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        val lines = mutableListOf("NguonTV v15 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
