@@ -307,7 +307,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v16", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v17", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -658,7 +658,7 @@ class NguonTVProvider : MainAPI() {
     }.getOrDefault(ByteArray(0))
 
     // Thử tải segment đầu + khóa AES với vài bộ header; chọn bộ chạy được. Không đọc cả segment vào bộ nhớ.
-    private suspend fun probeSegments(text: String, embed: String, log: (String) -> Unit): Pair<Map<String, String>?, ByteArray?> {
+    private suspend fun probeSegments(text: String, embed: String, cookies: Map<String, String>, log: (String) -> Unit): Pair<Map<String, String>?, ByteArray?> {
         val lines = text.lines()
         log("  playlist: " + lines.map { it.trim() }.filter { it.isNotEmpty() }.take(7).joinToString(" | ") { it.take(90) })
         val seg = lines.map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return Pair(null, null)
@@ -672,8 +672,14 @@ class NguonTVProvider : MainAPI() {
             "D:ref+origin" to mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin),
             "E:accept-all" to mapOf("User-Agent" to ua, "Accept" to "*/*", "Referer" to embed),
             "F:embed+origin" to (segHeaders(embed) + ("Origin" to origin)),
-            "G:không-header" to emptyMap()
+            "G:không-header" to emptyMap(),
+            "H:cors-trình-duyệt" to mapOf(
+                "User-Agent" to ua, "Accept" to "*/*", "Accept-Language" to "en-US,en;q=0.9",
+                "Origin" to origin, "Referer" to "$origin/",
+                "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "cross-site"
+            )
         )
+        log("  cookie CDN: " + (if (cookies.isEmpty()) "không có" else cookies.keys.joinToString(",")))
         var chosen: Map<String, String>? = null
         var chosenKey: ByteArray? = null
         var segOnly: Map<String, String>? = null
@@ -681,7 +687,7 @@ class NguonTVProvider : MainAPI() {
         for ((tag, h) in sets) {
             val res = mutableListOf<String>()
             val ref = h["Referer"]
-            val sr = runCatching { app.get(seg, referer = ref, headers = h + ("Range" to "bytes=0-15")) }.getOrNull()
+            val sr = runCatching { app.get(seg, referer = ref, headers = h + ("Range" to "bytes=0-15"), cookies = cookies) }.getOrNull()
             val segOk = sr != null && (sr.code == 200 || sr.code == 206) &&
                 (sr.headers["Content-Type"] ?: sr.headers["content-type"] ?: "").lowercase().let { !it.contains("html") && !it.contains("json") }
             if (sr == null) res.add("seg=LỖI") else {
@@ -691,16 +697,16 @@ class NguonTVProvider : MainAPI() {
             var keyOk = key == null
             var kb: ByteArray? = null
             if (key != null) {
-                val kr = runCatching { app.get(key, referer = ref, headers = h) }.getOrNull()
+                val kr = runCatching { app.get(key, referer = ref, headers = h, cookies = cookies) }.getOrNull()
                 if (kr == null) res.add("key=LỖI") else {
                     kb = runCatching { kr.okhttpResponse.body.bytes() }.getOrDefault(ByteArray(0))
                     keyOk = kr.code == 200 && kb.size == 16
-                    res.add("key=${kr.code}/${kr.headers["Content-Type"] ?: "?"}/${kb.size}byte")
+                    res.add("key=${kr.code}/${kr.headers["Content-Type"] ?: "?"}/${kb.size}byte/sc=${kr.cookies.keys.joinToString(",").ifEmpty { "-" }}/srv=${kr.headers["Server"] ?: "?"}/loc=${kr.headers["Location"] ?: "-"}")
                 }
             }
             var mapOk = true
             if (mapUri != null) {
-                val mr = runCatching { app.get(mapUri, referer = ref, headers = h) }.getOrNull()
+                val mr = runCatching { app.get(mapUri, referer = ref, headers = h, cookies = cookies) }.getOrNull()
                 mapOk = mr != null && mr.code == 200 && headBytes(mr.okhttpResponse, 4).isNotEmpty()
                 res.add("map=${mr?.code ?: "LỖI"}")
             }
@@ -712,6 +718,9 @@ class NguonTVProvider : MainAPI() {
             log("  probe: không bộ nào đủ seg+key; dùng bộ cho seg=${segOnly?.let { segOnlyTag } ?: "KHÔNG CÓ (giữ A)"}")
             chosen = segOnly
         }
+        if (chosen != null && cookies.isNotEmpty()) {
+            chosen = chosen + ("Cookie" to cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+        }
         return Pair(chosen, chosenKey)
     }
 
@@ -719,7 +728,9 @@ class NguonTVProvider : MainAPI() {
     private suspend fun flatten(st: Stream, embed: String, log: (String) -> Unit): Stream = runCatching {
         val ref = st.ref ?: embed
         val baseUrl = st.url
-        var text = st.text ?: app.get(baseUrl!!, referer = ref.ifBlank { null }, headers = segHeaders(ref)).text
+        var cookies: Map<String, String> = emptyMap()
+        var text = st.text ?: app.get(baseUrl!!, referer = ref.ifBlank { null }, headers = segHeaders(ref))
+            .also { cookies = cookies + it.cookies }.text
         val base = baseUrl ?: Regex("""https?://[^\s"]+""").find(text)?.value ?: return@runCatching st
         text = absAll(text, base)
         if (text.contains("#EXT-X-STREAM-INF")) {
@@ -735,11 +746,12 @@ class NguonTVProvider : MainAPI() {
             }
             if (best != null) {
                 val r = app.get(best, referer = ref.ifBlank { null }, headers = segHeaders(ref))
+                cookies = cookies + r.cookies
                 log("  flat: playlist con code=${r.code} bw=$bw đầu=${r.text.trimStart().take(40).replace(Regex("\\s+"), " ")}")
                 if (r.code == 200 && looksLikePlaylist(r.text)) text = absAll(r.text, best)
             }
         }
-        val (hdr, keyBytes) = runCatching { probeSegments(text, embed, log) }
+        val (hdr, keyBytes) = runCatching { probeSegments(text, embed, cookies, log) }
             .getOrElse { log("  probe lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); Pair(null, null) }
         val keyRe = Regex("""(#EXT-X-KEY:[^\n]*?URI=")([^"]+)(")""")
         val keyUris = keyRe.findAll(text).map { it.groupValues[2] }.toSet()
@@ -798,7 +810,7 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v16 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        val lines = mutableListOf("NguonTV v17 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
