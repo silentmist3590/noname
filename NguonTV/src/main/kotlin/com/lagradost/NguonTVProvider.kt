@@ -25,7 +25,19 @@ private const val TAG = "NguonTV"
 /** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist đã giải mã cho trình phát. */
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val bin = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
     private var server: java.net.ServerSocket? = null
+
+    @Synchronized
+    fun bytes(data: ByteArray): String {
+        val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
+            server = it
+            start(it)
+        }
+        val id = "key_${System.nanoTime()}.bin"
+        bin[id] = data
+        return "http://127.0.0.1:${s.localPort}/$id"
+    }
 
     @Synchronized
     fun url(text: String): String {
@@ -57,13 +69,15 @@ private object LocalPlaylist {
                     if (h.isEmpty()) break
                 }
                 val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
-                val body = path?.let { store[it] }?.toByteArray()
+                val binBody = path?.let { bin[it] }
+                val body = binBody ?: path?.let { store[it] }?.toByteArray()
+                val ctype = if (binBody != null) "application/octet-stream" else "application/vnd.apple.mpegurl"
                 val out = c.getOutputStream()
                 if (body == null) {
                     out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                 } else {
                     out.write(
-                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                        ("HTTP/1.1 200 OK\r\nContent-Type: $ctype\r\n" +
                             "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray()
                     )
                     if (!line.startsWith("HEAD")) out.write(body)
@@ -293,7 +307,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v13", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v16", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -630,10 +644,24 @@ class NguonTVProvider : MainAPI() {
     }
 
     // Thử nhiều bộ header trên segment đầu tiên (và key nếu có) rồi chọn bộ chạy được cho ExoPlayer
-    private suspend fun probeSegments(text: String, embed: String, log: (String) -> Unit): Map<String, String>? {
+    private fun headBytes(r: okhttp3.Response, n: Int): ByteArray = runCatching {
+        r.body.byteStream().use { st ->
+            val buf = ByteArray(n)
+            var got = 0
+            while (got < n) {
+                val k = st.read(buf, got, n - got)
+                if (k <= 0) break
+                got += k
+            }
+            buf.copyOf(got)
+        }
+    }.getOrDefault(ByteArray(0))
+
+    // Thử tải segment đầu + khóa AES với vài bộ header; chọn bộ chạy được. Không đọc cả segment vào bộ nhớ.
+    private suspend fun probeSegments(text: String, embed: String, log: (String) -> Unit): Pair<Map<String, String>?, ByteArray?> {
         val lines = text.lines()
         log("  playlist: " + lines.map { it.trim() }.filter { it.isNotEmpty() }.take(7).joinToString(" | ") { it.take(90) })
-        val seg = lines.map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return null
+        val seg = lines.map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return Pair(null, null)
         val key = Regex("""#EXT-X-KEY:[^\n]*URI="([^"]+)"""").find(text)?.groupValues?.get(1)
         val mapUri = Regex("""#EXT-X-MAP:[^\n]*URI="([^"]+)"""").find(text)?.groupValues?.get(1)
         val origin = originOf(embed)
@@ -642,26 +670,49 @@ class NguonTVProvider : MainAPI() {
             "B:chỉ-UA" to mapOf("User-Agent" to ua),
             "C:ref-trang-chủ" to mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"),
             "D:ref+origin" to mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin),
-            "E:accept-all" to mapOf("User-Agent" to ua, "Accept" to "*/*", "Referer" to embed)
+            "E:accept-all" to mapOf("User-Agent" to ua, "Accept" to "*/*", "Referer" to embed),
+            "F:embed+origin" to (segHeaders(embed) + ("Origin" to origin)),
+            "G:không-header" to emptyMap()
         )
         var chosen: Map<String, String>? = null
+        var chosenKey: ByteArray? = null
+        var segOnly: Map<String, String>? = null
+        var segOnlyTag = ""
         for ((tag, h) in sets) {
             val res = mutableListOf<String>()
-            var allOk = true
-            for ((what, u) in listOfNotNull("seg" to seg, key?.let { "key" to it }, mapUri?.let { "map" to it })) {
-                val r = runCatching { app.get(u, referer = h["Referer"], headers = h) }.getOrNull()
-                if (r == null) { res.add("$what=LỖI"); allOk = false; continue }
-                val b = r.text
-                val ct = r.headers["content-type"] ?: r.headers["Content-Type"] ?: "?"
-                val hexHead = b.take(4).toByteArray().joinToString("") { "%02x".format(it) }
-                res.add("$what=${r.code}/$ct/len=${b.length}/head=$hexHead")
-                if (r.code != 200) allOk = false
+            val ref = h["Referer"]
+            val sr = runCatching { app.get(seg, referer = ref, headers = h + ("Range" to "bytes=0-15")) }.getOrNull()
+            val segOk = sr != null && (sr.code == 200 || sr.code == 206) &&
+                (sr.headers["Content-Type"] ?: sr.headers["content-type"] ?: "").lowercase().let { !it.contains("html") && !it.contains("json") }
+            if (sr == null) res.add("seg=LỖI") else {
+                val hb = headBytes(sr.okhttpResponse, 16).joinToString("") { "%02x".format(it) }
+                res.add("seg=${sr.code}/${sr.headers["Content-Type"] ?: "?"}/len=${sr.headers["Content-Length"] ?: "?"}/head=${hb.take(8)}")
+            }
+            var keyOk = key == null
+            var kb: ByteArray? = null
+            if (key != null) {
+                val kr = runCatching { app.get(key, referer = ref, headers = h) }.getOrNull()
+                if (kr == null) res.add("key=LỖI") else {
+                    kb = runCatching { kr.okhttpResponse.body.bytes() }.getOrDefault(ByteArray(0))
+                    keyOk = kr.code == 200 && kb.size == 16
+                    res.add("key=${kr.code}/${kr.headers["Content-Type"] ?: "?"}/${kb.size}byte")
+                }
+            }
+            var mapOk = true
+            if (mapUri != null) {
+                val mr = runCatching { app.get(mapUri, referer = ref, headers = h) }.getOrNull()
+                mapOk = mr != null && mr.code == 200 && headBytes(mr.okhttpResponse, 4).isNotEmpty()
+                res.add("map=${mr?.code ?: "LỖI"}")
             }
             log("  probe $tag: ${res.joinToString(" ")} url=${seg.take(60)}")
-            if (allOk && chosen == null) { chosen = h; break }
+            if (segOk && segOnly == null) { segOnly = h; segOnlyTag = tag }
+            if (segOk && keyOk && mapOk) { chosen = h; chosenKey = kb?.takeIf { key != null && keyOk }; log("  probe chọn: $tag"); break }
         }
-        log("  probe chọn: ${chosen?.let { c -> sets.first { it.second == c }.first } ?: "KHÔNG CÓ (giữ A)"}")
-        return chosen
+        if (chosen == null) {
+            log("  probe: không bộ nào đủ seg+key; dùng bộ cho seg=${segOnly?.let { segOnlyTag } ?: "KHÔNG CÓ (giữ A)"}")
+            chosen = segOnly
+        }
+        return Pair(chosen, chosenKey)
     }
 
     // Tải playlist, nếu là master thì chọn chất lượng cao nhất, tải playlist con rồi phát qua máy chủ cục bộ
@@ -688,7 +739,15 @@ class NguonTVProvider : MainAPI() {
                 if (r.code == 200 && looksLikePlaylist(r.text)) text = absAll(r.text, best)
             }
         }
-        val hdr = probeSegments(text, embed, log)
+        val (hdr, keyBytes) = runCatching { probeSegments(text, embed, log) }
+            .getOrElse { log("  probe lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); Pair(null, null) }
+        val keyRe = Regex("""(#EXT-X-KEY:[^\n]*?URI=")([^"]+)(")""")
+        val keyUris = keyRe.findAll(text).map { it.groupValues[2] }.toSet()
+        if (keyBytes != null && keyUris.size == 1) {
+            val local = LocalPlaylist.bytes(keyBytes)
+            text = keyRe.replace(text) { it.groupValues[1] + local + it.groupValues[3] }
+            log("  key AES đã tải sẵn (${keyBytes.size} byte) và phát qua máy chủ cục bộ")
+        }
         Stream(null, text, st.via + "+flat", ref, hdr)
     }.getOrElse { log("  flat lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); st }
 
@@ -739,7 +798,7 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v15 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        val lines = mutableListOf("NguonTV v16 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
