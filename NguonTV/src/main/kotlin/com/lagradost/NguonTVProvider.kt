@@ -307,7 +307,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v20", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v22", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -404,7 +404,7 @@ class NguonTVProvider : MainAPI() {
     // ================= Lấy luồng phát từ trang embed (nhiều tầng dự phòng) =================
 
     private class Stream(val url: String?, val text: String?, val via: String, val ref: String? = null, val hdr: Map<String, String>? = null,
-                         val token: String? = null, val streamUrl: String? = null)
+                         val token: String? = null, val streamUrl: String? = null, val mp4: Boolean = false)
 
     private fun segHeaders(embed: String): Map<String, String> {
         val base = mapOf(
@@ -584,6 +584,21 @@ class NguonTVProvider : MainAPI() {
         return direct(sniffed, embed, "webview", listOf(hashOf(embed)))
     }
 
+    @Volatile private var driveDead = false
+
+    // Google Drive: phát thẳng tệp video nếu còn được chia sẻ công khai
+    private suspend fun viaDrive(id: String, log: (String) -> Unit): Stream? {
+        val url = "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t"
+        val r = runCatching { app.get(url, headers = mapOf("User-Agent" to ua, "Range" to "bytes=0-15")) }.getOrNull()
+        val ct = (r?.headers?.get("Content-Type") ?: "").lowercase()
+        log("  drive $id: code=${r?.code ?: "LỖI"} type=${ct.ifEmpty { "?" }}")
+        if (r == null || (r.code != 200 && r.code != 206) || ct.contains("html")) {
+            log("  drive: tệp không dùng được (đã xóa/không chia sẻ/hết lượt tải)")
+            return null
+        }
+        return Stream(url, null, "gdrive", null, null, null, null, true)
+    }
+
     private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit, allowWebView: Boolean = false, depth: Int = 0): Stream? {
         val tags = if (allowWebView) listOf("bootstrap", "data-obf", "base64", "scan", "webview")
                    else listOf("bootstrap", "data-obf", "base64", "scan")
@@ -610,6 +625,12 @@ class NguonTVProvider : MainAPI() {
                 val src = m.groupValues[1].replace("&amp;", "&").let { if (it.startsWith("//")) "https:$it" else it }
                 if (!src.startsWith("http") || src == embed) continue
                 log("  iframe lồng -> ${src.take(110)}")
+                val driveId = Regex("""drive\.google\.com/(?:file/d/|open\?id=|uc\?[^"']*id=)([\w-]+)""").find(src)?.groupValues?.get(1)
+                if (driveId != null) {
+                    viaDrive(driveId, log)?.let { return it }
+                    driveDead = true
+                    continue
+                }
                 resolveEmbed(src, embed, log, false, depth + 1)?.let { return it }
             }
         }
@@ -633,6 +654,16 @@ class NguonTVProvider : MainAPI() {
     }
 
     private suspend fun emitStream(st: Stream, embed: String, callback: (ExtractorLink) -> Unit): Boolean = runCatching {
+        if (st.mp4) {
+            callback(
+                newExtractorLink(name, "$name Drive", st.url!!, ExtractorLinkType.VIDEO) {
+                    this.referer = ""
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to ua)
+                }
+            )
+            return@runCatching true
+        }
         val link = if (st.text != null) LocalPlaylist.url(st.text) else st.url!!
         val r = st.ref ?: embed
         callback(
@@ -781,6 +812,7 @@ class NguonTVProvider : MainAPI() {
 
     // Tải playlist, nếu là master thì chọn chất lượng cao nhất, tải playlist con rồi phát qua máy chủ cục bộ
     private suspend fun flatten(st: Stream, embed: String, log: (String) -> Unit): Stream = runCatching {
+        if (st.mp4) return@runCatching st
         val ref = st.ref ?: embed
         val baseUrl = st.url
         var cookies: Map<String, String> = emptyMap()
@@ -835,22 +867,25 @@ class NguonTVProvider : MainAPI() {
         }
         val playerHtml = (playerDoc?.html() ?: "").replace("&amp;", "&")
         // Nút chọn server của trang: POST tới URL tập "...fromEmbed=1..." với indexL = số thứ tự server, loadTime=1
-        val serverUrl = Regex("""/xem-phim/[^'"\s<>]*fromEmbed=1[^'"\s<>]*""").find(playerHtml)?.value?.let { absolute(it) }
-        val servers = Regex("""data-index="(\d+)"[^>]*>([^<]*)<""").findAll(playerHtml)
-            .map { it.groupValues[1].toInt() to it.groupValues[2].trim() }.toList()
+        val serverUrlRe = Regex("""/xem-phim/[^'"\s<>]*fromEmbed=1[^'"\s<>]*""")
+        val serversRe = Regex("""data-index="?(\d+)"?[^>]*>([^<]*)<""")
+        var serverUrl = serverUrlRe.find(playerHtml)?.value?.let { absolute(it) }
+        var servers = serversRe.findAll(playerHtml).map { it.groupValues[1].toInt() to it.groupValues[2].trim() }.toList()
         log("servers=${servers.joinToString(",") { "${it.first}:${it.second}" }.ifEmpty { "không thấy" }} serverUrl=${serverUrl?.substringBefore('?')?.takeLast(50) ?: "không"}")
         class Attempt(val url: String, val l: Int, val sl: Int, val loadTime: String)
         val attempts = mutableListOf(Attempt(playerPage, 0, 0, "0"))
         if (serverUrl != null) {
             val idxs = servers.map { it.first }.ifEmpty { listOf(0, 1, 2) }
-            for (i in idxs) attempts.add(Attempt(serverUrl, i, 0, "1"))
-        } else {
-            attempts.add(Attempt(playerPage, 1, 0, "0")); attempts.add(Attempt(playerPage, 2, 0, "0"))
+            for (i in idxs) attempts.add(Attempt(serverUrl!!, i, 0, "1"))
         }
+        driveDead = false
         var other: String? = null
         var firstEmbed: String? = null
+        var failovers = 0
         val seen = mutableSetOf<String>()
-        for (a in attempts) {
+        var ai = 0
+        while (ai < attempts.size) {
+            val a = attempts[ai++]
             val resp = postForm(
                 a.url,
                 mapOf("fid" to state.fid, "time" to state.time, "key" to state.key,
@@ -858,28 +893,48 @@ class NguonTVProvider : MainAPI() {
                 xhrHeaders(playerPage)
             )
             val body = resp.text
-            val decoded = body.replace("\\/", "/").replace("\\u0026", "&")
+            val decoded = body.replace("\\/", "/").replace("\\u0026", "&").replace("\\\"", "\"").replace("&amp;", "&")
             val embed = findEmbedUrl(body)
-                ?: Regex("""<iframe[^>]+src=\\?["']([^"'\\]+)""").find(decoded)?.groupValues?.get(1)?.replace("&amp;", "&")
-            val svName = servers.firstOrNull { it.first == a.l }?.second ?: "?"
-            log("POST ${if (a.url == playerPage) "trang-phát" else "server"} L=${a.l}($svName) code=${resp.code} len=${body.length} embed=${embed?.take(110) ?: "KHÔNG"}")
+                ?: Regex("""<iframe[^>]+src=\\?["']([^"'\\]+)""").find(body.replace("\\/", "/"))?.groupValues?.get(1)?.replace("&amp;", "&")
+            val js = runCatching { JSONObject(body) }.getOrNull()
+            val rl = js?.optInt("indexL", -1) ?: -1
+            val rsl = js?.optInt("indexSL", 0) ?: 0
+            val rlt = js?.optInt("loadTime", -1) ?: -1
+            log("POST ${if (a.url == playerPage) "trang-phát" else "server"} L=${a.l}(${servers.firstOrNull { it.first == a.l }?.second ?: "?"}) lt=${a.loadTime} code=${resp.code} len=${body.length} json[indexL=$rl indexSL=$rsl loadTime=$rlt fromIndexL=${js?.opt("fromIndexL")}] embed=${embed?.take(110) ?: "KHÔNG"}")
+            // Danh sách server có thể nằm trong phản hồi POST thay vì trang phát
+            if (serverUrl == null) {
+                serverUrlRe.find(decoded)?.value?.let { u ->
+                    serverUrl = absolute(u)
+                    servers = serversRe.findAll(decoded).map { it.groupValues[1].toInt() to it.groupValues[2].trim() }.toList()
+                    log("  phản hồi có danh sách server: ${servers.joinToString(",") { "${it.first}:${it.second}" }} url=${serverUrl?.substringBefore('?')?.takeLast(40)}")
+                    val su = serverUrl!!
+                    for (i in servers.map { it.first }.ifEmpty { listOf(0, 1, 2) }) if (i != a.l) attempts.add(Attempt(su, i, 0, "1"))
+                }
+            }
             if (embed == null) {
                 val hls = findHls(body)
                 if (hls != null) {
                     val st = direct(hls, "", "api-hls", emptyList(), playerPage, log)
                     if (st != null) return Res(flatten(st, "", log), "", null)
                 }
-                log("  đầu=${body.take(160).replace(Regex("\\s+"), " ")}")
+                log("  đầu=${body.take(300).replace(Regex("\\s+"), " ")}")
                 continue
             }
-            if (!seen.add(embed)) { log("  embed trùng, bỏ qua"); continue }
-            if (firstEmbed == null) firstEmbed = embed
-            if (!embed.contains("grab.nguontv.life")) other = other ?: embed
-            val st = resolveEmbed(embed, playerPage, log)
-            if (st != null) return Res(flatten(st, embed, log), embed, null)
+            if (!seen.add(embed)) { log("  embed trùng, bỏ qua") }
+            else {
+                if (firstEmbed == null) firstEmbed = embed
+                if (!embed.contains("grab.nguontv.life")) other = other ?: embed
+                val st = resolveEmbed(embed, playerPage, log)
+                if (st != null) return Res(flatten(st, embed, log), embed, null)
+            }
+            // Tự chuyển server như trình duyệt: gửi lại với indexL/indexSL/loadTime+1 mà phản hồi trả về
+            if (failovers < 4 && rl >= 0) {
+                failovers++
+                attempts.add(Attempt(a.url, rl, rsl, "${maxOf(rlt, 0) + 1}"))
+            }
         }
         // Dự phòng cuối: WebView (chậm, tối đa ~120 giây) cho embed đầu tiên
-        if (firstEmbed != null) {
+        if (firstEmbed != null && !driveDead) {
             val st = runCatching { viaWebView(firstEmbed, playerPage) }
                 .onFailure { log("tầng webview lỗi: ${it.javaClass.simpleName} ${it.message?.take(80)}") }.getOrNull()
             if (st != null) { log("tầng webview: dùng được"); return Res(flatten(st, firstEmbed, log), firstEmbed, null) }
@@ -896,7 +951,7 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v20 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        val lines = mutableListOf("NguonTV v22 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
