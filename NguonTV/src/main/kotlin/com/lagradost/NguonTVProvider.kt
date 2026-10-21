@@ -307,7 +307,7 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
         }
-        return newMovieLoadResponse("DEBUG phát v19", "$mainUrl/__debug", TvType.Movie, "debug") {
+        return newMovieLoadResponse("DEBUG phát v20", "$mainUrl/__debug", TvType.Movie, "debug") {
             this.plot = esc(sb.toString())
         }
     }
@@ -489,7 +489,10 @@ class NguonTVProvider : MainAPI() {
         val body = JSONObject().apply {
             put("action", "bootstrap")
             put("referrer", page)
-            put("frame_origins", org.json.JSONArray().put(mainUrl))
+            put("frame_origins", org.json.JSONArray().put(mainUrl).apply {
+                val po = originOf(page)
+                if (po.isNotBlank() && po != mainUrl) put(po)
+            })
             put("request_grant", true)
             put("playlist_format", "aesgcm-v2")
             put("pretty_url", true)
@@ -581,7 +584,7 @@ class NguonTVProvider : MainAPI() {
         return direct(sniffed, embed, "webview", listOf(hashOf(embed)))
     }
 
-    private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit, allowWebView: Boolean = false): Stream? {
+    private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit, allowWebView: Boolean = false, depth: Int = 0): Stream? {
         val tags = if (allowWebView) listOf("bootstrap", "data-obf", "base64", "scan", "webview")
                    else listOf("bootstrap", "data-obf", "base64", "scan")
         for (tag in tags) {
@@ -599,6 +602,16 @@ class NguonTVProvider : MainAPI() {
             if (st == null) { log("tầng $tag: không có kết quả"); continue }
             log("tầng $tag: dùng được (${st.via})")
             return st
+        }
+        // Trang embed của NguonTV có thể lồng iframe tới nhà cung cấp khác (ví dụ streamc.xyz): xử lý đệ quy
+        if (depth < 2) {
+            val html = runCatching { app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text }.getOrDefault("")
+            for (m in Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).take(3)) {
+                val src = m.groupValues[1].replace("&amp;", "&").let { if (it.startsWith("//")) "https:$it" else it }
+                if (!src.startsWith("http") || src == embed) continue
+                log("  iframe lồng -> ${src.take(110)}")
+                resolveEmbed(src, embed, log, false, depth + 1)?.let { return it }
+            }
         }
         if (!allowWebView) embedHint(embed, page, log)
         return null
@@ -883,7 +896,7 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v19 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        val lines = mutableListOf("NguonTV v20 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
