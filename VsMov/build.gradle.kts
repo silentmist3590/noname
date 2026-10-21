@@ -1,4 +1,4 @@
-version = 3
+version = 4
 
 cloudstream {
     description = "Xem phim từ API công khai của vsmov.com"
