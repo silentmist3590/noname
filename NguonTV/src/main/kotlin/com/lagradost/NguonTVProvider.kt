@@ -154,7 +154,8 @@ class NguonTVProvider : MainAPI() {
         val res = try {
             fetch("$mainUrl/")
         } catch (e: Exception) {
-            return debugHome("lỗi tải: ${e.javaClass.simpleName} ${e.message?.take(80)}")
+            Log.d(TAG, "lỗi tải trang chủ: ${e.javaClass.simpleName} ${e.message}")
+            return newHomePageResponse(emptyList(), hasNext = false)
         }
         val doc = res.document
         val items = doc.select(".categories-file-index .item-file-index, .item-file-index").mapNotNull { item ->
@@ -185,27 +186,12 @@ class NguonTVProvider : MainAPI() {
         }
 
         if (responses.isEmpty()) {
-            return debugHome("Bấm vào đây xem chẩn đoán v12 (code=${res.code} len=${res.text.length} title=${doc.title()})")
+            return newHomePageResponse(emptyList(), hasNext = false)
         }
 
         val homePage = mutableListOf<HomePageList>()
         if (responses.isNotEmpty()) homePage.add(HomePageList("Phim Hot / Phim mới", responses))
-        // TẠM THỜI: thẻ chẩn đoán các bước lấy link phát
-        homePage.add(
-            HomePageList(
-                "DEBUG",
-                listOf(newMovieSearchResponse("Chẩn đoán phát v12", "$mainUrl/__debug", TvType.Movie))
-            )
-        )
         return newHomePageResponse(homePage, hasNext = false)
-    }
-
-    // Hiện thông tin chẩn đoán thành các thẻ phim ngay ở trang chủ
-    private fun debugHome(vararg lines: String): HomePageResponse {
-        val cards = lines.mapIndexed { i, t ->
-            newMovieSearchResponse(t.replace("<", "‹").replace(">", "›"), "$mainUrl/__debug$i", TvType.Movie)
-        }
-        return newHomePageResponse(listOf(HomePageList("DEBUG NguonTV", cards)), hasNext = false)
     }
 
     private suspend fun searchItems(query: String): List<FilmItem> {
@@ -275,45 +261,7 @@ class NguonTVProvider : MainAPI() {
     private fun episodeNumber(url: String): Int? = Regex("-(\\d+)-e\\d+\\.html", RegexOption.IGNORE_CASE)
         .find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()
 
-    // Trang chẩn đoán v12: thử nhiều phim cùng lúc, mỗi phim một khối ngắn
-    private suspend fun debugLoad(): LoadResponse {
-        fun esc(t: String) = t.replace("<", "‹").replace(">", "›").replace("\n", "<br>")
-        val sb = StringBuilder()
-        try {
-            val home = fetch("$mainUrl/")
-            val films = home.document.select("a[href]").map { it.attr("abs:href") }
-                .filter { Regex("-f\\d+\\.html", RegexOption.IGNORE_CASE).containsMatchIn(it) && !it.contains("/xem-phim/") }
-                .distinct().take(8)
-            sb.append("v12 - thử ${films.size} phim\n")
-            films.forEachIndexed { i, filmUrl ->
-                val lines = mutableListOf<String>()
-                val t0 = System.currentTimeMillis()
-                var res: Res? = null
-                try {
-                    val page = fetch(filmUrl)
-                    val ep = page.document.select("a[href]").map { it.attr("abs:href") }
-                        .firstOrNull { episodeNumber(it) != null }
-                    res = resolveFilm(filmUrl, ep ?: toPlayerUrl(filmUrl)) { lines.add(it) }
-                } catch (e: Exception) {
-                    lines.add("LỖI ${e.javaClass.simpleName}: ${e.message?.take(100)}")
-                }
-                val rr = res
-                val ok = rr?.st?.via ?: rr?.other?.let { "iframe-ngoài ${it.take(50)}" } ?: "KHÔNG"
-                sb.append("\n#${i + 1} ${filmUrl.substringAfter("life/").take(40)}\n=> $ok (${System.currentTimeMillis() - t0}ms)\n")
-                if (rr?.st == null) gateProbe(filmUrl).forEach { sb.append("  ").append(it.take(400)).append("\n") }
-                if (rr?.st == null) lines.take(14).forEach { sb.append("  ").append(it.take(160)).append("\n") }
-                else sb.append("  ").append(lines.lastOrNull { it.contains("flat") || it.contains("GET") }?.take(160) ?: "").append("\n")
-            }
-        } catch (e: Exception) {
-            sb.append("DỪNG: ${e.javaClass.simpleName}: ${e.message?.take(150)}\n")
-        }
-        return newMovieLoadResponse("DEBUG phát v22", "$mainUrl/__debug", TvType.Movie, "debug") {
-            this.plot = esc(sb.toString())
-        }
-    }
-
     override suspend fun load(url: String): LoadResponse? {
-        if (url.contains("__debug")) return debugLoad()
         val pageUrl = absolute(url) ?: return null
         val doc = fetch(pageUrl).document
         val title = parseTitle(doc, doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "NguonTV")
@@ -951,7 +899,7 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v22 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        val lines = mutableListOf("NguonTV v23 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
@@ -969,7 +917,7 @@ class NguonTVProvider : MainAPI() {
             log("LỖI loadLinks ${e.javaClass.simpleName}: ${e.message}")
         }
         if (!ok) gateProbe(basePage).forEach(log)
-        copyLog(lines.joinToString("\n"))
+        if (!ok) copyLog(lines.joinToString("\n"))
         return ok
     }
 
