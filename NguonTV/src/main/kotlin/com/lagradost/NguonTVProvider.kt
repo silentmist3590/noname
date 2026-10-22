@@ -11,9 +11,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -971,8 +968,7 @@ class NguonTVProvider : MainAPI() {
         return Pair(chosen, chosenKey)
     }
 
-    // Tải các khóa AES (song song, 8 khóa một lượt) và đổi URI khóa sang máy chủ cục bộ.
-    // `cache` dùng chung giữa các chất lượng để khóa trùng URL chỉ tải một lần.
+    // Tải các khóa AES và đổi URI khóa sang máy chủ cục bộ.
     private suspend fun localizeKeys(
         text0: String, hdr: Map<String, String>, token: String?, streamUrl: String?,
         cache: MutableMap<String, String>, log: (String) -> Unit
@@ -981,10 +977,10 @@ class NguonTVProvider : MainAPI() {
         val keyUris = keyRe.findAll(text0).map { it.groupValues[1] }.toList().distinct()
         if (keyUris.isEmpty()) return text0
         val need = keyUris.take(300).filter { it !in cache }
-        coroutineScope {
-            for (chunk in need.chunked(8)) {
-                val res = chunk.map { u -> async { u to fetchKey(u, hdr, token, streamUrl, log) } }.awaitAll()
-                for ((u, kb) in res) if (kb != null) cache[u] = LocalPlaylist.bytes(kb)
+        for (u in need) {
+            val kb = fetchKey(u, hdr, token, streamUrl, log)
+            if (kb != null) {
+                cache[u] = LocalPlaylist.bytes(kb)
             }
         }
         var text = text0
