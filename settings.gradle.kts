@@ -4,4 +4,5 @@ include(":VsMov")
 include(":Kkphim")
 include(":NguonTV")
 include(":PhimVNProvider")
+include(":NgonTV")
 rootProject.name = "CloudstreamPlugins"
