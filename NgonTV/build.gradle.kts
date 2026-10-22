@@ -1,4 +1,4 @@
-version = 24
+version = 2
 
 cloudstream {
     description = "NgonTV movie and series provider. Uses embedded playback hosts when available."
