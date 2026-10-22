@@ -11,7 +11,7 @@ buildscript {
     }
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
+        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
         // Phải >= 2.3.0 vì cloudstream3:pre-release dùng metadata Kotlin 2.4.0
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
