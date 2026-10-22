@@ -11,6 +11,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -22,29 +25,37 @@ import java.util.Locale
 
 private const val TAG = "NguonTV"
 
-/** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist đã giải mã cho trình phát. */
+/**
+ * true  = khi không tìm thấy phụ đề nào, tự chép log chẩn đoán vào clipboard (để gửi cho người phát triển).
+ * false = tắt, chỉ ghi vào logcat. Đặt false khi đã hoàn thiện phần phụ đề.
+ */
+private const val COPY_LOG_WHEN_NO_SUB = true
+
+/** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist / khóa / phụ đề đã xử lý cho trình phát. */
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val bin = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+    private val types = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var server: java.net.ServerSocket? = null
 
-    @Synchronized
-    fun bytes(data: ByteArray): String {
-        val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
+    private fun ensure(): java.net.ServerSocket =
+        server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
             server = it
             start(it)
         }
-        val id = "key_${System.nanoTime()}.bin"
+
+    @Synchronized
+    fun bytes(data: ByteArray, ext: String = "bin", ctype: String = "application/octet-stream"): String {
+        val s = ensure()
+        val id = "key_${System.nanoTime()}.$ext"
         bin[id] = data
+        types[id] = ctype
         return "http://127.0.0.1:${s.localPort}/$id"
     }
 
     @Synchronized
     fun url(text: String): String {
-        val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
-            server = it
-            start(it)
-        }
+        val s = ensure()
         val id = "pl_${System.nanoTime()}.m3u8"
         store[id] = text
         return "http://127.0.0.1:${s.localPort}/$id"
@@ -71,7 +82,7 @@ private object LocalPlaylist {
                 val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
                 val binBody = path?.let { bin[it] }
                 val body = binBody ?: path?.let { store[it] }?.toByteArray()
-                val ctype = if (binBody != null) "application/octet-stream" else "application/vnd.apple.mpegurl"
+                val ctype = if (binBody != null) (types[path] ?: "application/octet-stream") else "application/vnd.apple.mpegurl"
                 val out = c.getOutputStream()
                 if (body == null) {
                     out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
@@ -349,10 +360,192 @@ class NguonTVProvider : MainAPI() {
     }
 
 
+    // ================= Phụ đề =================
+
+    private class Sub(val lang: String, val label: String, val url: String, val ref: String)
+
+    private val subs = java.util.concurrent.CopyOnWriteArrayList<Sub>()
+    private val subHints = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+    private val viRe = Regex("""(?<![a-z])(vi|vie|vn|vnm|viet|vietsub|vietnam|vietnamese|tiếng việt|tieng viet|việt|viet nam)(?![a-z])""")
+    private val enRe = Regex("""(?<![a-z])(en|eng|engsub|english|anh|tiếng anh|tieng anh)(?![a-z])""")
+    private val subExtRe = Regex("""https?://[^\s"'<>\\]+?\.(?:vtt|srt|ass|ssa|ttml)(?:\?[^\s"'<>\\]*)?""", RegexOption.IGNORE_CASE)
+    private val notSubRe = Regex("""(?i)thumb|sprite|storyboard|preview|chapter""")
+
+    private fun langOf(s: String): String? {
+        val x = s.lowercase()
+        return when {
+            viRe.containsMatchIn(x) -> "Vietnamese"
+            enRe.containsMatchIn(x) -> "English"
+            else -> null
+        }
+    }
+
+    // Nhãn quyết định trước; nếu không có nhãn thì đoán theo đường dẫn URL (không xét tên miền)
+    private fun subLang(label: String, url: String): String? =
+        langOf(label) ?: if (label.isBlank()) langOf(url.substringAfter("://").substringAfter('/')) else null
+
+    private fun hlsAttr(line: String, name: String): String {
+        val m = Regex("""(?<![A-Z-])$name=(?:"([^"]*)"|([^,]*))""").find(line) ?: return ""
+        return m.groupValues[1].ifEmpty { m.groupValues[2] }
+    }
+
+    private fun setHlsFlag(l: String, k: String, v: String): String {
+        val re = Regex("""(?<=[:,])$k=(YES|NO)(?=,|$)""")
+        return if (re.containsMatchIn(l)) re.replace(l, "$k=$v") else "$l,$k=$v"
+    }
+
+    /** Trong master playlist: đặt phụ đề tiếng Việt (nếu không có thì tiếng Anh) làm mặc định. */
+    private fun prioritizeSubs(master: String): String {
+        val lines = master.lines()
+        val subIdx = lines.indices.filter { lines[it].startsWith("#EXT-X-MEDIA") && hlsAttr(lines[it], "TYPE") == "SUBTITLES" }
+        if (subIdx.isEmpty()) return master
+        fun lg(l: String) = langOf(hlsAttr(l, "NAME") + " " + hlsAttr(l, "LANGUAGE"))
+        val best = subIdx.firstOrNull { lg(lines[it]) == "Vietnamese" } ?: subIdx.firstOrNull { lg(lines[it]) == "English" }
+        return lines.mapIndexed { i, l ->
+            if (i in subIdx) {
+                val isBest = i == best
+                setHlsFlag(setHlsFlag(l, "DEFAULT", if (isBest) "YES" else "NO"), "AUTOSELECT", "YES")
+            } else l
+        }.joinToString("\n")
+    }
+
+    private fun enclosingObject(t: String, range: IntRange): String {
+        val s = t.lastIndexOf('{', range.first)
+        val e = t.indexOf('}', range.last)
+        return if (s >= 0 && e > s && e - s < 700) t.substring(s, e + 1) else ""
+    }
+
+    /**
+     * Quét một đoạn văn bản (HTML trang phát, trang embed, JSON phản hồi, chuỗi base64 đã giải...)
+     * để tìm link phụ đề: JSON dạng {"file":"...vtt","label":"Vietnamese","kind":"captions"},
+     * thẻ <track>, hoặc bất kỳ URL .vtt/.srt/.ass nào. Bỏ qua thumbnails/sprite/chapters.
+     */
+    private fun collectSubsFrom(raw: String, base: String, src: String, log: (String) -> Unit) {
+        if (raw.isBlank()) return
+        val t = raw.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&").replace("\\\"", "\"")
+        var found = 0
+        fun add(label: String, rawUrl: String) {
+            val url = resolveUrl(rawUrl.trim(), base)
+            if (!url.startsWith("http") || subs.any { it.url == url }) return
+            if (notSubRe.containsMatchIn(url) || notSubRe.containsMatchIn(label)) return
+            val lang = subLang(label, url)
+            subs.add(Sub(lang ?: label.ifBlank { "Phụ đề" }, label, url, base))
+            found++
+            log("  sub[$src]: ${lang ?: label.ifBlank { "?" }} -> ${url.take(100)}")
+        }
+
+        // 1) Đối tượng JSON có kind captions/subtitles hoặc trỏ tới tệp phụ đề
+        val jsonObj = Regex("""\{[^{}]*\}""")
+        val kindOk = Regex("""(?i)"(?:kind|type)"\s*:\s*"(?:captions|subtitles?|subs?|text)"|\.(?:vtt|srt|ass|ssa|ttml)\b""")
+        val kindBad = Regex("""(?i)"kind"\s*:\s*"(?:thumbnails|chapters|metadata)"""")
+        val fileRe = Regex(""""(?:file|src|url|link|path)"\s*:\s*"([^"]+)"""")
+        val labelRe = Regex(""""(?:label|name|title|lang|language|srclang)"\s*:\s*"([^"]{1,40})"""")
+        for (m in jsonObj.findAll(t)) {
+            val o = m.value
+            if (!kindOk.containsMatchIn(o) || kindBad.containsMatchIn(o)) continue
+            val u = fileRe.find(o)?.groupValues?.get(1) ?: continue
+            val label = labelRe.findAll(o).joinToString(" ") { it.groupValues[1] }
+            add(label, u)
+        }
+
+        // 2) Thẻ <track src=... label=... srclang=...>
+        for (m in Regex("""<track\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(t)) {
+            val tag = m.value
+            val kind = Regex("""kind=["']([^"']+)""", RegexOption.IGNORE_CASE).find(tag)?.groupValues?.get(1)?.lowercase().orEmpty()
+            if (kind == "metadata" || kind == "chapters" || kind == "thumbnails") continue
+            val s = Regex("""src=["']([^"']+)""", RegexOption.IGNORE_CASE).find(tag)?.groupValues?.get(1) ?: continue
+            val label = listOf("label", "srclang").mapNotNull {
+                Regex("""$it=["']([^"']+)""", RegexOption.IGNORE_CASE).find(tag)?.groupValues?.get(1)
+            }.joinToString(" ")
+            add(label, s)
+        }
+
+        // 3) URL .vtt/.srt/.ass bất kỳ
+        for (m in subExtRe.findAll(t)) {
+            val o = enclosingObject(t, m.range)
+            if (kindBad.containsMatchIn(o)) continue
+            val label = if (o.isNotEmpty()) labelRe.findAll(o).joinToString(" ") { it.groupValues[1] } else ""
+            add(label, m.value)
+        }
+
+        if (found == 0 && subHints.size < 12) {
+            Regex("""(?i)(subtitle|captions?|"tracks"|\.vtt|\.srt|phụ đề|phude|suburl|sub_url|subs?\s*[:=])""")
+                .findAll(t).take(3).forEach {
+                    val x = maxOf(0, it.range.first - 80)
+                    subHints.add("  subhint[$src]> " + t.substring(x, minOf(t.length, it.range.last + 200)).replace(Regex("\\s+"), " "))
+                }
+        }
+    }
+
+    // Ghi lại các phần tử giao diện có vẻ liên quan phụ đề (nút chọn phụ đề...) để chẩn đoán
+    private fun domSubHints(doc: Document?, src: String) {
+        if (doc == null) return
+        runCatching {
+            doc.select("[class*=sub], [class*=Sub], [id*=sub], [id*=Sub], [class*=caption], [data-sub]")
+                .filter { !it.outerHtml().contains("subscribe", true) && !it.outerHtml().contains("submenu", true) }
+                .take(5).forEach {
+                    if (subHints.size < 20) subHints.add("  domhint[$src]> " + it.outerHtml().replace(Regex("\\s+"), " ").take(260))
+                }
+        }
+    }
+
+    // Tải phụ đề về qua Referer đúng rồi phát qua máy chủ cục bộ, tránh lỗi chặn hotlink khi trình phát tải
+    private suspend fun localizeSub(s: Sub): String {
+        val ext = Regex("""\.(vtt|srt|ass|ssa|ttml)(?:\?|$)""", RegexOption.IGNORE_CASE)
+            .find(s.url)?.groupValues?.get(1)?.lowercase() ?: "vtt"
+        val ctype = when (ext) {
+            "srt" -> "application/x-subrip"
+            "ass", "ssa" -> "text/x-ssa"
+            "ttml" -> "application/ttml+xml"
+            else -> "text/vtt"
+        }
+        for (ref in listOf(s.ref, "$mainUrl/", "")) {
+            val r = runCatching {
+                app.get(s.url, referer = ref.ifBlank { null }, headers = mapOf("User-Agent" to ua))
+            }.getOrNull() ?: continue
+            if (r.code != 200) continue
+            val t = r.text
+            val head = t.trimStart()
+            if (t.length < 10 || head.startsWith("<!DOCTYPE", true) || head.startsWith("<html", true)) continue
+            return LocalPlaylist.bytes(t.toByteArray(Charsets.UTF_8), ext, ctype)
+        }
+        return s.url
+    }
+
+    // Phát phụ đề cho CloudStream: tiếng Việt trước, rồi tiếng Anh. Nếu không có cả hai thì lấy tối đa 3 bản bất kỳ.
+    private suspend fun emitSubs(subtitleCallback: (SubtitleFile) -> Unit, log: (String) -> Unit) {
+        val all = subs.toList()
+        if (all.isEmpty()) {
+            log("PHỤ ĐỀ: không tìm thấy bản nào")
+            subHints.forEach(log)
+            return
+        }
+        val pri = all.filter { it.lang == "Vietnamese" || it.lang == "English" }
+        val chosen = (if (pri.isNotEmpty()) pri else all.take(3))
+            .sortedBy { if (it.lang == "Vietnamese") 0 else if (it.lang == "English") 1 else 2 }
+        val used = mutableMapOf<String, Int>()
+        for (s in chosen) {
+            val n = (used[s.lang] ?: 0) + 1
+            used[s.lang] = n
+            val nm = if (n == 1) s.lang else "${s.lang} $n"
+            val u = runCatching { localizeSub(s) }.getOrNull() ?: s.url
+            subtitleCallback.invoke(SubtitleFile(nm, u))
+            log("PHỤ ĐỀ: $nm -> ${u.take(90)}")
+        }
+    }
+
+
     // ================= Lấy luồng phát từ trang embed (nhiều tầng dự phòng) =================
 
-    private class Stream(val url: String?, val text: String?, val via: String, val ref: String? = null, val hdr: Map<String, String>? = null,
-                         val token: String? = null, val streamUrl: String? = null, val mp4: Boolean = false)
+    private class Stream(
+        val url: String?, val text: String?, val via: String, val ref: String? = null, val hdr: Map<String, String>? = null,
+        val token: String? = null, val streamUrl: String? = null, val mp4: Boolean = false,
+        // (chiều cao, bandwidth, URL playlist cục bộ) của từng chất lượng, dùng để thêm link chọn tay
+        val variants: List<Triple<Int, Long, String>> = emptyList()
+    )
+
+    private class Variant(val bw: Long, val height: Int, val url: String)
 
     private fun segHeaders(embed: String): Map<String, String> {
         val base = mapOf(
@@ -428,7 +621,7 @@ class NguonTVProvider : MainAPI() {
         return if (looksLikePlaylist(body)) Stream(url, null, via, ref) else null
     }
 
-    private suspend fun viaBootstrap(embed: String, page: String): Stream? {
+    private suspend fun viaBootstrap(embed: String, page: String, log: (String) -> Unit = {}): Stream? {
         val origin = originOf(embed)
         val shell = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua))
         val cfg = Regex("""<script id="stream-bootstrap"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
@@ -462,6 +655,7 @@ class NguonTVProvider : MainAPI() {
             )
             j = JSONObject(String(plain))
         }
+        runCatching { collectSubsFrom(j.toString(), embed, "bootstrap", log) }
         val video = j.optString("video").ifBlank { hashOf(embed) }
         val playlist = j.optJSONObject("preissued")?.optString("playlist")?.takeIf { it.isNotBlank() } ?: return null
         return direct(playlist, embed, "bootstrap", listOf(video))
@@ -505,6 +699,8 @@ class NguonTVProvider : MainAPI() {
             }.getOrNull() ?: continue
             if (!decoded.contains("http")) continue
             val text = decoded.replace("\\/", "/")
+            // Chuỗi base64 có thể chứa cả danh sách phụ đề
+            runCatching { collectSubsFrom(text, embed, "b64", log) }
             val url = Regex("""https?://[^\s"'<>\\]+""").findAll(text).map { it.value }
                 .firstOrNull { it.contains(".m3u8") } ?: continue
             found++
@@ -548,12 +744,16 @@ class NguonTVProvider : MainAPI() {
     }
 
     private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit, allowWebView: Boolean = false, depth: Int = 0): Stream? {
+        // Quét phụ đề trong chính trang embed
+        runCatching {
+            collectSubsFrom(app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text, embed, "embed", log)
+        }
         val tags = if (allowWebView) listOf("bootstrap", "data-obf", "base64", "scan", "webview")
                    else listOf("bootstrap", "data-obf", "base64", "scan")
         for (tag in tags) {
             val st = runCatching {
                 when (tag) {
-                    "bootstrap" -> viaBootstrap(embed, page)
+                    "bootstrap" -> viaBootstrap(embed, page, log)
                     "data-obf" -> viaDataObf(embed, page)
                     "base64" -> viaB64(embed, page, log)
                     "scan" -> viaScan(embed, page)
@@ -614,13 +814,26 @@ class NguonTVProvider : MainAPI() {
         }
         val link = if (st.text != null) LocalPlaylist.url(st.text) else st.url!!
         val r = st.ref ?: embed
+        val hasAbr = st.variants.isNotEmpty()
+        // Link "Auto": master playlist có nhiều chất lượng, trình phát tự đổi theo tốc độ mạng.
         callback(
-            newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
+            newExtractorLink(name, if (hasAbr) "$name Auto" else name, link, ExtractorLinkType.M3U8) {
                 this.referer = st.hdr?.get("Referer") ?: if (st.hdr != null) "" else r
-                this.quality = Qualities.Unknown.value
+                this.quality = if (hasAbr) 2160 else Qualities.Unknown.value
                 this.headers = st.hdr ?: segHeaders(r)
             }
         )
+        // Các link chọn tay một chất lượng cố định
+        for ((h, bw, u) in st.variants) {
+            val label = if (h > 0) "${h}p" else "${bw / 1000}kbps"
+            callback(
+                newExtractorLink(name, "$name $label", u, ExtractorLinkType.M3U8) {
+                    this.referer = st.hdr?.get("Referer") ?: if (st.hdr != null) "" else r
+                    this.quality = if (h > 0) h else Qualities.Unknown.value
+                    this.headers = st.hdr ?: segHeaders(r)
+                }
+            )
+        }
         true
     }.getOrDefault(false)
 
@@ -758,7 +971,39 @@ class NguonTVProvider : MainAPI() {
         return Pair(chosen, chosenKey)
     }
 
-    // Tải playlist, nếu là master thì chọn chất lượng cao nhất, tải playlist con rồi phát qua máy chủ cục bộ
+    // Tải các khóa AES (song song, 8 khóa một lượt) và đổi URI khóa sang máy chủ cục bộ.
+    // `cache` dùng chung giữa các chất lượng để khóa trùng URL chỉ tải một lần.
+    private suspend fun localizeKeys(
+        text0: String, hdr: Map<String, String>, token: String?, streamUrl: String?,
+        cache: MutableMap<String, String>, log: (String) -> Unit
+    ): String {
+        val keyRe = Regex("""#EXT-X-KEY:[^\n]*?URI="([^"]+)"""")
+        val keyUris = keyRe.findAll(text0).map { it.groupValues[1] }.toList().distinct()
+        if (keyUris.isEmpty()) return text0
+        val need = keyUris.take(300).filter { it !in cache }
+        coroutineScope {
+            for (chunk in need.chunked(8)) {
+                val res = chunk.map { u -> async { u to fetchKey(u, hdr, token, streamUrl, log) } }.awaitAll()
+                for ((u, kb) in res) if (kb != null) cache[u] = LocalPlaylist.bytes(kb)
+            }
+        }
+        var text = text0
+        var ok = 0
+        for (u in keyUris) {
+            val loc = cache[u] ?: continue
+            text = text.replace("URI=\"$u\"", "URI=\"$loc\"")
+            ok++
+        }
+        log("  khóa AES: $ok/${keyUris.size} tải được và phát qua máy chủ cục bộ")
+        return text
+    }
+
+    /**
+     * Tải playlist. Nếu là master có nhiều chất lượng: giữ lại tối đa 4 chất lượng (cao nhất, thấp nhất và 2 mức giữa),
+     * xử lý khóa của từng chất lượng, rồi dựng lại master trỏ tới playlist cục bộ để ExoPlayer tự đổi chất lượng
+     * theo tốc độ mạng. Đồng thời trả về danh sách chất lượng để thêm link chọn tay.
+     * Nếu chỉ có một playlist thì xử lý như trước.
+     */
     private suspend fun flatten(st: Stream, embed: String, log: (String) -> Unit): Stream = runCatching {
         if (st.mp4) return@runCatching st
         val ref = st.ref ?: embed
@@ -768,44 +1013,95 @@ class NguonTVProvider : MainAPI() {
             .also { cookies = cookies + it.cookies }.text
         val base = baseUrl ?: Regex("""https?://[^\s"]+""").find(text)?.value ?: return@runCatching st
         text = absAll(text, base)
+        val cache = mutableMapOf<String, String>()
+
         if (text.contains("#EXT-X-STREAM-INF")) {
             val ls = text.lines()
-            var best: String? = null
-            var bw = -1L
+            val all = mutableListOf<Variant>()
             for (i in ls.indices) {
-                if (ls[i].startsWith("#EXT-X-STREAM-INF")) {
-                    val b = Regex("""BANDWIDTH=(\d+)""").find(ls[i])?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                    val u = ls.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }?.trim()
-                    if (u != null && b > bw) { bw = b; best = u }
+                if (!ls[i].startsWith("#EXT-X-STREAM-INF")) continue
+                val b = Regex("""BANDWIDTH=(\d+)""").find(ls[i])?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                val hgt = Regex("""RESOLUTION=\d+x(\d+)""").find(ls[i])?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val u = ls.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }?.trim()
+                if (u != null) all.add(Variant(b, hgt, u))
+            }
+            val uniq = all.distinctBy { it.url }.sortedByDescending { it.bw }
+            val picked = if (uniq.size <= 4) uniq
+                else listOf(0, uniq.size / 3, 2 * uniq.size / 3, uniq.size - 1).distinct().map { uniq[it] }
+            log("  master: ${uniq.size} chất lượng, giữ ${picked.size}: " + picked.joinToString(",") { "${it.height}p/${it.bw / 1000}k" })
+
+            val fetched = LinkedHashMap<String, String>()
+            for (v in picked) {
+                val r = runCatching { app.get(v.url, referer = ref.ifBlank { null }, headers = segHeaders(ref)) }.getOrNull()
+                if (r != null) cookies = cookies + r.cookies
+                log("  flat: ${v.height}p bw=${v.bw} code=${r?.code ?: "LỖI"} đầu=${r?.text?.trimStart()?.take(40)?.replace(Regex("\\s+"), " ") ?: ""}")
+                if (r != null && r.code == 200 && looksLikePlaylist(r.text)) fetched[v.url] = absAll(r.text, v.url)
+            }
+
+            if (fetched.isNotEmpty()) {
+                val top = picked.first { it.url in fetched }
+                val (hdr, _) = runCatching { probeSegments(fetched[top.url]!!, embed, cookies, st.token, st.streamUrl, log) }
+                    .getOrElse { log("  probe lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); Pair(null, null) }
+                val kh = hdr ?: segHeaders(ref)
+
+                val localUrls = mutableMapOf<String, String>()
+                for ((u, t) in fetched) {
+                    localUrls[u] = LocalPlaylist.url(localizeKeys(t, kh, st.token, st.streamUrl, cache, log))
                 }
+
+                // Dựng lại master: chỉ giữ các chất lượng tải được, trỏ về playlist cục bộ
+                val out = mutableListOf<String>()
+                var idx = 0
+                while (idx < ls.size) {
+                    val l = ls[idx]
+                    when {
+                        l.startsWith("#EXT-X-STREAM-INF") -> {
+                            var j = idx + 1
+                            while (j < ls.size && (ls[j].isBlank() || ls[j].startsWith("#"))) j++
+                            val u = ls.getOrNull(j)?.trim()
+                            val loc = u?.let { localUrls[it] }
+                            if (loc != null) { out.add(l); out.add(loc) }
+                            idx = j + 1
+                        }
+                        l.startsWith("#EXT-X-MEDIA") && hlsAttr(l, "TYPE") == "AUDIO" && hlsAttr(l, "URI").isNotBlank() -> {
+                            // Nhóm audio riêng cũng có thể cần xử lý khóa
+                            val u = hlsAttr(l, "URI")
+                            val loc = runCatching {
+                                val r = app.get(u, referer = ref.ifBlank { null }, headers = segHeaders(ref))
+                                if (r.code == 200 && looksLikePlaylist(r.text))
+                                    LocalPlaylist.url(localizeKeys(absAll(r.text, u), kh, st.token, st.streamUrl, cache, log))
+                                else null
+                            }.getOrNull()
+                            out.add(if (loc != null) l.replace("URI=\"$u\"", "URI=\"$loc\"") else l)
+                            idx++
+                        }
+                        else -> { out.add(l); idx++ }
+                    }
+                }
+                val master = prioritizeSubs(out.joinToString("\n"))
+                val subTracks = out.count { it.startsWith("#EXT-X-MEDIA") && hlsAttr(it, "TYPE") == "SUBTITLES" }
+                log("  master mới: ${localUrls.size} chất lượng, ${subTracks} phụ đề nhúng HLS")
+
+                val variantLinks = picked.filter { it.url in localUrls }.map { Triple(it.height, it.bw, localUrls[it.url]!!) }
+                return@runCatching Stream(null, master, st.via + "+abr", ref, hdr, st.token, st.streamUrl, false, variantLinks)
             }
-            if (best != null) {
-                val r = app.get(best, referer = ref.ifBlank { null }, headers = segHeaders(ref))
-                cookies = cookies + r.cookies
-                log("  flat: playlist con code=${r.code} bw=$bw đầu=${r.text.trimStart().take(40).replace(Regex("\\s+"), " ")}")
-                if (r.code == 200 && looksLikePlaylist(r.text)) text = absAll(r.text, best)
-            }
+            log("  master: không tải được playlist con nào, dùng cách cũ")
         }
-        val (hdr, keyBytes) = runCatching { probeSegments(text, embed, cookies, st.token, st.streamUrl, log) }
+
+        // Chỉ có một playlist (không đổi chất lượng được)
+        val (hdr, _) = runCatching { probeSegments(text, embed, cookies, st.token, st.streamUrl, log) }
             .getOrElse { log("  probe lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); Pair(null, null) }
-        val keyRe = Regex("""#EXT-X-KEY:[^\n]*?URI="([^"]+)"""")
-        val keyUris = keyRe.findAll(text).map { it.groupValues[1] }.toList().distinct()
-        if (keyUris.isNotEmpty()) {
-            val base = hdr ?: segHeaders(ref)
-            var okKeys = 0
-            for (u in keyUris.take(300)) {
-                val kb = fetchKey(u, base, st.token, st.streamUrl, log) ?: continue
-                text = text.replace("URI=\"$u\"", "URI=\"${LocalPlaylist.bytes(kb)}\"")
-                okKeys++
-            }
-            log("  khóa AES: $okKeys/${keyUris.size} tải được và phát qua máy chủ cục bộ")
-        }
+        text = localizeKeys(text, hdr ?: segHeaders(ref), st.token, st.streamUrl, cache, log)
         Stream(null, text, st.via + "+flat", ref, hdr, st.token, st.streamUrl)
     }.getOrElse { log("  flat lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); st }
 
     private suspend fun resolveFilm(basePage: String, playerPage: String, log: (String) -> Unit): Res? {
         val pageDoc = fetch(basePage).document
         val playerDoc = runCatching { fetch(playerPage, mapOf("Referer" to basePage)).document }.getOrNull()
+        // Phụ đề có thể nằm ngay trong trang phim / trang phát
+        runCatching { collectSubsFrom(pageDoc.html(), basePage, "trang-phim", log) }
+        runCatching { collectSubsFrom(playerDoc?.html() ?: "", playerPage, "trang-phát", log) }
+        domSubHints(playerDoc, "trang-phát")
         val state = playerDoc?.let { extractPlayerState(it, playerPage) } ?: extractPlayerState(pageDoc, basePage)
         if (state == null) {
             log("state=NULL (không tách được fid/key) playerDoc=${playerDoc != null}")
@@ -842,6 +1138,8 @@ class NguonTVProvider : MainAPI() {
             )
             val body = resp.text
             val decoded = body.replace("\\/", "/").replace("\\u0026", "&").replace("\\\"", "\"").replace("&amp;", "&")
+            // Phản hồi POST cũng có thể mang danh sách phụ đề
+            runCatching { collectSubsFrom(body, playerPage, "post", log) }
             val embed = findEmbedUrl(body)
                 ?: Regex("""<iframe[^>]+src=\\?["']([^"'\\]+)""").find(body.replace("\\/", "/"))?.groupValues?.get(1)?.replace("&amp;", "&")
             val js = runCatching { JSONObject(body) }.getOrNull()
@@ -899,7 +1197,11 @@ class NguonTVProvider : MainAPI() {
         val parts = data.split("||", limit = 2)
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
-        val lines = mutableListOf("NguonTV v23 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        subs.clear()
+        subHints.clear()
+        val lines: MutableList<String> = java.util.Collections.synchronizedList(
+            mutableListOf("NguonTV v24 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+        )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
         try {
@@ -916,8 +1218,11 @@ class NguonTVProvider : MainAPI() {
         } catch (e: Exception) {
             log("LỖI loadLinks ${e.javaClass.simpleName}: ${e.message}")
         }
+        // Phụ đề: tiếng Việt trước, tiếng Anh sau
+        runCatching { emitSubs(subtitleCallback, log) }
+            .onFailure { log("LỖI phụ đề ${it.javaClass.simpleName}: ${it.message?.take(80)}") }
         if (!ok) gateProbe(basePage).forEach(log)
-        if (!ok) copyLog(lines.joinToString("\n"))
+        if (!ok || (COPY_LOG_WHEN_NO_SUB && subs.isEmpty())) copyLog(lines.joinToString("\n"))
         return ok
     }
 
