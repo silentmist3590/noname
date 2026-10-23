@@ -11,6 +11,10 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -359,7 +363,9 @@ class NguonTVProvider : MainAPI() {
 
     // ================= Phụ đề =================
 
-    private class Sub(val lang: String, val label: String, val url: String, val ref: String)
+    private class Sub(var lang: String, val label: String, val url: String, val ref: String) {
+        var text: String? = null
+    }
 
     private val subs = java.util.concurrent.CopyOnWriteArrayList<Sub>()
     private val subHints = java.util.concurrent.CopyOnWriteArrayList<String>()
@@ -420,7 +426,7 @@ class NguonTVProvider : MainAPI() {
      */
     private fun collectSubsFrom(raw: String, base: String, src: String, log: (String) -> Unit) {
         if (raw.isBlank()) return
-        val t = raw.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&").replace("\\\"", "\"")
+        val t = unescapeJs(raw)
         var found = 0
         fun add(label: String, rawUrl: String) {
             val url = resolveUrl(rawUrl.trim(), base)
@@ -475,6 +481,89 @@ class NguonTVProvider : MainAPI() {
         }
     }
 
+    private fun unescapeJs(s: String): String {
+        var t = s.replace("\\/", "/").replace("&amp;", "&").replace("\\\"", "\"")
+        if (t.contains("\\u") || t.contains("\\x")) {
+            t = Regex("""\\u([0-9a-fA-F]{4})""").replace(t) { it.groupValues[1].toInt(16).toChar().toString() }
+            t = Regex("""\\x([0-9a-fA-F]{2})""").replace(t) { it.groupValues[1].toInt(16).toChar().toString() }
+        }
+        return t
+    }
+
+    // Quét cả các chuỗi base64 / percent-encoded giấu trong trang embed (JW Player dựng `tracks` từ JS)
+    private fun deepCollect(html: String, base: String, src: String, log: (String) -> Unit) {
+        collectSubsFrom(html, base, src, log)
+        if (html.contains("%2F", true) || html.contains("%3A", true)) {
+            runCatching { java.net.URLDecoder.decode(html, "UTF-8") }.getOrNull()
+                ?.let { collectSubsFrom(it, base, "$src-url", log) }
+        }
+        val seen = HashSet<String>()
+        for (m in Regex("""["'`]([A-Za-z0-9+/=_-]{24,})["'`]""").findAll(html)) {
+            val s = m.groupValues[1]
+            if (!seen.add(s)) continue
+            val std = s.replace('-', '+').replace('_', '/')
+            val dec = runCatching {
+                String(android.util.Base64.decode(std + "=".repeat((4 - std.length % 4) % 4), android.util.Base64.DEFAULT))
+            }.getOrNull() ?: continue
+            if (dec.length < 12 || dec.count { it.code in 32..126 } < dec.length * 0.85) continue
+            if (Regex("""(?i)srt|vtt|\.ass|subtitle|tracks|caption""").containsMatchIn(dec)) {
+                collectSubsFrom(dec, base, "$src-b64", log)
+            }
+        }
+    }
+
+    // Đoán ngôn ngữ từ nội dung tệp phụ đề (tên tệp trên máy chủ không có mã ngôn ngữ, vd 446_1792525039_xxx.srt)
+    private fun detectLang(t: String): String? {
+        val body = t.lines().map { it.trim() }
+            .filter { it.isNotEmpty() && !it.contains("-->") && !it.all { c -> c.isDigit() } && !it.startsWith("WEBVTT") }
+            .take(400).joinToString(" ")
+            .replace(Regex("<[^>]+>|\\{[^}]*\\}"), " ").lowercase()
+        val letters = body.count { it.isLetter() }
+        if (letters < 40) return null
+        // Chỉ tính các chữ cái đặc trưng tiếng Việt (không tính à á è é... dùng chung với tiếng Pháp/Tây Ban Nha)
+        val vi = body.count { it in "ăâđêôơưạảẩẫấầậắằẳẵặẹẻẽếềểễệỉĩịọỏốồổỗộớờởỡợụủũứừửữựỳỵỷỹ" }
+        if (vi.toDouble() / letters > 0.04) return "Vietnamese"
+        val en = Regex("""\b(the|you|and|to|is|that|it|of|what|this|are)\b""").findAll(body).count()
+        return if (en >= 12) "English" else null
+    }
+
+    private suspend fun fetchSubText(s: Sub): String? {
+        s.text?.let { return it }
+        for (ref in listOf(s.ref, "$mainUrl/", "")) {
+            val r = runCatching {
+                app.get(s.url, referer = ref.ifBlank { null }, headers = mapOf("User-Agent" to ua))
+            }.getOrNull() ?: continue
+            if (r.code != 200) continue
+            val t = r.text
+            val head = t.trimStart()
+            if (t.length < 10 || head.startsWith("<!DOCTYPE", true) || head.startsWith("<html", true)) continue
+            s.text = t
+            return t
+        }
+        return null
+    }
+
+    // Dự phòng: mở trang embed trong WebView và bắt các request .srt/.vtt/.ass do JW Player tải.
+    // Mỗi lượt chỉ bắt được 1 URL, nên các lượt sau loại trừ URL đã bắt (tối đa 3 phụ đề).
+    private suspend fun viaWebViewSubs(embed: String, page: String, log: (String) -> Unit) {
+        val ext = """\.(?:srt|vtt|ass|ssa)(?:[?#]|$)"""
+        val got = mutableListOf<String>()
+        for (i in 0 until 3) {
+            val skip = if (got.isEmpty()) "" else "(?!" + got.joinToString("|") { Regex.escape(it) } + ")"
+            val re = Regex("^$skip.*$ext", RegexOption.IGNORE_CASE)
+            val url = withTimeoutOrNull(if (i == 0) 35_000L else 12_000L) {
+                runCatching { app.get(embed, referer = page, interceptor = WebViewResolver(re)).url }.getOrNull()
+            }
+            if (url == null || !re.containsMatchIn(url)) {
+                log("  webview phụ đề lượt ${i + 1}: không bắt được thêm")
+                break
+            }
+            got.add(url)
+            log("  webview phụ đề: $url")
+            if (subs.none { it.url == url }) subs.add(Sub(subLang("", url) ?: "Phụ đề", "", url, embed))
+        }
+    }
+
     // Ghi lại các phần tử giao diện có vẻ liên quan phụ đề (nút chọn phụ đề...) để chẩn đoán
     private fun domSubHints(doc: Document?, src: String) {
         if (doc == null) return
@@ -497,17 +586,8 @@ class NguonTVProvider : MainAPI() {
             "ttml" -> "application/ttml+xml"
             else -> "text/vtt"
         }
-        for (ref in listOf(s.ref, "$mainUrl/", "")) {
-            val r = runCatching {
-                app.get(s.url, referer = ref.ifBlank { null }, headers = mapOf("User-Agent" to ua))
-            }.getOrNull() ?: continue
-            if (r.code != 200) continue
-            val t = r.text
-            val head = t.trimStart()
-            if (t.length < 10 || head.startsWith("<!DOCTYPE", true) || head.startsWith("<html", true)) continue
-            return LocalPlaylist.bytes(t.toByteArray(Charsets.UTF_8), ext, ctype)
-        }
-        return s.url
+        val t = fetchSubText(s) ?: return s.url
+        return LocalPlaylist.bytes(t.toByteArray(Charsets.UTF_8), ext, ctype)
     }
 
     // Phát phụ đề cho CloudStream: tiếng Việt trước, rồi tiếng Anh. Nếu không có cả hai thì lấy tối đa 3 bản bất kỳ.
@@ -517,6 +597,14 @@ class NguonTVProvider : MainAPI() {
             log("PHỤ ĐỀ: không tìm thấy bản nào")
             subHints.forEach(log)
             return
+        }
+        // Bản chưa biết ngôn ngữ: tải về và đoán theo nội dung
+        for (s in all.filter { it.lang != "Vietnamese" && it.lang != "English" }.take(6)) {
+            val t = runCatching { fetchSubText(s) }.getOrNull() ?: continue
+            detectLang(t)?.let {
+                s.lang = it
+                log("  sub nhận diện theo nội dung: $it <- ${s.url.takeLast(45)}")
+            }
         }
         val pri = all.filter { it.lang == "Vietnamese" || it.lang == "English" }
         val chosen = (if (pri.isNotEmpty()) pri else all.take(3))
@@ -743,7 +831,7 @@ class NguonTVProvider : MainAPI() {
     private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit, allowWebView: Boolean = false, depth: Int = 0): Stream? {
         // Quét phụ đề trong chính trang embed
         runCatching {
-            collectSubsFrom(app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text, embed, "embed", log)
+            deepCollect(app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text, embed, "embed", log)
         }
         val tags = if (allowWebView) listOf("bootstrap", "data-obf", "base64", "scan", "webview")
                    else listOf("bootstrap", "data-obf", "base64", "scan")
@@ -840,7 +928,7 @@ class NguonTVProvider : MainAPI() {
         val sb = StringBuilder()
         val scripts = Regex("""<script[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
             .findAll(t).map { it.groupValues[1] }
-            .filter { it.contains("npJWPlayer") || Regex("""function\s+f\d""").containsMatchIn(it) }
+            .filter { it.contains("jwplayer", true) || it.contains("npJWPlayer") || Regex("""function\s+f\d""").containsMatchIn(it) }
             .toList()
         sb.append("số script liên quan=${scripts.size}\n")
         scripts.take(3).forEachIndexed { i, sc ->
@@ -968,7 +1056,8 @@ class NguonTVProvider : MainAPI() {
         return Pair(chosen, chosenKey)
     }
 
-    // Tải các khóa AES và đổi URI khóa sang máy chủ cục bộ.
+    // Tải các khóa AES (song song, 8 khóa một lượt) và đổi URI khóa sang máy chủ cục bộ.
+    // `cache` dùng chung giữa các chất lượng để khóa trùng URL chỉ tải một lần.
     private suspend fun localizeKeys(
         text0: String, hdr: Map<String, String>, token: String?, streamUrl: String?,
         cache: MutableMap<String, String>, log: (String) -> Unit
@@ -977,10 +1066,10 @@ class NguonTVProvider : MainAPI() {
         val keyUris = keyRe.findAll(text0).map { it.groupValues[1] }.toList().distinct()
         if (keyUris.isEmpty()) return text0
         val need = keyUris.take(300).filter { it !in cache }
-        for (u in need) {
-            val kb = fetchKey(u, hdr, token, streamUrl, log)
-            if (kb != null) {
-                cache[u] = LocalPlaylist.bytes(kb)
+        coroutineScope {
+            for (chunk in need.chunked(8)) {
+                val res = chunk.map { u -> async { u to fetchKey(u, hdr, token, streamUrl, log) } }.awaitAll()
+                for ((u, kb) in res) if (kb != null) cache[u] = LocalPlaylist.bytes(kb)
             }
         }
         var text = text0
@@ -1196,12 +1285,14 @@ class NguonTVProvider : MainAPI() {
         subs.clear()
         subHints.clear()
         val lines: MutableList<String> = java.util.Collections.synchronizedList(
-            mutableListOf("NguonTV v24 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+            mutableListOf("NguonTV v25 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
+        var embedUrl: String? = null
         try {
             val res = resolveFilm(basePage, playerPage, log)
+            embedUrl = res?.embed?.takeIf { it.isNotBlank() }
             ok = when {
                 res?.st != null && emitStream(res.st, res.embed.orEmpty(), callback) -> { log("KẾT QUẢ: phát qua ${res.st.via}"); true }
                 res?.other != null -> {
@@ -1213,6 +1304,19 @@ class NguonTVProvider : MainAPI() {
             }
         } catch (e: Exception) {
             log("LỖI loadLinks ${e.javaClass.simpleName}: ${e.message}")
+        }
+        // Không thấy phụ đề trong HTML/JSON: để JW Player tự chạy trong WebView rồi bắt request .srt/.vtt
+        val eu = embedUrl
+        if (subs.isEmpty() && eu != null) {
+            runCatching { viaWebViewSubs(eu, playerPage, log) }
+                .onFailure { log("LỖI webview phụ đề ${it.javaClass.simpleName}: ${it.message?.take(80)}") }
+            if (subs.isEmpty()) {
+                // Vẫn không có: ghi lại đoạn script dựng JW Player để biết `tracks` được giấu thế nào
+                runCatching {
+                    val h = app.get(eu, referer = playerPage, headers = mapOf("User-Agent" to ua)).text
+                    log("EMBED DIGEST:\n" + embedDigest(h))
+                }
+            }
         }
         // Phụ đề: tiếng Việt trước, tiếng Anh sau
         runCatching { emitSubs(subtitleCallback, log) }
