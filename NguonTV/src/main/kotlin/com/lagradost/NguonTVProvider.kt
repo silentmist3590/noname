@@ -28,6 +28,9 @@ private const val TAG = "NguonTV"
  */
 private const val COPY_LOG_WHEN_NO_SUB = true
 
+/** true = chép log vào clipboard sau MỖI lần phát (tạm thời, để chẩn đoán việc tải chậm / phát lệch vị trí). Đặt false khi xong. */
+private const val COPY_LOG_ALWAYS = true
+
 /** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist / khóa / phụ đề đã xử lý cho trình phát. */
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -633,6 +636,17 @@ class NguonTVProvider : MainAPI() {
     private fun originOf(url: String): String =
         Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1).orEmpty()
 
+    // Thống kê nhanh playlist: số đoạn, tổng thời lượng, có ENDLIST (VOD) hay không
+    private fun plStats(t: String): String {
+        val ls = t.lines()
+        val inf = ls.filter { it.startsWith("#EXTINF") }
+        val dur = inf.sumOf { it.substringAfter(':').substringBefore(',').toDoubleOrNull() ?: 0.0 }
+        val type = Regex("#EXT-X-PLAYLIST-TYPE:(\\w+)").find(t)?.groupValues?.get(1) ?: "-"
+        val seq = Regex("#EXT-X-MEDIA-SEQUENCE:(\\d+)").find(t)?.groupValues?.get(1) ?: "-"
+        val keys = Regex("""#EXT-X-KEY:[^\n]*URI="([^"]+)"""").findAll(t).map { it.groupValues[1] }.distinct().count()
+        return "đoạn=${inf.size} dài=${dur.toInt()}s endlist=${t.contains("#EXT-X-ENDLIST")} type=$type seq=$seq khóa=$keys"
+    }
+
     private fun looksLikePlaylist(t: String?): Boolean =
         t != null && t.trimStart().startsWith("#EXTM3U") && t.lines().any { it.isNotBlank() && !it.startsWith("#") }
 
@@ -1116,7 +1130,10 @@ class NguonTVProvider : MainAPI() {
                 val r = runCatching { app.get(v.url, referer = ref.ifBlank { null }, headers = segHeaders(ref)) }.getOrNull()
                 if (r != null) cookies = cookies + r.cookies
                 log("  flat: ${v.height}p bw=${v.bw} code=${r?.code ?: "LỖI"} đầu=${r?.text?.trimStart()?.take(40)?.replace(Regex("\\s+"), " ") ?: ""}")
-                if (r != null && r.code == 200 && looksLikePlaylist(r.text)) fetched[v.url] = absAll(r.text, v.url)
+                if (r != null && r.code == 200 && looksLikePlaylist(r.text)) {
+                    fetched[v.url] = absAll(r.text, v.url)
+                    log("  playlist ${v.height}p: ${plStats(r.text)}")
+                }
             }
 
             if (fetched.isNotEmpty()) {
@@ -1170,6 +1187,7 @@ class NguonTVProvider : MainAPI() {
         }
 
         // Chỉ có một playlist (không đổi chất lượng được)
+        log("  playlist đơn: ${plStats(text)}")
         val (hdr, _) = runCatching { probeSegments(text, embed, cookies, st.token, st.streamUrl, log) }
             .getOrElse { log("  probe lỗi ${it.javaClass.simpleName} ${it.message?.take(80)}"); Pair(null, null) }
         text = localizeKeys(text, hdr ?: segHeaders(ref), st.token, st.streamUrl, cache, log)
@@ -1280,8 +1298,9 @@ class NguonTVProvider : MainAPI() {
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
         subs.clear()
         subHints.clear()
+        val t0 = System.currentTimeMillis()
         val lines: MutableList<String> = java.util.Collections.synchronizedList(
-            mutableListOf("NguonTV v27 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+            mutableListOf("NguonTV v28 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
@@ -1290,7 +1309,7 @@ class NguonTVProvider : MainAPI() {
             val res = resolveFilm(basePage, playerPage, log)
             embedUrl = res?.embed?.takeIf { it.isNotBlank() }
             ok = when {
-                res?.st != null && emitStream(res.st, res.embed.orEmpty(), callback) -> { log("KẾT QUẢ: phát qua ${res.st.via}"); true }
+                res?.st != null && emitStream(res.st, res.embed.orEmpty(), callback) -> { log("KẾT QUẢ: phát qua ${res.st.via} (trả link sau ${System.currentTimeMillis() - t0}ms)"); true }
                 res?.other != null -> {
                     log("KẾT QUẢ: iframe ngoài ${res.other}")
                     loadExtractor(res.other, playerPage, subtitleCallback, callback)
@@ -1318,7 +1337,8 @@ class NguonTVProvider : MainAPI() {
         runCatching { emitSubs(subtitleCallback, log) }
             .onFailure { log("LỖI phụ đề ${it.javaClass.simpleName}: ${it.message?.take(80)}") }
         if (!ok) gateProbe(basePage).forEach(log)
-        if (!ok || (COPY_LOG_WHEN_NO_SUB && subs.isEmpty())) copyLog(lines.joinToString("\n"))
+        log("TỔNG THỜI GIAN loadLinks: ${System.currentTimeMillis() - t0}ms")
+        if (!ok || COPY_LOG_ALWAYS || (COPY_LOG_WHEN_NO_SUB && subs.isEmpty())) copyLog(lines.joinToString("\n"))
         return ok
     }
 
