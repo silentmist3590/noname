@@ -1,0 +1,153 @@
+[
+    {
+        "iconUrl": "https://archive.org/favicon.ico",
+        "fileHash": "sha256-eb71f916b83309d836a725a307ef1a06b80033232daa28741ea4f12a0f057e0a",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 16064,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie"
+        ],
+        "version": 1,
+        "internalName": "InternetArchive",
+        "description": "Phim thu\u1ed9c ph\u1ea1m vi c\u00f4ng c\u1ed9ng t\u1eeb Internet Archive (archive.org)",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/InternetArchive.cs3",
+        "name": "InternetArchive"
+    },
+    {
+        "fileHash": "sha256-03b6e2a7fd2abcf2cef308b414b97bfd26c82afe33082351bfd8f6534693458f",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 30416,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AsianDrama"
+        ],
+        "version": 4,
+        "internalName": "Kkphim",
+        "description": "Xem phim t\u1eeb API c\u1ee7a kkphim.com",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/Kkphim.cs3",
+        "name": "Kkphim"
+    },
+    {
+        "fileHash": "sha256-1d315215bf47148f89f0f254b71ce2930c37e052436170efc5ec5954308ea50d",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 80374,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Local build"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "Cartoon"
+        ],
+        "version": 2,
+        "internalName": "NgonTV",
+        "description": "NgonTV movie and series provider. Uses embedded playback hosts when available.",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/NgonTV.cs3",
+        "name": "NgonTV"
+    },
+    {
+        "fileHash": "sha256-490095da5d3a8979c9b8be22428722556b4019889f49aacce5671bb0ea49ca44",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 112804,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Local build"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "Cartoon"
+        ],
+        "version": 30,
+        "internalName": "NguonTV",
+        "description": "NguonTV movie and series provider. Ph\u1ee5 \u0111\u1ec1 Vi\u1ec7t/Anh, t\u1ef1 \u0111\u1ed9ng \u0111\u1ed5i ch\u1ea5t l\u01b0\u1ee3ng theo m\u1ea1ng. VPN may be needed for some titles.",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/NguonTV.cs3",
+        "name": "NguonTV"
+    },
+    {
+        "iconUrl": "https://phim.nguonc.com/favicon.ico",
+        "fileHash": "sha256-72ae758787508c55a7b7659f85304da8f9902ab805a807d9b114a81d4c25da6f",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 32193,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "AsianDrama"
+        ],
+        "version": 26,
+        "internalName": "PhimNguonC",
+        "description": "Xem phim t\u1eeb ngu\u1ed3n phim.nguonc.com tr\u00ean CloudStream",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/PhimNguonC.cs3",
+        "name": "PhimNguonC"
+    },
+    {
+        "fileHash": "sha256-805e3d65bbc8b826fda613ab8097f1d81c338026763c52932d09f2ef40f3f635",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 32648,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 2,
+        "internalName": "PhimVNProvider",
+        "description": "Plugin PhimVN",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/PhimVNProvider.cs3",
+        "name": "PhimVNProvider"
+    },
+    {
+        "iconUrl": "https://vsmov.com/VSmov.png",
+        "fileHash": "sha256-57380a1f48c8633390a0dba2b3a628445441c492662f4071fa9947ac7f9034b4",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 44035,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AsianDrama"
+        ],
+        "version": 4,
+        "internalName": "VsMov",
+        "description": "Xem phim t\u1eeb API c\u00f4ng khai c\u1ee7a vsmov.com",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/VsMov.cs3",
+        "name": "VsMov"
+    }
+]
