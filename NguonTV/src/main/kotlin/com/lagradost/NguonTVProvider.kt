@@ -623,6 +623,14 @@ class NguonTVProvider : MainAPI() {
 
     private class Variant(val bw: Long, val height: Int, val url: String)
 
+    private val embedCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var tStart = 0L
+    private fun el() = System.currentTimeMillis() - tStart
+
+    private suspend fun embedHtml(embed: String, page: String): String =
+        embedCache[embed] ?: app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text
+            .also { embedCache[embed] = it }
+
     private fun segHeaders(embed: String): Map<String, String> {
         val base = mapOf(
             "User-Agent" to ua,
@@ -710,9 +718,9 @@ class NguonTVProvider : MainAPI() {
 
     private suspend fun viaBootstrap(embed: String, page: String, log: (String) -> Unit = {}): Stream? {
         val origin = originOf(embed)
-        val shell = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua))
+        val shellText = embedHtml(embed, page)
         val cfg = Regex("""<script id="stream-bootstrap"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
-            .find(shell.text)?.groupValues?.get(1) ?: return null
+            .find(shellText)?.groupValues?.get(1) ?: return null
         val api = JSONObject(cfg).optString("api").takeIf { it.isNotBlank() } ?: return null
         val body = JSONObject().apply {
             put("action", "bootstrap")
@@ -750,7 +758,7 @@ class NguonTVProvider : MainAPI() {
 
     private suspend fun viaDataObf(embed: String, page: String): Stream? {
         val origin = originOf(embed)
-        val html = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text
+        val html = embedHtml(embed, page)
         val obf = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.get(1) ?: return null
         val j = JSONObject(String(android.util.Base64.decode(obf, android.util.Base64.DEFAULT)))
         val sub = j.optString("sUb").takeIf { it.isNotBlank() } ?: return null
@@ -778,7 +786,7 @@ class NguonTVProvider : MainAPI() {
     // Trang embed của NguonTV giấu nguồn phát trong biến chuỗi base64 (tên biến đổi mỗi lần tải),
     // ví dụ [{"file":"https://.../index.m3u8","type":"hls"}]. Giải mọi chuỗi base64 dài và tìm link .m3u8.
     private suspend fun viaB64(embed: String, page: String, log: (String) -> Unit): Stream? {
-        val html = app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text
+        val html = embedHtml(embed, page)
         var found = 0
         for (m in Regex("""["']([A-Za-z0-9+/=_-]{40,})["']""").findAll(html)) {
             val decoded = runCatching {
@@ -843,11 +851,12 @@ class NguonTVProvider : MainAPI() {
     private suspend fun resolveEmbed(embed: String, page: String, log: (String) -> Unit, allowWebView: Boolean = false, depth: Int = 0): Stream? {
         // Quét phụ đề trong chính trang embed
         runCatching {
-            deepCollect(app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text, embed, "embed", log)
+            deepCollect(embedHtml(embed, page), embed, "embed", log)
         }
         val tags = if (allowWebView) listOf("bootstrap", "data-obf", "base64", "scan", "webview")
                    else listOf("bootstrap", "data-obf", "base64", "scan")
         for (tag in tags) {
+            val tt = System.currentTimeMillis()
             val st = runCatching {
                 when (tag) {
                     "bootstrap" -> viaBootstrap(embed, page, log)
@@ -859,13 +868,14 @@ class NguonTVProvider : MainAPI() {
             }.onFailure {
                 log("tầng $tag lỗi: ${it.javaClass.simpleName} ${it.message?.take(100)}")
             }.getOrNull()
+            log("  [t=${el()}ms] tầng $tag xong sau ${System.currentTimeMillis() - tt}ms")
             if (st == null) { log("tầng $tag: không có kết quả"); continue }
             log("tầng $tag: dùng được (${st.via})")
             return st
         }
         // Trang embed của NguonTV có thể lồng iframe tới nhà cung cấp khác (ví dụ streamc.xyz): xử lý đệ quy
         if (depth < 2) {
-            val html = runCatching { app.get(embed, referer = page, headers = mapOf("User-Agent" to ua)).text }.getOrDefault("")
+            val html = runCatching { embedHtml(embed, page) }.getOrDefault("")
             for (m in Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).take(3)) {
                 val src = m.groupValues[1].replace("&amp;", "&").let { if (it.startsWith("//")) "https:$it" else it }
                 if (!src.startsWith("http") || src == embed) continue
@@ -1273,7 +1283,12 @@ class NguonTVProvider : MainAPI() {
                 if (firstEmbed == null) firstEmbed = embed
                 if (!embed.contains("grab.nguontv.life")) other = other ?: embed
                 val st = resolveEmbed(embed, playerPage, log)
-                if (st != null) return Res(flatten(st, embed, log), embed, null)
+                if (st != null) {
+                    log("  [t=${el()}ms] bắt đầu flatten")
+                    val fl = flatten(st, embed, log)
+                    log("  [t=${el()}ms] flatten xong")
+                    return Res(fl, embed, null)
+                }
             }
             // Tự chuyển server như trình duyệt: gửi lại với indexL/indexSL/loadTime+1 mà phản hồi trả về
             if (failovers < 4 && rl >= 0) {
@@ -1300,10 +1315,12 @@ class NguonTVProvider : MainAPI() {
         val basePage = absolute(parts.first()) ?: return false
         val playerPage = absolute(parts.getOrNull(1)) ?: toPlayerUrl(basePage)
         subs.clear()
+        embedCache.clear()
         subHints.clear()
         val t0 = System.currentTimeMillis()
+        tStart = t0
         val lines: MutableList<String> = java.util.Collections.synchronizedList(
-            mutableListOf("NguonTV v29 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+            mutableListOf("NguonTV v30 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
