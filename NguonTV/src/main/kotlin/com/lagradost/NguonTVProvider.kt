@@ -680,7 +680,7 @@ class NguonTVProvider : MainAPI() {
         url: String, embed: String, via: String, hashes: List<String> = emptyList(),
         ref: String = embed, log: (String) -> Unit = {}
     ): Stream? {
-        val r = app.get(url, referer = ref.ifBlank { null }, headers = segHeaders(ref))
+        val r = app.get(url, referer = ref.ifBlank { null }, headers = segHeaders(ref), timeout = 30L)
         val body = r.text
         log("  GET ${url.take(70)} ref=${ref.take(30)} code=${r.code} đầu=${body.trimStart().take(60).replace(Regex("\\s+"), " ")}")
         if (r.code != 200) return null
@@ -781,10 +781,20 @@ class NguonTVProvider : MainAPI() {
             val token = Regex(""""token"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
             val streamUrl = Regex(""""streamUrl"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
             log("  token=${if (token != null) "có(${token.length})" else "không"} streamUrl=${streamUrl ?: "không"}")
+            var failed = 0
             for (ref in listOf(embed, "$mainUrl/", "${originOf(embed)}/", "")) {
-                direct(url, embed, "base64", emptyList(), ref, log)?.let {
-                    return Stream(it.url, it.text, it.via, it.ref, it.hdr, token, streamUrl)
-                }
+                val st = runCatching { direct(url, embed, "base64", emptyList(), ref, log) }
+                    .onFailure {
+                        failed++
+                        log("  base64 ref=${ref.take(25)} lỗi mạng ${it.javaClass.simpleName}: ${it.message?.take(60)}")
+                    }.getOrNull()
+                if (st != null) return Stream(st.url, st.text, st.via, st.ref, st.hdr, token, streamUrl)
+                if (failed >= 2) break
+            }
+            // Lỗi mạng (không phải phản hồi sai): trả link chưa kiểm tra để trình phát tự thử tải
+            if (failed >= 2) {
+                log("  base64: lỗi mạng ${failed} lần liên tiếp, trả link chưa kiểm tra")
+                return Stream(url, null, "base64-unverified", embed, null, token, streamUrl)
             }
         }
         if (found == 0) log("  base64: không có chuỗi nào giải ra link .m3u8")
@@ -1271,7 +1281,7 @@ class NguonTVProvider : MainAPI() {
         subs.clear()
         subHints.clear()
         val lines: MutableList<String> = java.util.Collections.synchronizedList(
-            mutableListOf("NguonTV v26 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+            mutableListOf("NguonTV v27 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
