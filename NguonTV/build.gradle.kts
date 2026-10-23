@@ -1,4 +1,4 @@
-version = 27
+version = 28
 
 cloudstream {
     description = "NguonTV movie and series provider. Phụ đề Việt/Anh, tự động đổi chất lượng theo mạng. VPN may be needed for some titles."
