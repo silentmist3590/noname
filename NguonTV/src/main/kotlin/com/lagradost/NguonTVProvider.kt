@@ -11,10 +11,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -543,24 +539,16 @@ class NguonTVProvider : MainAPI() {
         return null
     }
 
-    // Dự phòng: mở trang embed trong WebView và bắt các request .srt/.vtt/.ass do JW Player tải.
-    // Mỗi lượt chỉ bắt được 1 URL, nên các lượt sau loại trừ URL đã bắt (tối đa 3 phụ đề).
+    // Dự phòng: mở trang embed trong WebView, để JW Player tự chạy và gom mọi request .srt/.vtt/.ass.
+    // JW Player tải phụ đề lúc khởi tạo, trước khi tải m3u8, nên dừng WebView khi gặp m3u8.
     private suspend fun viaWebViewSubs(embed: String, page: String, log: (String) -> Unit) {
-        val ext = """\.(?:srt|vtt|ass|ssa)(?:[?#]|$)"""
-        val got = mutableListOf<String>()
-        for (i in 0 until 3) {
-            val skip = if (got.isEmpty()) "" else "(?!" + got.joinToString("|") { Regex.escape(it) } + ")"
-            val re = Regex("^$skip.*$ext", RegexOption.IGNORE_CASE)
-            val url = withTimeoutOrNull(if (i == 0) 35_000L else 12_000L) {
-                runCatching { app.get(embed, referer = page, interceptor = WebViewResolver(re)).url }.getOrNull()
-            }
-            if (url == null || !re.containsMatchIn(url)) {
-                log("  webview phụ đề lượt ${i + 1}: không bắt được thêm")
-                break
-            }
-            got.add(url)
-            log("  webview phụ đề: $url")
-            if (subs.none { it.url == url }) subs.add(Sub(subLang("", url) ?: "Phụ đề", "", url, embed))
+        val subRe = Regex("""\.(?:srt|vtt|ass|ssa)(?:[?#]|$)""", RegexOption.IGNORE_CASE)
+        val (hit, extra) = WebViewResolver(Regex("""\.m3u8"""), additionalUrls = listOf(subRe))
+            .resolveUsingWebView(url = embed, referer = page, headers = emptyMap())
+        log("  webview phụ đề: m3u8=${if (hit != null) "có" else "không"} request phụ đề=${extra.size}")
+        for (u in extra.map { it.url.toString() }.filter { subRe.containsMatchIn(it) }.distinct().take(4)) {
+            log("  webview phụ đề: $u")
+            if (subs.none { it.url == u }) subs.add(Sub(subLang("", u) ?: "Phụ đề", "", u, embed))
         }
     }
 
@@ -1066,11 +1054,9 @@ class NguonTVProvider : MainAPI() {
         val keyUris = keyRe.findAll(text0).map { it.groupValues[1] }.toList().distinct()
         if (keyUris.isEmpty()) return text0
         val need = keyUris.take(300).filter { it !in cache }
-        coroutineScope {
-            for (chunk in need.chunked(8)) {
-                val res = chunk.map { u -> async { u to fetchKey(u, hdr, token, streamUrl, log) } }.awaitAll()
-                for ((u, kb) in res) if (kb != null) cache[u] = LocalPlaylist.bytes(kb)
-            }
+        for (chunk in need.chunked(8)) {
+            val res = chunk.amap { u -> u to fetchKey(u, hdr, token, streamUrl, log) }
+            for ((u, kb) in res) if (kb != null) cache[u] = LocalPlaylist.bytes(kb)
         }
         var text = text0
         var ok = 0
@@ -1285,7 +1271,7 @@ class NguonTVProvider : MainAPI() {
         subs.clear()
         subHints.clear()
         val lines: MutableList<String> = java.util.Collections.synchronizedList(
-            mutableListOf("NguonTV v25 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+            mutableListOf("NguonTV v26 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
