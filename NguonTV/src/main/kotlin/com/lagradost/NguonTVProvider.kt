@@ -1032,10 +1032,13 @@ class NguonTVProvider : MainAPI() {
             val res = mutableListOf<String>()
             val ref = h["Referer"]
             val sr = runCatching { app.get(seg, referer = ref, headers = h + ("Range" to "bytes=0-15"), cookies = cookies) }.getOrNull()
-            val segOk = sr != null && (sr.code == 200 || sr.code == 206) &&
-                (sr.headers["Content-Type"] ?: sr.headers["content-type"] ?: "").lowercase().let { !it.contains("html") && !it.contains("json") }
+            val hbBytes = if (sr != null) headBytes(sr.okhttpResponse, 16) else ByteArray(0)
+            // Máy chủ grab.php gửi segment MPEG-TS (byte đầu 0x47) nhưng gắn Content-Type text/html: vẫn là segment hợp lệ
+            val isTs = hbBytes.isNotEmpty() && hbBytes[0] == 0x47.toByte()
+            val segOk = sr != null && (sr.code == 200 || sr.code == 206) && (isTs ||
+                (sr.headers["Content-Type"] ?: sr.headers["content-type"] ?: "").lowercase().let { !it.contains("html") && !it.contains("json") })
             if (sr == null) res.add("seg=LỖI") else {
-                val hb = headBytes(sr.okhttpResponse, 16).joinToString("") { "%02x".format(it) }
+                val hb = hbBytes.joinToString("") { "%02x".format(it) }
                 res.add("seg=${sr.code}/${sr.headers["Content-Type"] ?: "?"}/len=${sr.headers["Content-Length"] ?: "?"}/head=${hb.take(8)}")
             }
             var keyOk = key == null
@@ -1300,7 +1303,7 @@ class NguonTVProvider : MainAPI() {
         subHints.clear()
         val t0 = System.currentTimeMillis()
         val lines: MutableList<String> = java.util.Collections.synchronizedList(
-            mutableListOf("NguonTV v28 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+            mutableListOf("NguonTV v29 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
