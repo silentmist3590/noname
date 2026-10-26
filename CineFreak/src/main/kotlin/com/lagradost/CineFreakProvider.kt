@@ -15,14 +15,17 @@ class CineFreakProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.Cartoon)
+    // CloudStream mainPageOf expects URL first, category name second.
+    // If the order is reversed, request.data becomes text such as "Hindi Movies",
+    // which is not a valid URL and triggers "Expected URL scheme http or https".
     override val mainPage = mainPageOf(
-        "Latest Releases" to "$mainUrl/",
-        "Hindi Movies" to "$mainUrl/hindi-movies/",
-        "Hindi Dubbed" to "$mainUrl/hindi-dubbed-movies/",
-        "English Movies" to "$mainUrl/english-movies/",
-        "Dual Audio" to "$mainUrl/dual-audio/",
-        "K-Drama" to "$mainUrl/k-drama/",
-        "Web Series" to "$mainUrl/web-series/"
+        "$mainUrl/" to "Latest Releases",
+        "$mainUrl/hindi-movies/" to "Hindi Movies",
+        "$mainUrl/hindi-dubbed-movies/" to "Hindi Dubbed",
+        "$mainUrl/english-movies/" to "English Movies",
+        "$mainUrl/dual-audio/" to "Dual Audio",
+        "$mainUrl/k-drama/" to "K-Drama",
+        "$mainUrl/web-series/" to "Web Series"
     )
 
     /** Convert a site-provided URL to an absolute HTTP(S) URL, rejecting empty/invalid values. */
@@ -43,8 +46,15 @@ class CineFreakProvider : MainAPI() {
     }
 
     private fun safePageUrl(raw: String?, page: Int): String? {
-        val base = absolute(raw)
-        if (base.isBlank()) return null
+        // Do not resolve arbitrary text like "Hindi Movies" into a URL. MainPageRequest.data
+        // must already be an absolute HTTP(S) URL supplied by mainPageOf(url to name).
+        val base = raw?.trim().orEmpty()
+        if (!base.matches(Regex("(?i)^https?://[^\\s]+$"))) return null
+        val valid = runCatching {
+            val uri = URI(base)
+            (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) && !uri.host.isNullOrBlank()
+        }.getOrDefault(false)
+        if (!valid) return null
         val pageUrl = if (page <= 1) base else base.trimEnd('/') + "/page/$page/"
         return pageUrl.takeIf { it.matches(Regex("(?i)^https?://[^\\s]+$")) }
     }
