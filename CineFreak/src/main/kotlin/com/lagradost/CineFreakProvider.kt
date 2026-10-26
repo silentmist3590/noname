@@ -3,9 +3,10 @@ package com.cinefreak
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import org.jsoup.Jsoup
-import kotlinx.serialization.Serializable
-import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class CineFreakProvider : MainAPI() {
@@ -40,6 +41,10 @@ class CineFreakProvider : MainAPI() {
         Regex("web.?series|series|season|episode|k-drama|tv show|anime", RegexOption.IGNORE_CASE)
             .containsMatchIn("$text $url")
 
+    private val jsonMapper = jacksonObjectMapper()
+    private inline fun <reified T> parseJsonOrNull(text: String): T? =
+        runCatching { jsonMapper.readValue<T>(text) }.getOrNull()
+
     private val indexApi = "https://search.yagaverse.net/api/search"
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -63,13 +68,13 @@ class CineFreakProvider : MainAPI() {
     private suspend fun searchSiteApi(query: String, page: Int = 1): List<SearchResponse> {
         val headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json", "Referer" to "$mainUrl/fast-search/")
         val key = try {
-            app.post("$mainUrl/search-api.php", headers = headers + mapOf("Origin" to mainUrl),
-                data = mapOf("st" to "1")).parsedSafe<SearchKeyJson>()?.k.orEmpty()
+            parseJsonOrNull<SearchKeyJson>(app.post("$mainUrl/search-api.php", headers = headers + mapOf("Origin" to mainUrl),
+                data = mapOf("st" to "1")).text)?.k.orEmpty()
         } catch (_: Exception) { "" }
         val result = app.get(
             "$mainUrl/search-api.php?q=${URLEncoder.encode(query, "UTF-8")}&pg=$page",
             headers = headers + mapOf("X-CF-ST" to key)
-        ).parsedSafe<SearchJson>()
+        ).text.let { parseJsonOrNull<SearchJson>(it) }
         return result?.results.orEmpty().mapNotNull { item ->
             val slug = item.l?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val title = cleanTitle(item.t.orEmpty()).ifBlank { slug.substringAfterLast('/').replace('-', ' ') }
@@ -84,7 +89,7 @@ class CineFreakProvider : MainAPI() {
         val q = URLEncoder.encode(query, "UTF-8")
         val json = app.get("$indexApi?q=$q&pg=$page", headers = mapOf(
             "User-Agent" to userAgent, "Accept" to "application/json", "Origin" to mainUrl, "Referer" to "$mainUrl/"
-        )).parsedSafe<IndexJson>()
+        )).text.let { parseJsonOrNull<IndexJson>(it) }
         return indexItems(json)
     }
 
@@ -218,7 +223,22 @@ class CineFreakProvider : MainAPI() {
         for ((index, link) in rawLinks.withIndex()) {
             try {
                 if (Regex("\\.(m3u8|mp4|webm)(?:[?#].*)?$", RegexOption.IGNORE_CASE).containsMatchIn(link)) {
-                    callback(ExtractorLink(name, "CineFreak ${index + 1}", link, mainUrl, link.contains(".m3u8", true), headers = mapOf("Referer" to "$mainUrl/")))
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = "CineFreak ${index + 1}",
+                            url = link,
+                            type = if (link.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "$mainUrl/"
+                            this.quality = Regex("(?i)(2160|4k)").find(link)?.let { Qualities.P2160.value }
+                                ?: Regex("(?i)1080").find(link)?.let { Qualities.P1080.value }
+                                ?: Regex("(?i)720").find(link)?.let { Qualities.P720.value }
+                                ?: Regex("(?i)480").find(link)?.let { Qualities.P480.value }
+                                ?: Qualities.Unknown.value
+                            this.headers = mapOf("Referer" to "$mainUrl/")
+                        }
+                    )
                     found = true
                 } else {
                     // Delegate supported third-party hosts to CloudStream's normal extractor registry.
@@ -230,16 +250,10 @@ class CineFreakProvider : MainAPI() {
         return found
     }
 
-    @Serializable
     private data class SearchKeyJson(val k: String? = null)
-    @Serializable
     private data class SearchJson(val results: List<SearchItem> = emptyList(), val renew: Boolean? = null)
-    @Serializable
     private data class SearchItem(val t: String? = null, val l: String? = null, val i: String? = null, val c: String? = null)
-    @Serializable
     private data class IndexJson(val hits: List<IndexHit> = emptyList(), val found: Int? = null)
-    @Serializable
     private data class IndexHit(val document: IndexDocument? = null)
-    @Serializable
     private data class IndexDocument(val title: String? = null, val slug: String? = null, val thumb: String? = null, val cats: List<String> = emptyList())
 }
