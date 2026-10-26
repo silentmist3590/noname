@@ -31,11 +31,15 @@ private const val COPY_LOG_WHEN_NO_SUB = true
 /** true = chép log vào clipboard sau MỖI lần phát (tạm thời, để chẩn đoán việc tải chậm / phát lệch vị trí). Đặt false khi xong. */
 private const val COPY_LOG_ALWAYS = true
 
+/** true = nếu không thấy phụ đề trong trang embed thì mở WebView để bắt (có thể chờ tới 60 giây). Phim không có phụ đề sẽ bị chậm, nên tắt mặc định. */
+private const val SUB_WEBVIEW_FALLBACK = false
+
 /** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist / khóa / phụ đề đã xử lý cho trình phát. */
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val bin = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
     private val types = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val lazyKeys = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Map<String, String>>>()
     private var server: java.net.ServerSocket? = null
 
     private fun ensure(): java.net.ServerSocket =
@@ -52,6 +56,28 @@ private object LocalPlaylist {
         types[id] = ctype
         return "http://127.0.0.1:${s.localPort}/$id"
     }
+
+    /** Khóa AES: chỉ tải từ máy chủ thật khi trình phát yêu cầu, nên không phải chờ tải hết hàng chục khóa trước khi phát. */
+    @Synchronized
+    fun lazyKey(url: String, headers: Map<String, String>): String {
+        val s = ensure()
+        val id = "lk_${System.nanoTime()}.bin"
+        lazyKeys[id] = url to headers
+        types[id] = "application/octet-stream"
+        return "http://127.0.0.1:${s.localPort}/$id"
+    }
+
+    private fun fetchBlocking(url: String, headers: Map<String, String>): ByteArray? = runCatching {
+        val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 15000
+        c.readTimeout = 20000
+        headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
+        try {
+            if (c.responseCode == 200) c.inputStream.use { it.readBytes() } else null
+        } finally {
+            c.disconnect()
+        }
+    }.getOrNull()?.takeIf { it.size == 16 }
 
     @Synchronized
     fun url(text: String): String {
@@ -80,7 +106,11 @@ private object LocalPlaylist {
                     if (h.isEmpty()) break
                 }
                 val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
-                val binBody = path?.let { bin[it] }
+                var binBody = path?.let { bin[it] }
+                if (binBody == null && path != null) {
+                    val lz = lazyKeys[path]
+                    if (lz != null) binBody = fetchBlocking(lz.first, lz.second)?.also { bin[path] = it }
+                }
                 val body = binBody ?: path?.let { store[it] }?.toByteArray()
                 val ctype = if (binBody != null) (types[path] ?: "application/octet-stream") else "application/vnd.apple.mpegurl"
                 val out = c.getOutputStream()
@@ -1090,10 +1120,9 @@ class NguonTVProvider : MainAPI() {
         val keyRe = Regex("""#EXT-X-KEY:[^\n]*?URI="([^"]+)"""")
         val keyUris = keyRe.findAll(text0).map { it.groupValues[1] }.toList().distinct()
         if (keyUris.isEmpty()) return text0
-        val need = keyUris.take(300).filter { it !in cache }
-        for (chunk in need.chunked(8)) {
-            val res = chunk.amap { u -> u to fetchKey(u, hdr, token, streamUrl, log) }
-            for ((u, kb) in res) if (kb != null) cache[u] = LocalPlaylist.bytes(kb)
+        val keyHdr = if (token != null) hdr + ("token" to token) else hdr
+        for (u in keyUris) {
+            if (u !in cache) cache[u] = LocalPlaylist.lazyKey(rewriteKeyUrl(u, streamUrl), keyHdr)
         }
         var text = text0
         var ok = 0
@@ -1102,7 +1131,7 @@ class NguonTVProvider : MainAPI() {
             text = text.replace("URI=\"$u\"", "URI=\"$loc\"")
             ok++
         }
-        log("  khóa AES: $ok/${keyUris.size} tải được và phát qua máy chủ cục bộ")
+        log("  khóa AES: $ok/${keyUris.size} phát qua máy chủ cục bộ (tải khi trình phát cần)")
         return text
     }
 
@@ -1320,7 +1349,7 @@ class NguonTVProvider : MainAPI() {
         val t0 = System.currentTimeMillis()
         tStart = t0
         val lines: MutableList<String> = java.util.Collections.synchronizedList(
-            mutableListOf("NguonTV v30 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
+            mutableListOf("NguonTV v31 ${java.util.Date()}", "film=$basePage", "player=$playerPage")
         )
         val log: (String) -> Unit = { Log.d(TAG, it); lines.add(it) }
         var ok = false
@@ -1343,8 +1372,10 @@ class NguonTVProvider : MainAPI() {
         // Không thấy phụ đề trong HTML/JSON: để JW Player tự chạy trong WebView rồi bắt request .srt/.vtt
         val eu = embedUrl
         if (subs.isEmpty() && eu != null) {
-            runCatching { viaWebViewSubs(eu, playerPage, log) }
-                .onFailure { log("LỖI webview phụ đề ${it.javaClass.simpleName}: ${it.message?.take(80)}") }
+            if (SUB_WEBVIEW_FALLBACK) {
+                runCatching { viaWebViewSubs(eu, playerPage, log) }
+                    .onFailure { log("LỖI webview phụ đề ${it.javaClass.simpleName}: ${it.message?.take(80)}") }
+            }
             if (subs.isEmpty()) {
                 // Vẫn không có: ghi lại đoạn script dựng JW Player để biết `tracks` được giấu thế nào
                 runCatching {
