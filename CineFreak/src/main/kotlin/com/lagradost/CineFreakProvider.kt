@@ -6,6 +6,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import org.jsoup.Jsoup
 import java.net.URLEncoder
+import java.net.URI
 
 class CineFreakProvider : MainAPI() {
     override var mainUrl = "https://cinefreak.ch"
@@ -24,11 +25,28 @@ class CineFreakProvider : MainAPI() {
         "Web Series" to "$mainUrl/web-series/"
     )
 
-    private fun absolute(url: String): String = when {
-        url.startsWith("//") -> "https:$url"
-        url.startsWith("http://") || url.startsWith("https://") -> url
-        url.startsWith("/") -> mainUrl + url
-        else -> "$mainUrl/$url"
+    /** Convert a site-provided URL to an absolute HTTP(S) URL, rejecting empty/invalid values. */
+    private fun absolute(url: String?): String {
+        val raw = url?.trim().orEmpty()
+        if (raw.isBlank()) return ""
+        val candidate = when {
+            raw.startsWith("//") -> "https:$raw"
+            raw.matches(Regex("(?i)^https?://.*")) -> raw
+            else -> runCatching { URI(mainUrl + "/").resolve(URI(raw)).toString() }.getOrDefault("")
+        }
+        return candidate.takeIf {
+            runCatching {
+                val uri = URI(it)
+                (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) && !uri.host.isNullOrBlank()
+            }.getOrDefault(false)
+        }.orEmpty()
+    }
+
+    private fun safePageUrl(raw: String?, page: Int): String? {
+        val base = absolute(raw)
+        if (base.isBlank()) return null
+        val pageUrl = if (page <= 1) base else base.trimEnd('/') + "/page/$page/"
+        return pageUrl.takeIf { it.matches(Regex("(?i)^https?://[^\\s]+$")) }
     }
 
     private fun cleanTitle(value: String): String = value
@@ -57,7 +75,7 @@ class CineFreakProvider : MainAPI() {
         val slug = item.slug?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
         val title = cleanTitle(item.title.orEmpty()).ifBlank { slug.substringAfterLast('/').replace('-', ' ') }
         val url = indexUrl(slug)
-        val poster = item.thumb?.let(::absolute)
+        val poster = item.thumb?.let(::absolute)?.takeIf { it.isNotBlank() }
         val cats = item.cats.orEmpty().joinToString(" ")
         if (isSeries("$title $cats", slug)) newTvSeriesSearchResponse(title, url, TvType.TvSeries) { posterUrl = poster }
         else newMovieSearchResponse(title, url, TvType.Movie) { posterUrl = poster }
@@ -77,7 +95,7 @@ class CineFreakProvider : MainAPI() {
             val slug = item.l?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val title = cleanTitle(item.t.orEmpty()).ifBlank { slug.substringAfterLast('/').replace('-', ' ') }
             val url = indexUrl(slug)
-            val poster = item.i?.takeIf { it.isNotBlank() }?.let(::absolute)
+            val poster = item.i?.takeIf { it.isNotBlank() }?.let(::absolute)?.takeIf { it.isNotBlank() }
             if (isSeries("$title ${item.c.orEmpty()}", slug)) newTvSeriesSearchResponse(title, url, TvType.TvSeries) { posterUrl = poster }
             else newMovieSearchResponse(title, url, TvType.Movie) { posterUrl = poster }
         }.distinctBy { it.url }
@@ -98,6 +116,7 @@ class CineFreakProvider : MainAPI() {
         for (card in candidates) {
             val a = card.selectFirst("a[href]") ?: continue
             val href = absolute(a.attr("href"))
+            if (href.isBlank() || !href.startsWith("http", true)) continue
             if (!href.startsWith(mainUrl) || href == mainUrl || href.contains("/category/") || href.contains("/tag/")) continue
             val titleNode = card.selectFirst("h1,h2,h3,h4,.title,.entry-title,[title]")
             val title = cleanTitle(titleNode?.text()?.takeIf { it.isNotBlank() } ?: a.attr("title").ifBlank { a.text() })
@@ -113,6 +132,7 @@ class CineFreakProvider : MainAPI() {
         if (out.isEmpty()) {
             for (a in doc.select("a[href]:has(img)")) {
                 val href = absolute(a.attr("href"))
+                if (href.isBlank() || !href.startsWith("http", true)) continue
                 if (!href.startsWith(mainUrl) || href == mainUrl || href.contains("/category/") || href.contains("/tag/")) continue
                 val title = cleanTitle(a.attr("title").ifBlank { a.selectFirst("img")?.attr("alt").orEmpty() }.ifBlank { a.text() })
                 if (title.length < 2) continue
@@ -126,7 +146,8 @@ class CineFreakProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = request.data.let { base -> if (page <= 1) base else base.trimEnd('/') + "/page/$page/" }
+        val url = safePageUrl(request.data, page)
+            ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         val response = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
         var items = cards(response.text)
         if (items.isEmpty()) {
