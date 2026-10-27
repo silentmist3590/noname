@@ -313,10 +313,30 @@ class CineFreakProvider : MainAPI() {
             Log.e("CineFreak", "Failed to open cloud page: $fileUrl", e)
             return false
         }
-        Log.d("CineFreak", "Cloud page opened: url=$fileUrl, status=${response.code}, htmlLength=${response.text.length}")
+        Log.d(
+    "CineFreak",
+    "Cloud page opened: url=$fileUrl, status=${response.code}, htmlLength=${response.text.length}"
+        )
         val html = response.text
-        // A Turnstile interstitial has no playable server list. Do not mistake challenge links for media.
-        if (html.contains("cf-turnstile", true) && !html.contains("server-btn", true) && !html.contains("fsl-btn", true)) return false
+        
+        // Không phân tích trang lỗi hoặc trang bị từ chối truy cập như trang phát phim.
+        if (response.code !in 200..299) {
+            Log.w(
+                "CineFreak",
+                "Cloud page rejected: status=${response.code}, " +
+                    "bodyPreview=${html.take(250).replace('\n', ' ')}"
+            )
+            return false
+        }
+        // Trang thử thách không chứa liên kết phát phim có thể sử dụng.
+        if (
+            html.contains("cf-turnstile", true) ||
+            html.contains("Just a moment...", true) ||
+            html.contains("Enable JavaScript and cookies", true)
+        ) {
+            Log.w("CineFreak", "Cloud page returned a browser challenge: $fileUrl")
+            return false
+        }
         val doc = Jsoup.parse(html, fileUrl)
         val serverLinks = doc.select("a[href]").mapNotNull { a ->
             val href = a.absUrl("href").ifBlank { absoluteFrom(fileUrl, a.attr("href")) }
