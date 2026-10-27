@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.utils.*
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import org.jsoup.Jsoup
+import android.util.Log
 import java.net.URLEncoder
 import java.net.URI
 
@@ -239,20 +240,35 @@ class CineFreakProvider : MainAPI() {
         }
     }
 
-    /** Return the CineCloud/NeoDrive file-page URLs used by CineFreak's current player. */
+    /** Find CineCloud/NeoDrive file pages, player buttons, and direct media URLs. */
     private fun extractCloudLinks(html: String, pageUrl: String): List<String> {
         val doc = Jsoup.parse(html, pageUrl)
-        // The site includes hidden decoy links; don't use those as playback sources.
+        // Ignore hidden decoys, but retain visible links and links explicitly marked as player buttons.
         doc.select("div[aria-hidden=true]").remove()
-        return doc.select("a[href]").mapNotNull { a ->
-            val href = a.absUrl("href").ifBlank { absolute(a.attr("href")) }
-            val label = (a.text() + " " + a.attr("aria-label") + " " + a.className()).lowercase()
-            val cloudHost = runCatching { java.net.URI(href).host.orEmpty() }.getOrDefault("")
-            val cloudPath = runCatching { java.net.URI(href).path.orEmpty() }.getOrDefault("")
-            if ((cloudHost.contains("cinecloud") || cloudHost.contains("neodrive")) &&
-                Regex("/(f|x|w|d|gp)/[A-Za-z0-9_-]+", RegexOption.IGNORE_CASE).containsMatchIn(cloudPath) &&
-                !Regex("telegram|facebook|whatsapp|tutorial|privacy|terms", RegexOption.IGNORE_CASE).containsMatchIn("$href $label")) href else null
-        }.distinct()
+        val results = LinkedHashSet<String>()
+
+        for (a in doc.select("a[href]")) {
+            val href = a.absUrl("href").ifBlank { absoluteFrom(pageUrl, a.attr("href")) }.trim()
+            if (!href.startsWith("https://", true) && !href.startsWith("http://", true)) continue
+
+            val label = (a.text() + " " + a.attr("aria-label") + " " + a.attr("title") + " " + a.className() + " " + a.id()).lowercase()
+            if (Regex("telegram|facebook|whatsapp|tutorial|privacy|terms", RegexOption.IGNORE_CASE)
+                    .containsMatchIn("$href $label")) continue
+
+            val host = runCatching { URI(href).host.orEmpty().lowercase() }.getOrDefault("")
+            val path = runCatching { URI(href).path.orEmpty() }.getOrDefault("")
+            val knownCloudHost = host.contains("cinecloud") || host.contains("neodrive")
+            val cloudRoute = Regex("/(f|x|w|d|gp|fc|fastdl)/[A-Za-z0-9_-]+", RegexOption.IGNORE_CASE)
+                .containsMatchIn(path)
+            val playerButton = Regex(
+                "fast.?cloud|instant|resumable|stream.?online|watch.?online|fsl-btn|server-btn|download.?now|instant-download",
+                RegexOption.IGNORE_CASE
+            ).containsMatchIn(label)
+            val directMedia = Regex("(?i)\\.(m3u8|mp4|mkv|webm|mpd)(?:[?#].*)?$").containsMatchIn(href)
+
+            if (directMedia || (knownCloudHost && cloudRoute) || playerButton) results.add(href)
+        }
+        return results.toList()
     }
 
     private fun absoluteFrom(base: String, value: String): String = when {
@@ -290,10 +306,14 @@ class CineFreakProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val fileUrl = inputUrl.replace(Regex("/(x|w|d|gp)/", RegexOption.IGNORE_CASE), "/f/").substringBefore('#').substringBefore('?')
+        val fileUrl = inputUrl.substringBefore('#')
         val response = try {
             app.get(fileUrl, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to userAgent))
-        } catch (_: Exception) { return false }
+        } catch (e: Exception) {
+            Log.e("CineFreak", "Failed to open cloud page: $fileUrl", e)
+            return false
+        }
+        Log.d("CineFreak", "Cloud page opened: url=$fileUrl, status=${response.code}, htmlLength=${response.text.length}")
         val html = response.text
         // A Turnstile interstitial has no playable server list. Do not mistake challenge links for media.
         if (html.contains("cf-turnstile", true) && !html.contains("server-btn", true) && !html.contains("fsl-btn", true)) return false
@@ -306,10 +326,13 @@ class CineFreakProvider : MainAPI() {
             else if (low.contains("telegram") || low.contains("facebook") || low.contains("tutorial") || low.contains("privacy")) null
             else if (low.contains("fast cloud") || low.contains("instant") || low.contains("resumable") || low.contains("stream online") ||
                 low.contains("watch online") || a.className().contains("fsl-btn", true) ||
-                Regex("/(x|w|d|gp|f)/[A-Za-z0-9_-]+", RegexOption.IGNORE_CASE).containsMatchIn(href)) href to label
+                low.contains("download now") || a.className().contains("download-now", true) ||
+                a.className().contains("instant-download", true) ||
+                Regex("/(x|w|d|gp|f|fc|fastdl)/[A-Za-z0-9_-]+", RegexOption.IGNORE_CASE).containsMatchIn(href)) href to label
             else if (Regex("(?i)\\.(m3u8|mp4|mkv|webm)(?:[?#].*)?$").containsMatchIn(href)) href to label
             else null
         }.distinctBy { it.first }
+        Log.d("CineFreak", "Cloud page server buttons=${serverLinks.size}")
 
         var found = false
         for ((target, label) in serverLinks.take(12)) {
@@ -344,7 +367,9 @@ class CineFreakProvider : MainAPI() {
                         callback(extracted)
                     }
                 }
-            } catch (_: Exception) { /* Continue to other server buttons. */ }
+            } catch (e: Exception) {
+                Log.e("CineFreak", "Failed to resolve cloud server: $target", e)
+            }
         }
         return found
     }
@@ -357,7 +382,8 @@ class CineFreakProvider : MainAPI() {
     ): Boolean {
         val parts = data.split("|||", limit = 3)
         var pageUrl = parts.getOrNull(2).orEmpty().takeIf { it.startsWith("http", true) }
-        val rawLinks = parts.getOrNull(1).orEmpty().split('|').filter { it.startsWith("http://") || it.startsWith("https://") }
+        val rawLinks = parts.getOrNull(1).orEmpty().split('|').filter { it.startsWith("http://", true) || it.startsWith("https://", true) }
+        Log.d("CineFreak", "loadLinks: dataLength=${data.length}, parts=${parts.size}, pageUrl=$pageUrl, rawLinks=${rawLinks.size}")
         val links = LinkedHashSet<String>()
         links.addAll(rawLinks)
         // Re-read the page: current CineFreak pages may add player buttons through markup that the
@@ -375,8 +401,11 @@ class CineFreakProvider : MainAPI() {
                 }
                 Regex("(?i)[\"'](?:file|src|source|url|hls|videoUrl)[\"']\\s*[:=]\\s*[\"']([^\"']+\\.(?:m3u8|mp4|mkv|webm)(?:\\?[^\"']*)?)[\"']")
                     .findAll(page.text.replace("\\\\/", "/")).forEach { links.add(absoluteFrom(pageUrl, it.groupValues[1])) }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.e("CineFreak", "Failed to re-read episode page: $pageUrl", e)
+            }
         }
+        Log.d("CineFreak", "Collected ${links.size} candidate links: ${links.joinToString { candidate -> runCatching { val u = URI(candidate); "${u.host}${u.path}" }.getOrDefault("invalid-url") }}")
 
         var found = false
         val seen = mutableSetOf<String>()
@@ -395,7 +424,9 @@ class CineFreakProvider : MainAPI() {
                         callback(extracted)
                     }
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.e("CineFreak", "Failed to process candidate link: $link", e)
+            }
         }
 
         // SkyStream's second route uses PLAY_API with an episode source code. Try the non-challenge
@@ -428,8 +459,11 @@ class CineFreakProvider : MainAPI() {
                         }
                     }
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.e("CineFreak", "PLAY_API fallback failed for page: $pageUrl", e)
+            }
         }
+        Log.d("CineFreak", "loadLinks result: found=$found, candidates=${links.size}")
         return found
     }
 
