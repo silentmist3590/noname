@@ -443,6 +443,25 @@ class Movies321Provider : MainAPI() {
         java.net.URLDecoder.decode(raw, "UTF-8").takeIf { it.startsWith("http") }
     }.getOrNull()
 
+    /**
+     * Link proxy của site có thể mang header giả IP (X-Forwarded-For...) trong tham số headers=<json>.
+     * Cloudflare trả 403 cho các header đó, nên tạo bản link đã bỏ chúng đi.
+     */
+    private fun cleanProxyUrl(url: String): String? = runCatching {
+        val m = Regex("([?&]headers=)([^&]+)").find(url) ?: return@runCatching null
+        val j = JSONObject(java.net.URLDecoder.decode(m.groupValues[2], "UTF-8"))
+        val bad = Regex(
+            "^(x-forwarded-.*|x-real-ip|x-client-ip|x-originating-ip|cf-connecting-ip|true-client-ip|cf-ipcountry|x-country)$",
+            RegexOption.IGNORE_CASE
+        )
+        var changed = false
+        for (k in j.keys().asSequence().toList()) {
+            if (bad.matches(k)) { j.remove(k); changed = true }
+        }
+        if (!changed) return@runCatching null
+        url.replaceRange(m.range, m.groupValues[1] + URLEncoder.encode(j.toString(), "UTF-8"))
+    }.getOrNull()
+
     private fun isProxy(url: String) = url.contains(".workers.dev/")
 
     private fun probeOne(
@@ -466,6 +485,9 @@ class Movies321Provider : MainAPI() {
 
         // 1. Đúng cách site làm: Referer/Origin của site
         attempt("site", url, setA, false)?.let { return it }
+
+        // 1b. Cùng link proxy nhưng bỏ header giả IP khỏi tham số headers=
+        cleanProxyUrl(url)?.let { cu -> attempt("sạch", cu, setA, true)?.let { return it } }
 
         // 2. Bỏ qua proxy: gọi thẳng link gốc với Referer/Origin mà link proxy mang theo
         val emb = embeddedHeaders(url)
@@ -595,8 +617,9 @@ class Movies321Provider : MainAPI() {
             ok.sortWith(order)
             unknown.sortWith(order)
 
+            // Chỉ hiện link chưa kiểm tra được khi không có link nào đã kiểm tra chạy được
             val picked = ok.map { it to false } +
-                unknown.take(maxOf(0, 6 - ok.size)).map { it to true }
+                (if (ok.isEmpty()) unknown.take(4).map { it to true } else emptyList())
 
             val names = HashMap<String, Int>()
             for ((pair, unverified) in picked) {
@@ -619,7 +642,9 @@ class Movies321Provider : MainAPI() {
                         if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = hs["Referer"] ?: ""
-                        this.quality = qualityValue(heightOf(c.label))
+                        // Link đã kiểm tra xếp trên (CloudStream sắp theo quality), link chưa chắc chắn xếp cuối
+                        this.quality = if (unverified) 100
+                        else heightOf(c.label).let { if (it > 0) qualityValue(it) else Qualities.P720.value }
                         this.headers = hs
                     }
                 )
