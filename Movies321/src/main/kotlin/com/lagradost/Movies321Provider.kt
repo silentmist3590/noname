@@ -366,7 +366,14 @@ class Movies321Provider : MainAPI() {
             rb.header("Accept", "*/*")
             if (range != null) rb.header("Range", range)
             client.newCall(rb.build()).execute().use { r ->
-                r.code to runCatching { r.peekBody(limit).string() }.getOrDefault("")
+                val body = runCatching { r.peekBody(limit).string() }.getOrDefault("")
+                if (r.code == 200 || r.code == 206) {
+                    r.code to body
+                } else {
+                    val info = "[server=" + r.header("server") + " cf-ray=" + r.header("cf-ray") +
+                        " ctype=" + r.header("content-type") + " cf-mitigated=" + r.header("cf-mitigated") + "] "
+                    r.code to (info + body.take(160).replace('\n', ' '))
+                }
             }
         } catch (e: UnknownHostException) {
             -1 to "dns"
@@ -389,7 +396,7 @@ class Movies321Provider : MainAPI() {
         if (c1 == -1) return Verdict("dead", false, note = "DNS")
         if (c1 != 200 && c1 != 206) {
             val st = if (c1 == 401 || c1 == 403 || c1 == 429 || c1 == 0) "unknown" else "dead"
-            return Verdict(st, false, note = "playlist HTTP $c1")
+            return Verdict(st, false, note = "playlist HTTP $c1 ${b1.take(220)}")
         }
         val head = b1.replace("\uFEFF", "").trimStart()
         if (!head.startsWith("#EXTM3U")) {
@@ -420,14 +427,38 @@ class Movies321Provider : MainAPI() {
         else Verdict("unknown", true, note = "đoạn video HTTP $c3 ${segUrl.take(80)}")
     }
 
+    /** Referer/Origin mà link proxy mang theo trong tham số headers=<json> (dành cho máy chủ gốc). */
+    private fun embeddedHeaders(url: String): Map<String, String>? = runCatching {
+        val raw = Regex("[?&]headers=([^&]+)").find(url)?.groupValues?.get(1) ?: return@runCatching null
+        val j = JSONObject(java.net.URLDecoder.decode(raw, "UTF-8"))
+        val m = HashMap<String, String>()
+        m["User-Agent"] = ua
+        j.optString("Referer", "").takeIf { it.isNotBlank() }?.let { m["Referer"] = it }
+        j.optString("Origin", "").takeIf { it.isNotBlank() }?.let { m["Origin"] = it }
+        m
+    }.getOrNull()
+
     private fun probeOne(
         client: OkHttpClient, url: String, setA: Map<String, String>, setB: Map<String, String>
     ): Verdict {
-        val a = chain(client, url, setA)
-        if (a.state == "ok") return a
-        val b = chain(client, url, setB)
-        if (b.state == "ok") return b.copy(note = b.note + " (không Referer)")
-        return if (a.state == "dead" && b.state != "dead") b else a
+        val sets = mutableListOf<Pair<String, Map<String, String>>>()
+        sets.add("site" to setA)
+        sets.add("trống" to setB)
+        sets.add("android" to mapOf(
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+            "Referer" to "$mainUrl/", "Origin" to mainUrl, "Accept-Language" to "en-US,en;q=0.9"
+        ))
+        embeddedHeaders(url)?.let { sets.add("nhúng" to it) }
+        var first: Verdict? = null
+        val notes = StringBuilder()
+        for ((tag, hs) in sets) {
+            val v = chain(client, url, hs)
+            if (v.state == "ok") return v.copy(note = v.note + " (bộ header: $tag)")
+            if (first == null) first = v
+            notes.append(" | ").append(tag).append(": ").append(v.note.take(120))
+        }
+        val f = first!!
+        return f.copy(note = if (notes.length > 3) notes.toString().drop(3) else f.note)
     }
 
     /** Kiểm tra song song bằng luồng thường (không cần coroutines). */
@@ -440,7 +471,7 @@ class Movies321Provider : MainAPI() {
         val pool = Executors.newFixedThreadPool(minOf(cands.size, 8))
         return try {
             val fs = cands.map { c -> pool.submit(Callable { probeOne(client, c.url, setA, setB) }) }
-            fs.map { f -> runCatching { f.get(35, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false, note = "quá thời gian")) }
+            fs.map { f -> runCatching { f.get(60, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false, note = "quá thời gian")) }
         } finally {
             pool.shutdownNow()
         }
@@ -520,7 +551,7 @@ class Movies321Provider : MainAPI() {
             cands.forEachIndexed { i, c ->
                 val v = verdicts[i]
                 log.append("  [").append(v.state).append(" ").append(v.note).append("] ").append(c.family).append(" | ")
-                    .append(c.label).append(" | ").append(c.url.take(90)).append('\n')
+                    .append(c.label).append(" | ").append(c.url.take(150)).append('\n')
                 if (v.state == "ok") ok.add(c to v) else if (v.state == "unknown") unknown.add(c to v)
             }
             val order = Comparator<Pair<Cand, Verdict>> { a, b ->
