@@ -81,19 +81,40 @@ class Movies321Provider : MainAPI() {
 
     // ---------------------------------------------------------------- TMDB
 
+    // Nhà mạng ở một số nước chặn api.themoviedb.org nên thử thêm tên miền dự phòng chính thức api.tmdb.org
+    private val tmdbHosts = listOf("https://api.themoviedb.org/3", "https://api.tmdb.org/3")
+    private var tmdbPrefer = 0
+    private val tmdbLog = StringBuilder()
+
     private suspend fun tmdbGet(path: String): JSONObject? {
         val sep = if (path.contains("?")) "&" else "?"
-        val url = "$tmdb$path${sep}language=en-US"
         val headers = mapOf(
             "Authorization" to "Bearer $tmdbToken",
             "Accept" to "application/json"
         )
-        for (attempt in 0 until 3) {
-            val body = runCatching { app.get(url, headers = headers).text }.getOrNull()
-            val obj = body?.let { runCatching { JSONObject(it) }.getOrNull() }
-            if (obj != null && !obj.has("status_code")) return obj
-            if (obj != null && obj.optInt("status_code") == 34) return null // không tồn tại
-            Thread.sleep(350L * (attempt + 1))
+        for (round in 0 until 2) {
+            for (k in tmdbHosts.indices) {
+                val hi = (tmdbPrefer + k) % tmdbHosts.size
+                val url = "${tmdbHosts[hi]}$path${sep}language=en-US"
+                val r = runCatching { app.get(url, headers = headers, timeout = 20L) }
+                val resp = r.getOrNull()
+                if (resp == null) {
+                    tmdbLog.append(tmdbHosts[hi]).append(" -> ")
+                        .append(r.exceptionOrNull()?.javaClass?.simpleName).append(": ")
+                        .append(r.exceptionOrNull()?.message?.take(120)).append('\n')
+                    continue
+                }
+                val body = runCatching { resp.text }.getOrDefault("")
+                val obj = runCatching { JSONObject(body) }.getOrNull()
+                if (obj != null && !obj.has("status_code")) {
+                    tmdbPrefer = hi
+                    return obj
+                }
+                tmdbLog.append(tmdbHosts[hi]).append(" -> HTTP ").append(resp.code)
+                    .append(" ").append(body.take(120).replace('\n', ' ')).append('\n')
+                if (obj != null && obj.optInt("status_code") == 34) return null // không tồn tại
+            }
+            if (round == 0) Thread.sleep(500)
         }
         return null
     }
@@ -147,6 +168,10 @@ class Movies321Provider : MainAPI() {
         val res = tmdbGet("$path?page=$page")
         val forcedTv = path.startsWith("/tv") || path.contains("/tv/")
         val items = parseList(res?.optJSONArray("results"), forcedTv)
+        if (items.isEmpty() && DEBUG) {
+            copyLog("321Movies getMainPage $path page=$page\n$tmdbLog")
+            tmdbLog.setLength(0)
+        }
         val total = res?.optInt("total_pages", 1) ?: 1
         return newHomePageResponse(request.name, items, hasNext = page < total && page < 20)
     }
