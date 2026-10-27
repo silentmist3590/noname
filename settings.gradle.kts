@@ -6,5 +6,5 @@ include(":NguonTV")
 include(":PhimVNProvider")
 include(":NgonTV")
 include(":CineFreak")
-include(":Movie321")
+include(":Movies321")
 rootProject.name = "CloudstreamPlugins"
