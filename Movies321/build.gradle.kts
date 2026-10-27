@@ -1,4 +1,4 @@
-version = 5
+version = 7
 
 cloudstream {
     description = "Phim lẻ và phim bộ từ 321movies.co.uk (danh mục TMDB, link HLS từ player của site, mỗi link được kiểm tra trước)"
