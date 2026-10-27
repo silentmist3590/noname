@@ -322,7 +322,8 @@ class Movies321Provider : MainAPI() {
         val state: String,                       // ok | dead | unknown
         val m3u8: Boolean,
         val headers: Map<String, String>? = null, // bộ header đã chạy được
-        val note: String = ""
+        val note: String = "",
+        val url: String? = null                   // link thay thế (link gốc bỏ qua proxy)
     )
 
     /** Lấy JSON bằng OkHttp chặn luồng (request đầu tiên của site có thể mất ~20 giây). */
@@ -370,9 +371,7 @@ class Movies321Provider : MainAPI() {
                 if (r.code == 200 || r.code == 206) {
                     r.code to body
                 } else {
-                    val info = "[server=" + r.header("server") + " cf-ray=" + r.header("cf-ray") +
-                        " ctype=" + r.header("content-type") + " cf-mitigated=" + r.header("cf-mitigated") + "] "
-                    r.code to (info + body.take(160).replace('\n', ' '))
+                    r.code to body.take(200).replace('\n', ' ')
                 }
             }
         } catch (e: UnknownHostException) {
@@ -438,31 +437,63 @@ class Movies321Provider : MainAPI() {
         m
     }.getOrNull()
 
+    /** Giải mã tham số url=<...> của link proxy để lấy link gốc phía sau. */
+    private fun innerUrl(url: String): String? = runCatching {
+        val raw = Regex("[?&]url=([^&]+)").find(url)?.groupValues?.get(1) ?: return@runCatching null
+        java.net.URLDecoder.decode(raw, "UTF-8").takeIf { it.startsWith("http") }
+    }.getOrNull()
+
+    private fun isProxy(url: String) = url.contains(".workers.dev/")
+
     private fun probeOne(
-        client: OkHttpClient, url: String, setA: Map<String, String>, setB: Map<String, String>
+        client: OkHttpClient, url: String, setA: Map<String, String>, setB: Map<String, String>,
+        extra: List<Map<String, String>>
     ): Verdict {
-        val sets = mutableListOf<Pair<String, Map<String, String>>>()
-        sets.add("site" to setA)
-        sets.add("trống" to setB)
-        sets.add("android" to mapOf(
-            "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
-            "Referer" to "$mainUrl/", "Origin" to mainUrl, "Accept-Language" to "en-US,en;q=0.9"
-        ))
-        embeddedHeaders(url)?.let { sets.add("nhúng" to it) }
-        var first: Verdict? = null
         val notes = StringBuilder()
-        for ((tag, hs) in sets) {
-            val v = chain(client, url, hs)
-            if (v.state == "ok") return v.copy(note = v.note + " (bộ header: $tag)")
+        var first: Verdict? = null
+        fun attempt(tag: String, target: String, hs: Map<String, String>, replaceUrl: Boolean): Verdict? {
+            val v = chain(client, target, hs)
+            if (v.state == "ok") {
+                return v.copy(
+                    note = v.note + " (" + tag + ")",
+                    url = if (replaceUrl) target else null
+                )
+            }
             if (first == null) first = v
-            notes.append(" | ").append(tag).append(": ").append(v.note.take(120))
+            notes.append(" | ").append(tag).append(": ").append(v.note.take(150))
+            return null
         }
+
+        // 1. Đúng cách site làm: Referer/Origin của site
+        attempt("site", url, setA, false)?.let { return it }
+
+        // 2. Bỏ qua proxy: gọi thẳng link gốc với Referer/Origin mà link proxy mang theo
+        val emb = embeddedHeaders(url)
+        var inner = innerUrl(url)
+        var depth = 0
+        while (inner != null && depth < 3) {
+            if (emb != null) attempt("gốc" + depth, inner, emb, true)?.let { return it }
+            else for (e in extra) attempt("gốc" + depth + "+ref", inner, e, true)?.let { return it }
+            inner = innerUrl(inner)
+            depth++
+        }
+
+        // 3. Link trực tiếp không có Referer riêng: thử các Referer thấy ở các nguồn khác
+        if (!isProxy(url) && emb == null) {
+            for (e in extra) attempt("ref=" + (e["Referer"] ?: ""), url, e, false)?.let { return it }
+        }
+        // 4. Không Referer
+        attempt("trống", url, setB, false)?.let { return it }
+
         val f = first!!
-        return f.copy(note = if (notes.length > 3) notes.toString().drop(3) else f.note)
+        return f.copy(note = notes.toString().drop(3).ifBlank { f.note })
     }
 
     /** Kiểm tra song song bằng luồng thường (không cần coroutines). */
-    private fun probeAll(cands: List<Cand>, setA: Map<String, String>, setB: Map<String, String>): List<Verdict> {
+    private fun probeAll(
+        cands: List<Cand>, setA: Map<String, String>, setB: Map<String, String>,
+        extra: List<Map<String, String>>
+    ): List<Verdict> {
         if (cands.isEmpty()) return emptyList()
         val client = app.baseClient.newBuilder()
             .callTimeout(8, TimeUnit.SECONDS)
@@ -470,8 +501,8 @@ class Movies321Provider : MainAPI() {
             .build()
         val pool = Executors.newFixedThreadPool(minOf(cands.size, 8))
         return try {
-            val fs = cands.map { c -> pool.submit(Callable { probeOne(client, c.url, setA, setB) }) }
-            fs.map { f -> runCatching { f.get(60, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false, note = "quá thời gian")) }
+            val fs = cands.map { c -> pool.submit(Callable { probeOne(client, c.url, setA, setB, extra) }) }
+            fs.map { f -> runCatching { f.get(70, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false, note = "quá thời gian")) }
         } finally {
             pool.shutdownNow()
         }
@@ -545,13 +576,14 @@ class Movies321Provider : MainAPI() {
             }
 
             val headers = siteHeaders()
-            val verdicts = probeAll(cands, headers, mapOf("User-Agent" to ua))
+            val extra = cands.mapNotNull { embeddedHeaders(it.url) }.distinctBy { it["Referer"] }
+            val verdicts = probeAll(cands, headers, mapOf("User-Agent" to ua), extra)
             val ok = mutableListOf<Pair<Cand, Verdict>>()
             val unknown = mutableListOf<Pair<Cand, Verdict>>()
             cands.forEachIndexed { i, c ->
                 val v = verdicts[i]
                 log.append("  [").append(v.state).append(" ").append(v.note).append("] ").append(c.family).append(" | ")
-                    .append(c.label).append(" | ").append(c.url.take(150)).append('\n')
+                    .append(c.label).append(" | ").append((v.url ?: c.url).take(150)).append('\n')
                 if (v.state == "ok") ok.add(c to v) else if (v.state == "unknown") unknown.add(c to v)
             }
             val order = Comparator<Pair<Cand, Verdict>> { a, b ->
@@ -583,7 +615,7 @@ class Movies321Provider : MainAPI() {
                 val hs = v.headers ?: headers
                 callback(
                     newExtractorLink(
-                        name, disp, c.url,
+                        name, disp, v.url ?: c.url,
                         if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = hs["Referer"] ?: ""
