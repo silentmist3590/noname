@@ -313,13 +313,10 @@ class CineFreakProvider : MainAPI() {
             Log.e("CineFreak", "Failed to open cloud page: $fileUrl", e)
             return false
         }
-        Log.d(
-    "CineFreak",
-    "Cloud page opened: url=$fileUrl, status=${response.code}, htmlLength=${response.text.length}"
-        )
+        Log.d("CineFreak", "Cloud page opened: url=$fileUrl, status=${response.code}, htmlLength=${response.text.length}")
         val html = response.text
-        
-        // Không phân tích trang lỗi hoặc trang bị từ chối truy cập như trang phát phim.
+
+        // A rejected response is not a playable server page. Stop before parsing its links.
         if (response.code !in 200..299) {
             Log.w(
                 "CineFreak",
@@ -328,7 +325,8 @@ class CineFreakProvider : MainAPI() {
             )
             return false
         }
-        // Trang thử thách không chứa liên kết phát phim có thể sử dụng.
+
+        // Do not treat a browser-verification interstitial as a list of player buttons.
         if (
             html.contains("cf-turnstile", true) ||
             html.contains("Just a moment...", true) ||
@@ -356,6 +354,8 @@ class CineFreakProvider : MainAPI() {
 
         var found = false
         for ((target, label) in serverLinks.take(12)) {
+            // Track success per server, rather than using the global result to skip later extractors.
+            var serverResolved = false
             try {
                 if (Regex("(?i)\\.(m3u8|mp4|mkv|webm)(?:[?#].*)?$").containsMatchIn(target) ||
                     target.contains("googleusercontent.com", true) || target.contains("workers.dev", true) ||
@@ -363,8 +363,14 @@ class CineFreakProvider : MainAPI() {
                     if (target.contains("pixeldrain", true)) {
                         val id = Regex("pixeldrain\\.[a-z]+/(?:u|l|api/file)/([A-Za-z0-9]+)", RegexOption.IGNORE_CASE).find(target)?.groupValues?.get(1)
                         val direct = if (id != null) "https://pixeldrain.com/api/file/$id?download" else target
-                        found = emitDirect(direct, fileUrl, "CineFreak · ${label.ifBlank { "Direct" }}", callback) || found
-                    } else found = emitDirect(target, fileUrl, "CineFreak · ${label.ifBlank { "Direct" }}", callback) || found
+                        val emitted = emitDirect(direct, fileUrl, "CineFreak · ${label.ifBlank { "Direct" }}", callback)
+                        serverResolved = emitted || serverResolved
+                        found = emitted || found
+                    } else {
+                        val emitted = emitDirect(target, fileUrl, "CineFreak · ${label.ifBlank { "Direct" }}", callback)
+                        serverResolved = emitted || serverResolved
+                        found = emitted || found
+                    }
                     continue
                 }
                 // Stream Online pages can carry the final URL in iframe?id=...
@@ -380,9 +386,14 @@ class CineFreakProvider : MainAPI() {
                     Regex("https?://[^\\s\"'<>]+\\.(?:m3u8|mp4|mkv|webm)(?:\\?[^\\s\"'<>]*)?", RegexOption.IGNORE_CASE)
                         .findAll(inter.text).forEach { add(it.value) }
                 }.filter { it.startsWith("http", true) }.distinct()
-                for (candidate in candidates) found = emitDirect(candidate, target, "CineFreak · $label", callback) || found
-                if (!found) {
+                for (candidate in candidates) {
+                    val emitted = emitDirect(candidate, target, "CineFreak · $label", callback)
+                    serverResolved = emitted || serverResolved
+                    found = emitted || found
+                }
+                if (!serverResolved) {
                     loadExtractor(target, fileUrl, subtitleCallback) { extracted ->
+                        serverResolved = true
                         found = true
                         callback(extracted)
                     }
@@ -426,6 +437,13 @@ class CineFreakProvider : MainAPI() {
             }
         }
         Log.d("CineFreak", "Collected ${links.size} candidate links: ${links.joinToString { candidate -> runCatching { val u = URI(candidate); "${u.host}${u.path}" }.getOrDefault("invalid-url") }}")
+
+        Log.d(
+            "CineFreak",
+            "Candidate summary: total=${links.size}, " +
+                "cloud=${links.count { it.contains("cinecloud", true) || it.contains("neodrive", true) }}, " +
+                "directMedia=${links.count { Regex("(?i)\\.(m3u8|mp4|mkv|webm|mpd)(?:[?#].*)?$").containsMatchIn(it) }}"
+        )
 
         var found = false
         val seen = mutableSetOf<String>()
