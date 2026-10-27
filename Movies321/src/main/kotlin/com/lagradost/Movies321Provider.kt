@@ -121,7 +121,8 @@ class Movies321Provider : MainAPI() {
 
     private fun image(path: String?, size: String): String? {
         if (path.isNullOrBlank() || path == "null") return null
-        return img + size + (if (path.startsWith("/")) path else "/$path")
+        // image.tmdb.org bị chặn ở một số mạng nên đi qua proxy ảnh wsrv.nl
+        return "https://wsrv.nl/?url=" + URLEncoder.encode(img + size + (if (path.startsWith("/")) path else "/$path"), "UTF-8")
     }
 
     private fun yearOf(date: String?): Int? =
@@ -317,7 +318,12 @@ class Movies321Provider : MainAPI() {
         val declared: String, val rank: Int
     )
 
-    private data class Verdict(val state: String, val m3u8: Boolean)   // state: ok | dead | unknown
+    private data class Verdict(
+        val state: String,                       // ok | dead | unknown
+        val m3u8: Boolean,
+        val headers: Map<String, String>? = null, // bộ header đã chạy được
+        val note: String = ""
+    )
 
     /** Lấy JSON bằng OkHttp chặn luồng (request đầu tiên của site có thể mất ~20 giây). */
     private fun blockingGet(client: OkHttpClient, url: String, headers: Map<String, String>): Pair<Int, String> {
@@ -351,47 +357,90 @@ class Movies321Provider : MainAPI() {
         return null
     }
 
-    private fun probeOne(client: OkHttpClient, url: String, headers: Map<String, String>): Verdict {
-        val rb = Request.Builder().url(url)
-        headers.forEach { (k, v) -> rb.header(k, v) }
-        rb.header("Accept", "*/*").header("Range", "bytes=0-2047")
+    private fun getBytes(
+        client: OkHttpClient, url: String, headers: Map<String, String>, range: String?, limit: Long
+    ): Pair<Int, String> {
         return try {
+            val rb = Request.Builder().url(url)
+            headers.forEach { (k, v) -> rb.header(k, v) }
+            rb.header("Accept", "*/*")
+            if (range != null) rb.header("Range", range)
             client.newCall(rb.build()).execute().use { r ->
-                val code = r.code
-                if (code == 200 || code == 206) {
-                    val head = runCatching { r.peekBody(2048).string() }.getOrDefault("")
-                        .replace("﻿", "").trimStart()
-                    when {
-                        head.startsWith("#EXTM3U") -> Verdict("ok", true)
-                        Regex("^<(!doctype|html|\\?xml)", RegexOption.IGNORE_CASE).containsMatchIn(head) ->
-                            if (head.contains("<MPD", true)) Verdict("ok", false) else Verdict("dead", false)
-                        head.isNotEmpty() -> Verdict("ok", false)
-                        else -> Verdict("unknown", false)
-                    }
-                } else if (code == 401 || code == 403 || code == 429) {
-                    Verdict("unknown", false)
-                } else {
-                    Verdict("dead", false)
-                }
+                r.code to runCatching { r.peekBody(limit).string() }.getOrDefault("")
             }
         } catch (e: UnknownHostException) {
-            Verdict("dead", false)
+            -1 to "dns"
         } catch (e: Exception) {
-            Verdict("unknown", false)
+            0 to (e.message ?: e.javaClass.simpleName)
         }
     }
 
+    private fun resolveUrl(base: String, ref: String): String {
+        if (ref.startsWith("http://") || ref.startsWith("https://")) return ref
+        return runCatching { java.net.URI(base).resolve(ref).toString() }.getOrDefault(ref)
+    }
+
+    /**
+     * Kiểm tra tới tận đoạn video đầu tiên: tải playlist, nếu là master thì tải playlist con,
+     * rồi xin 1KB đầu của đoạn đầu. Link nào đoạn video trả 403/404 sẽ gây lỗi 2004 khi phát.
+     */
+    private fun chain(client: OkHttpClient, url: String, headers: Map<String, String>): Verdict {
+        val (c1, b1) = getBytes(client, url, headers, null, 400_000)
+        if (c1 == -1) return Verdict("dead", false, note = "DNS")
+        if (c1 != 200 && c1 != 206) {
+            val st = if (c1 == 401 || c1 == 403 || c1 == 429 || c1 == 0) "unknown" else "dead"
+            return Verdict(st, false, note = "playlist HTTP $c1")
+        }
+        val head = b1.replace("\uFEFF", "").trimStart()
+        if (!head.startsWith("#EXTM3U")) {
+            if (Regex("^<(!doctype|html|\\?xml)", RegexOption.IGNORE_CASE).containsMatchIn(head)) {
+                return if (head.contains("<MPD", true)) Verdict("ok", false, headers, "mpd")
+                else Verdict("dead", false, note = "trả về HTML")
+            }
+            return if (head.isNotEmpty()) Verdict("ok", false, headers, "không phải m3u8")
+            else Verdict("unknown", false, note = "rỗng")
+        }
+        var text = head
+        var base = url
+        if (text.contains("#EXT-X-STREAM-INF")) {
+            val lines = text.lines()
+            val idx = lines.indexOfFirst { it.startsWith("#EXT-X-STREAM-INF") }
+            val v = lines.drop(idx + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }?.trim()
+                ?: return Verdict("unknown", true, note = "master không có variant")
+            base = resolveUrl(url, v)
+            val (c2, b2) = getBytes(client, base, headers, null, 400_000)
+            if (c2 != 200 && c2 != 206) return Verdict("unknown", true, note = "variant HTTP $c2")
+            text = b2.trimStart()
+        }
+        val seg = text.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+            ?: return Verdict("unknown", true, note = "không thấy đoạn video")
+        val segUrl = resolveUrl(base, seg)
+        val (c3, _) = getBytes(client, segUrl, headers, "bytes=0-1023", 1024)
+        return if (c3 == 200 || c3 == 206) Verdict("ok", true, headers, "đoạn video HTTP $c3")
+        else Verdict("unknown", true, note = "đoạn video HTTP $c3 ${segUrl.take(80)}")
+    }
+
+    private fun probeOne(
+        client: OkHttpClient, url: String, setA: Map<String, String>, setB: Map<String, String>
+    ): Verdict {
+        val a = chain(client, url, setA)
+        if (a.state == "ok") return a
+        val b = chain(client, url, setB)
+        if (b.state == "ok") return b.copy(note = b.note + " (không Referer)")
+        return if (a.state == "dead" && b.state != "dead") b else a
+    }
+
     /** Kiểm tra song song bằng luồng thường (không cần coroutines). */
-    private fun probeAll(cands: List<Cand>, headers: Map<String, String>): List<Verdict> {
+    private fun probeAll(cands: List<Cand>, setA: Map<String, String>, setB: Map<String, String>): List<Verdict> {
         if (cands.isEmpty()) return emptyList()
         val client = app.baseClient.newBuilder()
-            .callTimeout(9, TimeUnit.SECONDS)
+            .callTimeout(8, TimeUnit.SECONDS)
             .followRedirects(true)
             .build()
         val pool = Executors.newFixedThreadPool(minOf(cands.size, 8))
         return try {
-            val fs = cands.map { c -> pool.submit(Callable { probeOne(client, c.url, headers) }) }
-            fs.map { f -> runCatching { f.get(14, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false)) }
+            val fs = cands.map { c -> pool.submit(Callable { probeOne(client, c.url, setA, setB) }) }
+            fs.map { f -> runCatching { f.get(35, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false, note = "quá thời gian")) }
         } finally {
             pool.shutdownNow()
         }
@@ -419,6 +468,7 @@ class Movies321Provider : MainAPI() {
     ): Boolean {
         val log = StringBuilder("321Movies loadLinks\ndata=$data\n")
         var found = false
+        var verified = 0
         try {
             val ref = refOf(data)
             if (ref == null) {
@@ -464,12 +514,12 @@ class Movies321Provider : MainAPI() {
             }
 
             val headers = siteHeaders()
-            val verdicts = probeAll(cands, headers)
+            val verdicts = probeAll(cands, headers, mapOf("User-Agent" to ua))
             val ok = mutableListOf<Pair<Cand, Verdict>>()
             val unknown = mutableListOf<Pair<Cand, Verdict>>()
             cands.forEachIndexed { i, c ->
                 val v = verdicts[i]
-                log.append("  [").append(v.state).append("] ").append(c.family).append(" | ")
+                log.append("  [").append(v.state).append(" ").append(v.note).append("] ").append(c.family).append(" | ")
                     .append(c.label).append(" | ").append(c.url.take(90)).append('\n')
                 if (v.state == "ok") ok.add(c to v) else if (v.state == "unknown") unknown.add(c to v)
             }
@@ -478,6 +528,7 @@ class Movies321Provider : MainAPI() {
                 val hb = heightOf(b.first.label).let { if (it == 0) 500 else it }
                 if (ha != hb) hb.compareTo(ha) else a.first.rank.compareTo(b.first.rank)
             }
+            verified = ok.size
             ok.sortWith(order)
             unknown.sortWith(order)
 
@@ -498,14 +549,15 @@ class Movies321Provider : MainAPI() {
                 if (n > 1) disp += " #$n"
 
                 val isM3u8 = if (v.state == "ok") v.m3u8 else c.declared.equals("hls", true)
+                val hs = v.headers ?: headers
                 callback(
                     newExtractorLink(
                         name, disp, c.url,
                         if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
-                        this.referer = "$mainUrl/"
+                        this.referer = hs["Referer"] ?: ""
                         this.quality = qualityValue(heightOf(c.label))
-                        this.headers = headers
+                        this.headers = hs
                     }
                 )
                 found = true
@@ -517,7 +569,7 @@ class Movies321Provider : MainAPI() {
                 .append(e.message).append('\n')
             return found
         } finally {
-            if (DEBUG && !found) copyLog(log.toString())
+            if (DEBUG && (!found || verified == 0)) copyLog(log.toString())
         }
     }
 
