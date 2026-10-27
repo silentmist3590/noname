@@ -1,4 +1,4 @@
-version = 4
+version = 8
 
 cloudstream {
     description = "CineFreak catalog provider for CloudStream: homepage, search and detail pages"
