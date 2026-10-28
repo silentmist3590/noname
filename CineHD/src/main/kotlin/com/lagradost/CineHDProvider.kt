@@ -22,7 +22,11 @@ class CineHDProvider : MainAPI() {
     )
 
     companion object {
-        const val TMDB_API = "https://api.themoviedb.org/3"
+        // Ưu tiên api.tmdb.org để vượt qua tường lửa chặn tên miền của nhà mạng Viettel/VNPT
+        private val TMDB_HOSTS = listOf(
+            "https://api.tmdb.org/3",
+            "https://api.themoviedb.org/3"
+        )
         const val TMDB_KEY = "439c478a771f35c05022f9feabcca01c"
         const val TMDB_IMG = "https://image.tmdb.org/t/p"
 
@@ -46,13 +50,28 @@ class CineHDProvider : MainAPI() {
         return dateStr?.takeIf { it.length >= 4 }?.substring(0, 4)?.toIntOrNull()
     }
 
+    private suspend fun fetchTmdbJson(path: String): JSONObject? {
+        for (host in TMDB_HOSTS) {
+            try {
+                val sep = if (path.contains("?")) "&" else "?"
+                val fullUrl = "$host/$path${sep}api_key=$TMDB_KEY"
+                val res = app.get(fullUrl, headers = DEFAULT_HEADERS, timeout = 12).text
+                if (res.isNotBlank() && res.startsWith("{")) {
+                    return JSONObject(res)
+                }
+            } catch (_: Exception) {
+                // Tự động chuyển qua mirror khác nếu máy chủ bị chặn bởi nhà mạng
+            }
+        }
+        return null
+    }
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val url = "$TMDB_API/${request.data}?api_key=$TMDB_KEY&page=$page"
-        val response = app.get(url, headers = DEFAULT_HEADERS).text
-        val json = JSONObject(response)
+        val json = fetchTmdbJson("${request.data}?page=$page") 
+            ?: return newHomePageResponse(request.name, emptyList())
         val results = json.optJSONArray("results") ?: JSONArray()
         
         val items = ArrayList<SearchResponse>()
@@ -93,9 +112,8 @@ class CineHDProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$TMDB_API/search/multi?api_key=$TMDB_KEY&query=${query.trim()}&page=1&include_adult=false"
-        val response = app.get(url, headers = DEFAULT_HEADERS).text
-        val json = JSONObject(response)
+        val json = fetchTmdbJson("search/multi?query=${query.trim()}&page=1&include_adult=false")
+            ?: return emptyList()
         val results = json.optJSONArray("results") ?: JSONArray()
 
         val list = ArrayList<SearchResponse>()
@@ -142,8 +160,7 @@ class CineHDProvider : MainAPI() {
         val type = parsed.getString("type")
 
         if (type == "movie") {
-            val res = app.get("$TMDB_API/movie/$id?api_key=$TMDB_KEY&append_to_response=credits,videos", headers = DEFAULT_HEADERS).text
-            val d = JSONObject(res)
+            val d = fetchTmdbJson("movie/$id?append_to_response=credits,videos") ?: return null
 
             val title = d.optString("title", "Unknown")
             val posterUrl = getPoster(d.optString("poster_path"))
@@ -177,8 +194,7 @@ class CineHDProvider : MainAPI() {
                 this.tags = tags
             }
         } else {
-            val res = app.get("$TMDB_API/tv/$id?api_key=$TMDB_KEY&append_to_response=credits,videos", headers = DEFAULT_HEADERS).text
-            val d = JSONObject(res)
+            val d = fetchTmdbJson("tv/$id?append_to_response=credits,videos") ?: return null
 
             val title = d.optString("name", "Unknown")
             val posterUrl = getPoster(d.optString("poster_path"))
@@ -204,13 +220,7 @@ class CineHDProvider : MainAPI() {
                 val epCount = sObj.optInt("episode_count", 0)
                 if (sNum <= 0 || epCount <= 0) continue
 
-                val sRes = try {
-                    app.get("$TMDB_API/tv/$id/season/$sNum?api_key=$TMDB_KEY", headers = DEFAULT_HEADERS).text
-                } catch (e: Exception) {
-                    null
-                } ?: continue
-
-                val sJson = JSONObject(sRes)
+                val sJson = fetchTmdbJson("tv/$id/season/$sNum") ?: continue
                 val epArray = sJson.optJSONArray("episodes") ?: continue
                 for (j in 0 until epArray.length()) {
                     val epObj = epArray.optJSONObject(j) ?: continue
