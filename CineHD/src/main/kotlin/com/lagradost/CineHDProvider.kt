@@ -9,6 +9,10 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
 import org.json.JSONArray
+import lagradost.cinehd.extractors.NxshaExtractor
+import lagradost.cinehd.extractors.VidLoveExtractor
+import lagradost.cinehd.extractors.VidRockExtractor
+import lagradost.cinehd.utils.CryptoUtils
 
 class CineHDProvider : MainAPI() {
     override var mainUrl = "https://cinehd.vc"
