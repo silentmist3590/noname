@@ -3,7 +3,6 @@ package com.lagradost
 import com.lagradost.extractors.NxshaExtractor
 import com.lagradost.extractors.VidLoveExtractor
 import com.lagradost.extractors.VidRockExtractor
-import com.lagradost.utils.CryptoUtils
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
