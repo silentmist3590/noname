@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.cinehd"
+    namespace = "lagradost.cinehd"
     compileSdk = 34
 
     defaultConfig {
