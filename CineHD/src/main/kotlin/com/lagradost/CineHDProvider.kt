@@ -1,18 +1,15 @@
-package com.cinehd
+package com.lagradost
 
+import com.lagradost.extractors.NxshaExtractor
+import com.lagradost.extractors.VidLoveExtractor
+import com.lagradost.extractors.VidRockExtractor
+import com.lagradost.utils.CryptoUtils
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
 import org.json.JSONArray
-import lagradost.cinehd.extractors.NxshaExtractor
-import lagradost.cinehd.extractors.VidLoveExtractor
-import lagradost.cinehd.extractors.VidRockExtractor
-import lagradost.cinehd.utils.CryptoUtils
 
 class CineHDProvider : MainAPI() {
     override var mainUrl = "https://cinehd.vc"
@@ -154,7 +151,7 @@ class CineHDProvider : MainAPI() {
             val backdropUrl = getPoster(d.optString("backdrop_path"), "w780")
             val plot = d.optString("overview")
             val year = getYear(d.optString("release_date"))
-            val rating = (d.optDouble("vote_average", 0.0) * 10).toInt()
+            val voteAverage = d.optDouble("vote_average", 0.0)
             val duration = d.optInt("runtime", 0)
 
             val tags = ArrayList<String>()
@@ -176,7 +173,7 @@ class CineHDProvider : MainAPI() {
                 this.backgroundPosterUrl = backdropUrl
                 this.plot = plot
                 this.year = year
-                this.rating = rating
+                this.score = Score.from10(voteAverage)
                 this.duration = duration
                 this.tags = tags
             }
@@ -189,7 +186,7 @@ class CineHDProvider : MainAPI() {
             val backdropUrl = getPoster(d.optString("backdrop_path"), "w780")
             val plot = d.optString("overview")
             val year = getYear(d.optString("first_air_date"))
-            val rating = (d.optDouble("vote_average", 0.0) * 10).toInt()
+            val voteAverage = d.optDouble("vote_average", 0.0)
 
             val tags = ArrayList<String>()
             val genres = d.optJSONArray("genres")
@@ -202,53 +199,44 @@ class CineHDProvider : MainAPI() {
             val seasons = d.optJSONArray("seasons") ?: JSONArray()
             val episodes = ArrayList<Episode>()
 
-            coroutineScope {
-                val deferredSeasons = (0 until seasons.length()).mapNotNull { i ->
-                    val sObj = seasons.optJSONObject(i) ?: return@mapNotNull null
-                    val sNum = sObj.optInt("season_number", 0)
-                    val epCount = sObj.optInt("episode_count", 0)
-                    if (sNum > 0 && epCount > 0) {
-                        async {
-                            try {
-                                val sRes = app.get("$TMDB_API/tv/$id/season/$sNum?api_key=$TMDB_KEY", headers = DEFAULT_HEADERS).text
-                                JSONObject(sRes)
-                            } catch (e: Exception) {
-                                null
-                            }
+            for (i in 0 until seasons.length()) {
+                val sObj = seasons.optJSONObject(i) ?: continue
+                val sNum = sObj.optInt("season_number", 0)
+                val epCount = sObj.optInt("episode_count", 0)
+                if (sNum <= 0 || epCount <= 0) continue
+
+                val sRes = try {
+                    app.get("$TMDB_API/tv/$id/season/$sNum?api_key=$TMDB_KEY", headers = DEFAULT_HEADERS).text
+                } catch (e: Exception) {
+                    null
+                } ?: continue
+
+                val sJson = JSONObject(sRes)
+                val epArray = sJson.optJSONArray("episodes") ?: continue
+                for (j in 0 until epArray.length()) {
+                    val epObj = epArray.optJSONObject(j) ?: continue
+                    val epNum = epObj.optInt("episode_number", j + 1)
+                    val epName = epObj.optString("name").ifEmpty { "Episode $epNum" }
+                    val epStill = epObj.optString("still_path")
+                    val epPlot = epObj.optString("overview")
+
+                    val epData = JSONObject().apply {
+                        put("id", id)
+                        put("type", "tv")
+                        put("s", sNum)
+                        put("e", epNum)
+                        put("title", title)
+                    }.toString()
+
+                    episodes.add(
+                        newEpisode(epData) {
+                            this.name = epName
+                            this.season = sNum
+                            this.episode = epNum
+                            this.posterUrl = getPoster(epStill)
+                            this.description = epPlot
                         }
-                    } else null
-                }
-
-                deferredSeasons.awaitAll().forEach { sJson ->
-                    if (sJson != null) {
-                        val sNum = sJson.optInt("season_number", 1)
-                        val epArray = sJson.optJSONArray("episodes") ?: JSONArray()
-                        for (j in 0 until epArray.length()) {
-                            val epObj = epArray.optJSONObject(j) ?: continue
-                            val epNum = epObj.optInt("episode_number", j + 1)
-                            val epName = epObj.optString("name").ifEmpty { "Episode $epNum" }
-                            val epStill = epObj.optString("still_path")
-                            val epPlot = epObj.optString("overview")
-
-                            val epData = JSONObject().apply {
-                                put("id", id)
-                                put("type", "tv")
-                                put("s", sNum)
-                                put("e", epNum)
-                                put("title", title)
-                            }.toString()
-
-                            episodes.add(
-                                newEpisode(epData) {
-                                    this.name = epName
-                                    this.season = sNum
-                                    this.episode = epNum
-                                    this.posterUrl = getPoster(epStill)
-                                    this.description = epPlot
-                                }
-                            )
-                        }
-                    }
+                    )
                 }
             }
 
@@ -257,7 +245,7 @@ class CineHDProvider : MainAPI() {
                 this.backgroundPosterUrl = backdropUrl
                 this.plot = plot
                 this.year = year
-                this.rating = rating
+                this.score = Score.from10(voteAverage)
                 this.tags = tags
             }
         }
@@ -275,31 +263,24 @@ class CineHDProvider : MainAPI() {
         val season = if (isTv) payload.optInt("s", 1) else 0
         val episode = if (isTv) payload.optInt("e", 1) else 0
 
-        coroutineScope {
-            // Chạy song song 3 bộ bóc tách: VidRock, Nxsha và VidLove
-            val j1 = async {
-                try {
-                    VidRockExtractor.extract(tmdbId, isTv, season, episode, callback, subtitleCallback)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-            val j2 = async {
-                try {
-                    NxshaExtractor.extract(tmdbId, isTv, season, episode, callback, subtitleCallback)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-            val j3 = async {
-                try {
-                    VidLoveExtractor.extract(tmdbId, isTv, season, episode, callback, subtitleCallback)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-            awaitAll(j1, j2, j3)
+        try {
+            VidRockExtractor.extract(tmdbId, isTv, season, episode, callback, subtitleCallback)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
+
+        try {
+            NxshaExtractor.extract(tmdbId, isTv, season, episode, callback, subtitleCallback)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        try {
+            VidLoveExtractor.extract(tmdbId, isTv, season, episode, callback, subtitleCallback)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
         return true
     }
 }
