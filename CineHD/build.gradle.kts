@@ -25,7 +25,7 @@ android {
 
 cloudstream {
     // Tên hiển thị và mô tả của extension
-    setRepo(provider { "https://github.com/YourUsername/Cloudstream-CineHD" })
+    setRepo(provider { "https://github.com/silentmist3590/noname" })
     description = "CineHD (cinehd.vc / cinehd.dev) - Stream Movies & TV Series with multiple servers (VidRock GCM, Nxsha Nitro, VidLove M3U8)."
     authors = listOf("CineHD")
     status = com.lagradost.cloudstream3.gradle.CloudstreamExtension.Status.Down
