@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 cloudstream {
     description = "Phim thuộc phạm vi công cộng từ Internet Archive (archive.org)"
