@@ -1,6 +1,6 @@
-package com.cinehd.extractors
+package com.lagradost.extractors
 
-import com.cinehd.utils.CryptoUtils
+import com.lagradost.utils.CryptoUtils
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
@@ -53,7 +53,6 @@ object VidRockExtractor {
             val labelSuffix = if (language.isNotEmpty()) " - $language" else ""
 
             if (type == "mp4" && decryptedUrl.contains("streamrk.site/playlist")) {
-                // Trích xuất playlist mp4 của streamrk
                 try {
                     val plRes = app.get(
                         decryptedUrl,
@@ -69,7 +68,7 @@ object VidRockExtractor {
                         val res = item.optInt("resolution", 1080)
                         if (directMp4.startsWith("http")) {
                             callback.invoke(
-                                ExtractorLink(
+                                newExtractorLink(
                                     source = "Rock $serverName",
                                     name = "Rock $serverName - ${res}p MP4",
                                     url = directMp4,
@@ -85,7 +84,6 @@ object VidRockExtractor {
                     e.printStackTrace()
                 }
             } else {
-                // HLS Master m3u8
                 M3u8Helper.generateM3u8(
                     source = "Rock $serverName$labelSuffix",
                     streamUrl = decryptedUrl,
