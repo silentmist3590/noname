@@ -33,9 +33,8 @@ class Phim321Plugin : Plugin() {
 /**
  * Plugin 321Phim cho CloudStream 3
  * - Catalog: TMDB v3 hỗ trợ Tiếng Việt (vi-VN), tự động chuyển sang api.tmdb.org khi api.themoviedb.org bị chặn (::1).
- * - Nguồn phát chính: 321movies.co.uk playlist API (giải mã XOR và kiểm tra song song các luồng HLS).
- * - Nguồn dự phòng: Tulnex Multi-server API (VidSrc, SuperEmbed, LookMovie).
- * - Phụ đề: Hỗ trợ phụ đề Tiếng Việt (vi) và Tiếng Anh (en) tự động qua Wyzie Subtitles API.
+ * - Nguồn phát: 321movies playlist API (giải mã XOR và kiểm tra song song các luồng HLS).
+ * - Phụ đề: Trích xuất phụ đề sạch từ playlist nguồn, loại bỏ link chết tránh lỗi không hiển thị phụ đề khi chọn.
  */
 class Phim321Provider : MainAPI() {
     override var mainUrl = "https://321movies.co.uk"
@@ -290,34 +289,6 @@ class Phim321Provider : MainAPI() {
         }
     }
 
-    // ----------------------------------------------------------- Subtitles
-
-    private suspend fun fetchSubtitles(ref: Ref, subtitleCallback: (SubtitleFile) -> Unit) {
-        runCatching {
-            val url = if (ref.tv) {
-                "https://sub.wyzie.io/tv/${ref.id}/${ref.season ?: 1}/${ref.episode ?: 1}"
-            } else {
-                "https://sub.wyzie.io/movie/${ref.id}"
-            }
-            val resp = app.get(url, timeout = 10L).text
-            val arr = JSONArray(resp)
-            for (i in 0 until arr.length()) {
-                val item = arr.optJSONObject(i) ?: continue
-                val subUrl = item.optString("url", "")
-                val lang = item.optString("language", "").lowercase()
-                val display = item.optString("display", "")
-                if (subUrl.startsWith("http")) {
-                    val label = when {
-                        lang == "vi" || lang.contains("viet") -> "Tiếng Việt"
-                        lang == "en" || lang.contains("eng") -> "English"
-                        else -> display.ifBlank { lang.uppercase() }
-                    }
-                    subtitleCallback(SubtitleFile(label, subUrl))
-                }
-            }
-        }
-    }
-
     // ----------------------------------------------------------- Load Links
 
     private fun decodeFile(file: String?): String {
@@ -556,43 +527,6 @@ class Phim321Provider : MainAPI() {
         else -> Qualities.Unknown.value
     }
 
-    private suspend fun fetchTulnexStreams(
-        ref: Ref,
-        callback: (ExtractorLink) -> Unit
-    ): Int {
-        var count = 0
-        runCatching {
-            val url = if (ref.tv) {
-                "https://api.tulnex.com/provider/allmovies/tv/${ref.id}/${ref.season ?: 1}/${ref.episode ?: 1}?lang=english"
-            } else {
-                "https://api.tulnex.com/provider/allmovies/movie/${ref.id}?lang=english"
-            }
-            val resp = app.get(url, timeout = 10L).text
-            val json = JSONObject(resp)
-            val data = json.optJSONArray("data") ?: return@runCatching
-            for (i in 0 until data.length()) {
-                val item = data.optJSONObject(i) ?: continue
-                val streamUrl = item.optString("url", "")
-                val serverName = item.optString("name", "Tulnex VIP")
-                if (streamUrl.startsWith("http")) {
-                    callback(
-                        newExtractorLink(
-                            name,
-                            "Dự phòng: $serverName",
-                            streamUrl,
-                            if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.quality = Qualities.P1080.value
-                            this.referer = "https://api.tulnex.com/"
-                        }
-                    )
-                    count++
-                }
-            }
-        }
-        return count
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -609,11 +543,21 @@ class Phim321Provider : MainAPI() {
                 return false
             }
 
-            // 1. Tự động tìm phụ đề tiếng Việt & tiếng Anh
-            fetchSubtitles(ref, subtitleCallback)
-
-            // 2. Lấy playlist chính từ 321movies
+            // Lấy playlist chính từ 321movies
             val payload = playerPlaylist(ref, log)
+
+            // Trích xuất subtitle hợp lệ nếu playlist có trả về
+            val tracks = payload?.optJSONArray("tracks")
+            if (tracks != null) {
+                for (ti in 0 until tracks.length()) {
+                    val t = tracks.optJSONObject(ti) ?: continue
+                    val file = t.optString("file", "")
+                    val label = t.optString("label", "Phụ đề")
+                    if (file.startsWith("http")) {
+                        subtitleCallback(SubtitleFile(label, file))
+                    }
+                }
+            }
 
             // Giải mã và loại trùng
             val seen = HashSet<String>()
@@ -693,12 +637,6 @@ class Phim321Provider : MainAPI() {
                     )
                     found = true
                 }
-            }
-
-            // 3. Nguồn dự phòng Tulnex
-            if (!found || verified == 0) {
-                val backupCount = fetchTulnexStreams(ref, callback)
-                if (backupCount > 0) found = true
             }
 
             if (!found) log.append("NO_STREAMS: Không lấy được nguồn phát\n")
