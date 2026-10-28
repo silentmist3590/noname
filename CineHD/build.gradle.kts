@@ -5,8 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "lagradost.cinehd"
-    compileSdk = 34
+    namespace = "com.lagradost.cinehd" // hoặc "lagradost.cinehd" tùy theo package bạn chọn
 
     defaultConfig {
         minSdk = 21
@@ -16,23 +15,20 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
-
-    kotlinOptions {
-        jvmTarget = "1.8"
-        freeCompilerArgs += "-opt-in=kotlin.RequiresOptIn"
-    }
 }
 
 cloudstream {
-    // Tên hiển thị và mô tả của extension
-    setRepo(provider { "https://github.com/silentmist3590/noname" })
-    description = "CineHD (cinehd.vc / cinehd.dev) - Stream Movies & TV Series with multiple servers (VidRock GCM, Nxsha Nitro, VidLove M3U8)."
+    // 1. Nhập trực tiếp String, KHÔNG bọc trong provider { }
+    setRepo("https://github.com/silentmist3590/noname")
+    description = "CineHD - Stream Movies & Series from cinehd.vc & cinehd.dev (VidRock GCM, Nxsha Nitro, VidLove)"
     authors = listOf("CineHD")
-    status = com.lagradost.cloudstream3.gradle.CloudstreamExtension.Status.Down
+    
+    // 2. Dùng số nguyên Int: 1 = Hoạt động tốt (OK)
+    status = 1
 }
 
 dependencies {
-    val cloudstreamVersion = "pre-release" // hoặc phiên bản build hiện tại
+    val cloudstreamVersion = "pre-release"
     implementation("com.github.recloudstream:cloudstream:$cloudstreamVersion")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
