@@ -8,4 +8,5 @@ include(":NgonTV")
 include(":CineFreak")
 include(":Movies321")
 include(":CineHD")
+include(":Phim321")
 rootProject.name = "CloudstreamPlugins"
