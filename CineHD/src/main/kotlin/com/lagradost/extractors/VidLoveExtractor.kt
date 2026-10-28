@@ -1,10 +1,7 @@
-package com.cinehd.extractors
+package com.lagradost.extractors
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
 
 object VidLoveExtractor {
@@ -37,59 +34,55 @@ object VidLoveExtractor {
             "/movie?id=$tmdbId&mode=json"
         }
 
-        coroutineScope {
-            val jobs = SOURCES.map { (label, sourceParam) ->
-                async {
-                    try {
-                        val url = "$BASE_URL$basePath$sourceParam"
-                        val response = app.get(
-                            url,
-                            headers = mapOf(
-                                "User-Agent" to USER_AGENT,
-                                "Referer" to PLAYER_REF,
-                                "Accept" to "application/json"
+        for (sourceItem in SOURCES) {
+            val label = sourceItem.first
+            val sourceParam = sourceItem.second
+            try {
+                val url = "$BASE_URL$basePath$sourceParam"
+                val response = app.get(
+                    url,
+                    headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to PLAYER_REF,
+                        "Accept" to "application/json"
+                    )
+                ).text
+
+                val json = JSONObject(response)
+                val source = json.optJSONObject("source") ?: continue
+                val streamUrl = source.optString("url")
+
+                if (!streamUrl.startsWith("http")) continue
+
+                val subs = json.optJSONArray("subtitles")
+                if (subs != null) {
+                    for (i in 0 until subs.length()) {
+                        val subObj = subs.optJSONObject(i) ?: continue
+                        val subUrl = subObj.optString("url")
+                        val subLang = subObj.optString("lang").ifEmpty { subObj.optString("label") }
+                        if (subUrl.startsWith("http")) {
+                            subtitleCallback.invoke(
+                                SubtitleFile(
+                                    lang = subLang,
+                                    url = subUrl
+                                )
                             )
-                        ).text
-
-                        val json = JSONObject(response)
-                        val source = json.optJSONObject("source") ?: return@async
-                        val streamUrl = source.optString("url")
-
-                        if (!streamUrl.startsWith("http")) return@async
-
-                        // Lấy phụ đề nếu có
-                        val subs = json.optJSONArray("subtitles")
-                        if (subs != null) {
-                            for (i in 0 until subs.length()) {
-                                val subObj = subs.optJSONObject(i) ?: continue
-                                val subUrl = subObj.optString("url")
-                                val subLang = subObj.optString("lang").ifEmpty { subObj.optString("label") }
-                                if (subUrl.startsWith("http")) {
-                                    subtitleCallback.invoke(
-                                        SubtitleFile(
-                                            lang = subLang,
-                                            url = subUrl
-                                        )
-                                    )
-                                }
-                            }
                         }
-
-                        M3u8Helper.generateM3u8(
-                            source = "VidLove ($label)",
-                            streamUrl = streamUrl,
-                            referer = PLAYER_REF,
-                            headers = mapOf(
-                                "User-Agent" to USER_AGENT,
-                                "Referer" to PLAYER_REF
-                            )
-                        ).forEach(callback)
-                    } catch (e: Exception) {
-                        // Bỏ qua server không khả dụng
                     }
                 }
+
+                M3u8Helper.generateM3u8(
+                    source = "VidLove ($label)",
+                    streamUrl = streamUrl,
+                    referer = PLAYER_REF,
+                    headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to PLAYER_REF
+                    )
+                ).forEach(callback)
+            } catch (e: Exception) {
+                // Bỏ qua server lỗi
             }
-            jobs.awaitAll()
         }
     }
 }
