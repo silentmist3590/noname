@@ -1,11 +1,8 @@
-package com.cinehd.extractors
+package com.lagradost.extractors
 
-import com.cinehd.utils.CryptoUtils
+import com.lagradost.utils.CryptoUtils
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -74,64 +71,59 @@ object NxshaExtractor {
             }
         }
 
-        // Lấy nguồn từ tối đa 16 server hàng đầu song song
-        coroutineScope {
-            val limited = activeScrapers.take(16)
-            val deferred = limited.map { (scraper, srvName) ->
-                async {
-                    try {
-                        val q2Obj = JSONObject().apply {
-                            put("ex_lang", true)
-                            put("provider", scraper)
-                            put("tmdbId", tmdbId.toString())
-                            put("imdb_id", "")
-                            put("type", if (isTv) "tv" else "movie")
-                            put("season", if (isTv) season else 0)
-                            put("episode", if (isTv) episode else 0)
-                        }
-                        val q2 = CryptoUtils.encryptOpenSsl(q2Obj.toString(), PASSPHRASE)
-                        val sourceRes = app.get(
-                            "$BASE_URL/api/sources?q=$q2",
+        for (item in activeScrapers.take(12)) {
+            val scraper = item.first
+            val srvName = item.second
+            try {
+                val q2Obj = JSONObject().apply {
+                    put("ex_lang", true)
+                    put("provider", scraper)
+                    put("tmdbId", tmdbId.toString())
+                    put("imdb_id", "")
+                    put("type", if (isTv) "tv" else "movie")
+                    put("season", if (isTv) season else 0)
+                    put("episode", if (isTv) episode else 0)
+                }
+                val q2 = CryptoUtils.encryptOpenSsl(q2Obj.toString(), PASSPHRASE)
+                val sourceRes = app.get(
+                    "$BASE_URL/api/sources?q=$q2",
+                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "$BASE_URL/")
+                ).text
+
+                val sourceHash = JSONObject(sourceRes).optString("_hash")
+                if (sourceHash.isNotEmpty()) {
+                    val decSourceStr = CryptoUtils.decryptOpenSsl(sourceHash, PASSPHRASE)
+                    val decSources = JSONObject(decSourceStr)
+                    val sourcesArr = decSources.optJSONArray("sources") ?: JSONArray()
+
+                    val providerPretty = SERVER_FRIENDLY_NAMES[scraper] ?: srvName.replace(Regex("""\s*-\s*\[.*?\]"""), "").trim()
+
+                    for (k in 0 until sourcesArr.length()) {
+                        val srcItem = sourcesArr.optJSONObject(k) ?: continue
+                        val streamUrl = srcItem.optString("url")
+                        if (streamUrl.isNullOrBlank() || !streamUrl.startsWith("http")) continue
+
+                        val rawLabel = srcItem.optString("label").ifEmpty { srcItem.optString("quality") }
+                        val cleanLabel = rawLabel
+                            .replace(Regex("""\s*:\s*[\d,p]+\s*$"""), "")
+                            .replace(Regex("""\s*\|\s*(WEB-DL|BluRay|HDRip|WEBRip|HDTV)\b""", RegexOption.IGNORE_CASE), "")
+                            .replace(Regex("""\s*\|\s*"""), " ")
+                            .trim()
+                            .ifEmpty { "multi-audio" }
+
+                        val fullLabel = "$providerPretty - $cleanLabel"
+
+                        M3u8Helper.generateM3u8(
+                            source = fullLabel,
+                            streamUrl = streamUrl,
+                            referer = "$BASE_URL/",
                             headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "$BASE_URL/")
-                        ).text
-
-                        val sourceHash = JSONObject(sourceRes).optString("_hash")
-                        if (sourceHash.isNotEmpty()) {
-                            val decSourceStr = CryptoUtils.decryptOpenSsl(sourceHash, PASSPHRASE)
-                            val decSources = JSONObject(decSourceStr)
-                            val sourcesArr = decSources.optJSONArray("sources") ?: JSONArray()
-
-                            val providerPretty = SERVER_FRIENDLY_NAMES[scraper] ?: srvName.replace(Regex("\s*-\\s*\\[.*?\\]"), "").trim()
-
-                            for (k in 0 until sourcesArr.length()) {
-                                val srcItem = sourcesArr.optJSONObject(k) ?: continue
-                                val streamUrl = srcItem.optString("url")
-                                if (streamUrl.isNullOrBlank() || !streamUrl.startsWith("http")) continue
-
-                                val rawLabel = srcItem.optString("label").ifEmpty { srcItem.optString("quality") }
-                                val cleanLabel = rawLabel
-                                    .replace(Regex("\s*:\s*[\d,p]+\s*$"), "")
-                                    .replace(Regex("\s*\|\s*(WEB-DL|BluRay|HDRip|WEBRip|HDTV)\b", RegexOption.IGNORE_CASE), "")
-                                    .replace(Regex("\s*\|\s*"), " ")
-                                    .trim()
-                                    .ifEmpty { "multi-audio" }
-
-                                val fullLabel = "$providerPretty - $cleanLabel"
-
-                                M3u8Helper.generateM3u8(
-                                    source = fullLabel,
-                                    streamUrl = streamUrl,
-                                    referer = "$BASE_URL/",
-                                    headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "$BASE_URL/")
-                                ).forEach(callback)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        // Bỏ qua server lỗi
+                        ).forEach(callback)
                     }
                 }
+            } catch (e: Exception) {
+                // Bỏ qua server lỗi
             }
-            deferred.awaitAll()
         }
     }
 }
