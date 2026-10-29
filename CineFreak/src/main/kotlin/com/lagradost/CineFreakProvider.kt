@@ -1,20 +1,36 @@
 package com.cinefreak
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.util.Base64
 import android.util.Log
+import android.widget.Toast
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.Request
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import java.net.URI
-import java.net.URLDecoder
 import java.net.URLEncoder
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
+/**
+ * CineFreak v11
+ *
+ * Từ 11/10/2026 trang chi tiết KHÔNG còn chứa link cinecloud. Trình phát của web gọi
+ *   POST wp-json/cf/v1/pl/<khóa>   {op=play, ep=m | e<mùa>_<tập>, ts=<Turnstile>}
+ * -> {state:"ready", url:"<địa chỉ vidzer có ticket>"}  (hoặc uploading / failed ...)
+ * Cần mã Turnstile, nên plugin chạy đúng đoạn JS đó trong WebView rồi lấy kết quả.
+ *
+ * Mọi lỗi đều được ghi vào "log" và tự copy vào clipboard để gửi lại.
+ */
 class CineFreakProvider : MainAPI() {
     override var mainUrl = "https://cinefreak.ch"
     override var name = "CineFreak"
@@ -36,6 +52,52 @@ class CineFreakProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val indexApi = "https://search.yagaverse.net/api/search"
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    private val version = 11
+    private val defaultTsKey = "0x4AAAAAAFUUpvP7IaTI_12V"
+
+    // ───────────────────────── log + clipboard ─────────────────────────
+
+    private var lastCopy = 0L
+
+    private inner class Dbg(private val tag: String) {
+        private val sb = StringBuilder()
+        private val t0 = System.currentTimeMillis()
+
+        fun log(msg: String) {
+            val line = "[${System.currentTimeMillis() - t0}ms] $msg"
+            synchronized(sb) { sb.append(line).append('\n') }
+            Log.d("CineFreak", line)
+        }
+
+        fun err(msg: String, e: Throwable?) {
+            log("LỖI $msg: ${e?.javaClass?.simpleName}: ${e?.message}")
+            Log.e("CineFreak", msg, e)
+        }
+
+        /** Copy toàn bộ log vào clipboard (tối đa 1 lần / 3 giây). */
+        fun copy(reason: String) {
+            val now = System.currentTimeMillis()
+            if (now - lastCopy < 3000) return
+            lastCopy = now
+            val text = synchronized(sb) {
+                "CineFreak v$version | $tag | $reason\n" +
+                    "Android ${android.os.Build.VERSION.RELEASE} | ${android.os.Build.MODEL}\n" +
+                    sb.toString()
+            }
+            try {
+                val act = CommonActivity.activity ?: return
+                act.runOnUiThread {
+                    try {
+                        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("CineFreak log", text))
+                        Toast.makeText(act, "CineFreak: đã copy log lỗi ($reason)", Toast.LENGTH_LONG).show()
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
 
     private inline fun <reified T> parseJsonOrNull(text: String): T? =
         runCatching { mapper.readValue<T>(text) }.getOrNull()
@@ -70,6 +132,8 @@ class CineFreakProvider : MainAPI() {
         return if (clean.startsWith("http://") || clean.startsWith("https://")) clean
         else "$mainUrl/${clean.trim('/')}/"
     }
+
+    // ───────────────────────── danh mục / tìm kiếm ─────────────────────────
 
     private data class SearchKeyJson(val k: String? = null)
     private data class SearchJson(val results: List<SearchItem> = emptyList())
@@ -197,138 +261,342 @@ class CineFreakProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val d = Dbg("getMainPage ${request.name} p$page")
         val base = request.data.trim()
         if (!base.matches(Regex("(?i)^https?://[^\\s]+$"))) {
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
-        val pageUrl = if (page <= 1) base else base.trimEnd('/') + "/page/$page/"
-        val response = app.get(pageUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-        var items = cards(response.text, pageUrl)
-        if (items.isEmpty()) {
-            items = runCatching {
-                val indexed = indexSearch("*", page)
-                when {
-                    request.name.equals("Latest Releases", true) -> indexed
-                    request.name.contains("Hindi Dubbed", true) -> indexed.filter { it.name.contains("hindi", true) }
-                    request.name.contains("Hindi", true) -> indexed.filter { it.name.contains("hindi", true) }
-                    request.name.contains("English", true) -> indexed.filter { it.name.contains("english", true) }
-                    request.name.contains("Dual", true) -> indexed.filter { it.name.contains("dual", true) }
-                    request.name.contains("K-Drama", true) -> indexed.filter { isSeries(it.name, it.url) || it.name.contains("Korean", true) }
-                    request.name.contains("Series", true) -> indexed.filter { isSeries(it.name, it.url) }
-                    else -> indexed
-                }
-            }.getOrDefault(emptyList())
+        try {
+            val pageUrl = if (page <= 1) base else base.trimEnd('/') + "/page/$page/"
+            val response = app.get(pageUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+            d.log("GET $pageUrl -> ${response.code}, ${response.text.length} ký tự")
+            var items = cards(response.text, pageUrl)
+            d.log("cards=${items.size}")
+            if (items.isEmpty()) {
+                items = runCatching {
+                    val indexed = indexSearch("*", page)
+                    d.log("indexSearch=${indexed.size}")
+                    when {
+                        request.name.equals("Latest Releases", true) -> indexed
+                        request.name.contains("Hindi Dubbed", true) -> indexed.filter { it.name.contains("hindi", true) }
+                        request.name.contains("Hindi", true) -> indexed.filter { it.name.contains("hindi", true) }
+                        request.name.contains("English", true) -> indexed.filter { it.name.contains("english", true) }
+                        request.name.contains("Dual", true) -> indexed.filter { it.name.contains("dual", true) }
+                        request.name.contains("K-Drama", true) -> indexed.filter { isSeries(it.name, it.url) || it.name.contains("Korean", true) }
+                        request.name.contains("Series", true) -> indexed.filter { isSeries(it.name, it.url) }
+                        else -> indexed
+                    }
+                }.getOrDefault(emptyList())
+            }
+            if (items.isEmpty() && page <= 1) {
+                d.log("Trang chủ trống. Đầu HTML: ${response.text.take(300).replace('\n', ' ')}")
+                d.copy("trang chủ trống")
+            }
+            val hasNext = items.isNotEmpty() &&
+                (response.text.contains("rel=\"next\"", true) ||
+                    response.text.contains("/page/${page + 1}/") || items.size >= 20)
+            return newHomePageResponse(request.name, items, hasNext = hasNext)
+        } catch (e: Throwable) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d.err("getMainPage", e)
+            d.copy("lỗi trang chủ")
+            throw e
         }
-        val hasNext = items.isNotEmpty() &&
-            (response.text.contains("rel=\"next\"", true) ||
-                response.text.contains("/page/${page + 1}/") || items.size >= 20)
-        return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
-        runCatching { searchSiteApi(query) }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
-        runCatching { indexSearch(query) }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
-        val html = app.get(
-            "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}",
-            headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")
-        ).text
-        return cards(html, mainUrl)
-    }
-
-    private fun extractCloudLinks(html: String, pageUrl: String): List<String> {
-        val doc = Jsoup.parse(html, pageUrl)
-        doc.select("div[aria-hidden=true]").remove()
-        val results = LinkedHashSet<String>()
-
-        for (a in doc.select("a[href]")) {
-            val href = absolute(a.attr("href"), pageUrl)
-            if (href.isBlank()) continue
-            val label = (
-                a.text() + " " + a.attr("aria-label") + " " + a.attr("title") +
-                    " " + a.className() + " " + a.id()
-                ).lowercase()
-            if (Regex("telegram|facebook|whatsapp|tutorial|privacy|terms", RegexOption.IGNORE_CASE)
-                    .containsMatchIn("$href $label")) continue
-
-            val host = runCatching { URI(href).host.orEmpty().lowercase() }.getOrDefault("")
-            val path = runCatching { URI(href).path.orEmpty() }.getOrDefault("")
-            val knownCloud = host.contains("cinecloud") || host.contains("neodrive")
-            val cloudRoute = Regex("""/(f|x|w|d|gp|fc|fastdl)/[A-Za-z0-9_-]+""", RegexOption.IGNORE_CASE)
-                .containsMatchIn(path)
-            val playerButton = Regex(
-                "fast.?cloud|instant|resumable|stream.?online|watch.?online|fsl-btn|server-btn|download.?now|instant-download",
-                RegexOption.IGNORE_CASE
-            ).containsMatchIn(label)
-            val directMedia = Regex("""(?i)\.(m3u8|mp4|mkv|webm|mpd)(?:[?#].*)?$""")
-                .containsMatchIn(href)
-
-            if (directMedia || (knownCloud && cloudRoute) || playerButton) results.add(href)
+        val d = Dbg("search '$query'")
+        try {
+            runCatching { searchSiteApi(query) }
+                .onFailure { d.err("searchSiteApi", it) }
+                .getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
+            runCatching { indexSearch(query) }
+                .onFailure { d.err("indexSearch", it) }
+                .getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
+            val html = app.get(
+                "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}",
+                headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")
+            ).text
+            return cards(html, mainUrl)
+        } catch (e: Throwable) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d.err("search", e)
+            d.copy("lỗi tìm kiếm")
+            throw e
         }
-        return results.toList()
     }
+
+    // ───────────────────────── trang chi tiết ─────────────────────────
+
+    private fun firstInt(s: String?): Int? = Regex("""\d+""").find(s.orEmpty())?.value?.toIntOrNull()
 
     override suspend fun load(url: String): LoadResponse? {
-        val response = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-        val doc = Jsoup.parse(response.text, url)
-        val title = cleanTitle(
-            doc.selectFirst("meta[property=og:title]")?.attr("content")
-                ?: doc.selectFirst("h1.entry-title, h1, .post-title")?.text().orEmpty()
-        )
-        if (title.isBlank()) return null
-
-        val poster = doc.selectFirst(
-            "article img[src], .post img[src], .entry-content img[src], img[src*=image.tmdb.org], img[src*=cineimg.xyz]"
-        )?.let {
-            it.absUrl("src").ifBlank { it.absUrl("data-src") }.ifBlank { absolute(it.attr("data-src"), url) }
-        }?.ifBlank { null } ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
-            ?.takeIf { !it.contains("admin-ajax") }?.let { absolute(it, url) }
-
-        val description = doc.selectFirst("meta[property=og:description], meta[name=description]")?.attr("content")
-            ?: doc.selectFirst(".entry-content, .description, .summary")?.text()
-        val year = Regex("""\b(19\d{2}|20\d{2})\b""").find(title)?.value?.toIntOrNull()
-        val tv = isSeries(title, url) || doc.select(".cft-it[data-k]").isNotEmpty()
-        val episodes = mutableListOf<Episode>()
-
-        if (tv) {
-            for (row in doc.select(".cft-it[data-k]")) {
-                val key = row.attr("data-k")
-                val match = Regex("""[ep]s(\d+)e(\d+)(?:-(\d+))?""", RegexOption.IGNORE_CASE).find(key) ?: continue
-                val season = match.groupValues[1].toIntOrNull() ?: 1
-                val ep = match.groupValues[2].toIntOrNull() ?: continue
-                val epName = row.selectFirst(".cft-info b")?.text()?.ifBlank { null } ?: "Episode $ep"
-                val links = extractCloudLinks(row.outerHtml(), url)
-                episodes.add(newEpisode("$epName|||${links.joinToString("|")}|||$url") {
-                    name = epName
-                    this.season = season
-                    episode = ep
-                })
+        val d = Dbg("load")
+        try {
+            val response = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+            val html = response.text
+            d.log("GET $url -> ${response.code}, ${html.length} ký tự")
+            val doc = Jsoup.parse(html, url)
+            val title = cleanTitle(
+                doc.selectFirst("meta[property=og:title]")?.attr("content")
+                    ?: doc.selectFirst("h1.entry-title, h1, .post-title")?.text().orEmpty()
+            )
+            if (title.isBlank()) {
+                d.log("Không đọc được tiêu đề")
+                d.copy("trang chi tiết không có tiêu đề")
+                return null
             }
-        }
 
-        if (episodes.isEmpty()) {
-            val links = extractCloudLinks(response.text, url)
-            episodes.add(newEpisode("$title|||${links.joinToString("|")}|||$url") {
-                name = title
-                season = 1
-                episode = 1
-            })
-        }
+            val poster = doc.selectFirst(
+                "article img[src], .post img[src], .entry-content img[src], img[src*=image.tmdb.org], img[src*=cineimg.xyz]"
+            )?.let {
+                it.absUrl("src").ifBlank { it.absUrl("data-src") }.ifBlank { absolute(it.attr("data-src"), url) }
+            }?.ifBlank { null } ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
+                ?.takeIf { !it.contains("admin-ajax") }?.let { absolute(it, url) }
 
-        return if (tv) {
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                posterUrl = poster
-                plot = description
-                this.year = year
+            val description = doc.selectFirst("meta[property=og:description], meta[name=description]")?.attr("content")
+                ?: doc.selectFirst(".entry-content, .description, .summary")?.text()
+            val year = Regex("""\b(19\d{2}|20\d{2})\b""").find(title)?.value?.toIntOrNull()
+
+            // API phát mới (từ 11/10/2026)
+            val playApi = Regex("""const\s+PLAY_API\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+                ?.replace("\\/", "/").orEmpty()
+            val siteKey = Regex("""const\s+TS_SITE_KEY\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+                ?: defaultTsKey
+            d.log("PLAY_API=${playApi.ifBlank { "(không thấy)" }} siteKey=$siteKey")
+
+            // dataset = {"type":"movie"|"series","sources":"m","seasons":[{season_name,episodes:[{ep_num,ep_title,sources,k}]}]}
+            val datasetNode: JsonNode? = html.indexOf("const dataset = ").let { i ->
+                if (i < 0) null else runCatching {
+                    mapper.readTree(html.substring(i + "const dataset = ".length))
+                }.onFailure { d.err("parse dataset", it) }.getOrNull()
             }
-        } else {
-            newMovieLoadResponse(title, url, TvType.Movie, episodes.first().data) {
-                posterUrl = poster
-                plot = description
-                this.year = year
+            val isSeriesPage = datasetNode?.path("type")?.asText("") == "series" ||
+                (datasetNode == null && isSeries(title, url))
+            d.log("dataset type=${datasetNode?.path("type")?.asText("?")} series=$isSeriesPage")
+
+            fun payload(ep: String) = listOf(playApi, ep, url, siteKey).joinToString("|||")
+
+            val episodes = mutableListOf<Episode>()
+            if (isSeriesPage && datasetNode != null) {
+                val seasons = datasetNode.path("seasons")
+                for (si in 0 until seasons.size()) {
+                    val s = seasons[si]
+                    val seasonNo = firstInt(s.path("season_name").asText("")) ?: (si + 1)
+                    val eps = s.path("episodes")
+                    for (ei in 0 until eps.size()) {
+                        val e = eps[ei]
+                        val src = e.path("sources").asText("")
+                        if (src.isBlank()) continue
+                        val epNo = firstInt(e.path("ep_num").asText("")) ?: (ei + 1)
+                        val label = e.path("ep_title").asText("").ifBlank { "Episode $epNo" }
+                        val isPack = e.path("k").asText("") == "p"
+                        episodes.add(newEpisode(payload(src)) {
+                            this.name = if (isPack) "$label (pack)" else label
+                            this.season = seasonNo
+                            this.episode = epNo
+                        })
+                    }
+                }
+                d.log("episodes=${episodes.size}")
             }
+
+            if (episodes.isEmpty() && isSeriesPage) {
+                d.log("Series nhưng không có tập")
+                d.copy("không đọc được danh sách tập")
+            }
+
+            return if (isSeriesPage && episodes.isNotEmpty()) {
+                newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                    posterUrl = poster
+                    plot = description
+                    this.year = year
+                }
+            } else {
+                val ep = datasetNode?.path("sources")?.asText("")?.ifBlank { null } ?: "m"
+                newMovieLoadResponse(title, url, TvType.Movie, payload(ep)) {
+                    posterUrl = poster
+                    plot = description
+                    this.year = year
+                }
+            }
+        } catch (e: Throwable) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d.err("load", e)
+            d.copy("lỗi trang chi tiết")
+            throw e
         }
     }
+
+    // ───────────────────────── phát: PLAY_API ─────────────────────────
+
+    private class PlayResp(val status: Int, val state: String, val url: String, val need: String, val message: String, val raw: String)
+
+    private fun parsePlay(status: Int, text: String): PlayResp {
+        val n = runCatching { mapper.readTree(text) }.getOrNull()
+        return PlayResp(
+            status = status,
+            state = n?.path("state")?.asText("").orEmpty(),
+            url = n?.path("url")?.asText("").orEmpty(),
+            need = n?.path("need")?.asText("").orEmpty(),
+            message = n?.path("message")?.asText("").orEmpty(),
+            raw = text.take(300)
+        )
+    }
+
+    /** Tầng A: gọi thẳng bằng HTTP (chỉ chạy được khi web chưa đòi Turnstile / cho phép fallback). */
+    private suspend fun playHttp(d: Dbg, api: String, ep: String, pageUrl: String): PlayResp? {
+        return try {
+            val r = app.post(
+                api,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to pageUrl,
+                    "Origin" to mainUrl,
+                    "Accept" to "application/json"
+                ),
+                data = mapOf("op" to "play", "ep" to ep, "tsfb" to "none")
+            )
+            val p = parsePlay(r.code, r.text)
+            d.log("A) HTTP play -> ${p.status} state='${p.state}' need='${p.need}' msg='${p.message}' raw=${p.raw.take(120)}")
+            p
+        } catch (e: Throwable) {
+            d.err("A) HTTP play", e)
+            null
+        }
+    }
+
+    private fun playScript(api: String, ep: String, siteKey: String): String = """
+(function(){
+ if (window.__cfgo) return; window.__cfgo = 1;
+ var API = __API__, EP = __EP__, KEY = __KEY__, trace = [], t0 = Date.now(), finished = false;
+ function T(s){ trace.push(((Date.now()-t0)/1000).toFixed(1)+'s '+s); }
+ function beacon(o){
+   if (finished) return; finished = true;
+   o.trace = trace;
+   var s = encodeURIComponent(JSON.stringify(o));
+   if (s.length > 7000) { o.trace = trace.slice(-6); s = encodeURIComponent(JSON.stringify(o)); }
+   var i = new Image(); i.src = 'https://cfresult.invalid/r?d=' + s;
+ }
+ function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+ function post(op, ts, extra){
+   var b = new URLSearchParams({op: op, ep: EP});
+   if (ts) b.set('ts', ts);
+   if (extra) for (var k in extra) b.set(k, extra[k]);
+   return fetch(API, {method:'POST', body:b, cache:'no-store', credentials:'same-origin'}).then(function(r){
+     return r.text().then(function(t){ var j = null; try { j = JSON.parse(t); } catch(e) {}
+       return {status: r.status, j: j, raw: j ? null : t.slice(0,200)}; });
+   });
+ }
+ function loadTs(){
+   return new Promise(function(res, rej){
+     if (window.turnstile && window.turnstile.render) return res(window.turnstile);
+     var s = document.createElement('script');
+     s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+     s.async = true;
+     s.onload = function(){ res(window.turnstile); };
+     s.onerror = function(){ rej(new Error('ts-load')); };
+     document.head.appendChild(s);
+   });
+ }
+ function tsToken(){
+   return loadTs().then(function(ts){
+     return new Promise(function(res, rej){
+       var box = document.createElement('div');
+       box.style.cssText = 'position:fixed;left:0;top:0;z-index:99999;background:#000;padding:8px';
+       document.body.appendChild(box);
+       var tries = 0, wid = null;
+       var tm = setTimeout(function(){ rej(new Error('ts-timeout')); }, 60000);
+       wid = ts.render(box, {
+         sitekey: KEY, appearance: 'interaction-only', theme: 'dark', retry: 'never',
+         callback: function(tok){ clearTimeout(tm); res(tok); },
+         'error-callback': function(c){
+           if (++tries < 3) { setTimeout(function(){ try { ts.reset(wid); } catch(e) {} }, 1500); }
+           else { clearTimeout(tm); rej(new Error('ts-error:' + c)); }
+           return true;
+         },
+         'timeout-callback': function(){ try { ts.reset(wid); } catch(e) {} },
+         'unsupported-callback': function(){ clearTimeout(tm); rej(new Error('ts-unsupported')); }
+       });
+     });
+   });
+ }
+ function brief(x){ return x.status + ' ' + JSON.stringify(x.j || x.raw).slice(0, 160); }
+ async function main(){
+   try {
+     var ts = null;
+     var x = await post('play'); T('play ' + brief(x));
+     if (x.status === 401 && x.j && x.j.need === 'ts') {
+       try { ts = await tsToken(); T('turnstile ok'); x = await post('play', ts); T('play+ts ' + brief(x)); }
+       catch(e) { T('turnstile fail ' + e.message); x = await post('play', null, {tsfb: String(e.message).slice(0, 20)}); T('fallback ' + brief(x)); }
+     }
+     var n = 0;
+     while (x.j && x.j.state === 'uploading' && n++ < 24) {
+       await wait(4000);
+       x = await post('stat', ts); T('stat ' + brief(x));
+     }
+     beacon({status: x.status, j: x.j, raw: x.raw});
+   } catch(e) { T('exception ' + e); beacon({err: String(e)}); }
+ }
+ setTimeout(function(){ beacon({err: 'script-timeout'}); }, 140000);
+ main();
+})();
+""".trimIndent()
+        .replace("__API__", JSONObject.quote(api))
+        .replace("__EP__", JSONObject.quote(ep))
+        .replace("__KEY__", JSONObject.quote(siteKey))
+
+    /** Tầng B: chạy đúng đoạn JS của web trong WebView (có Turnstile) rồi nhận kết quả qua "beacon". */
+    private suspend fun playWebView(d: Dbg, api: String, ep: String, siteKey: String, pageUrl: String): PlayResp? {
+        return try {
+            d.log("B) WebView mở $pageUrl (ep=$ep)")
+            val resolver = WebViewResolver(
+                interceptUrl = Regex("""cfresult\.invalid/r\?"""),
+                additionalUrls = emptyList(),
+                userAgent = null,
+                useOkhttp = false,
+                script = playScript(api, ep, siteKey),
+                scriptCallback = { d.log("B) script trả về: ${it.take(80)}") },
+                timeout = 150_000L
+            )
+            val (req, _) = resolver.resolveUsingWebView(
+                Request.Builder().url(pageUrl).header("Referer", "$mainUrl/").build()
+            )
+            if (req == null) {
+                d.log("B) WebView hết thời gian, không nhận được kết quả")
+                return null
+            }
+            val raw = req.url.queryParameter("d").orEmpty()
+            val n = runCatching { mapper.readTree(raw) }.getOrNull()
+            if (n == null) {
+                d.log("B) beacon không đọc được: ${raw.take(200)}")
+                return null
+            }
+            val trace = n.path("trace")
+            for (i in 0 until trace.size()) d.log("   js: ${trace[i].asText()}")
+            if (n.has("err")) {
+                d.log("B) JS báo lỗi: ${n.path("err").asText()}")
+                return null
+            }
+            val j = n.path("j")
+            val p = PlayResp(
+                status = n.path("status").asInt(0),
+                state = j.path("state").asText(""),
+                url = j.path("url").asText(""),
+                need = j.path("need").asText(""),
+                message = j.path("message").asText(""),
+                raw = n.path("raw").asText("").ifBlank { j.toString().take(300) }
+            )
+            d.log("B) kết quả: status=${p.status} state='${p.state}' need='${p.need}' msg='${p.message}' url=${p.url.take(120)}")
+            p
+        } catch (e: Throwable) {
+            d.err("B) WebView play", e)
+            null
+        }
+    }
+
+    // ───────────────────────── vidzer ─────────────────────────
 
     private fun decodeB64Url(value: String): ByteArray {
         val normalized = value.replace('-', '+').replace('_', '/')
@@ -339,7 +607,7 @@ class CineFreakProvider : MainAPI() {
     private fun decryptVidzer(encrypted: String, qk: String): String {
         val key = decodeB64Url(qk.reversed())
         val input = decodeB64Url(encrypted)
-        require(key.size == 16 || key.size == 24 || key.size == 32) { "Invalid AES key size" }
+        require(key.size == 16 || key.size == 24 || key.size == 32) { "Invalid AES key size ${key.size}" }
         require(input.size > 12) { "Encrypted Vidzer payload too short" }
         val iv = input.copyOfRange(0, 12)
         val ciphertext = input.copyOfRange(12, input.size)
@@ -348,232 +616,143 @@ class CineFreakProvider : MainAPI() {
         return cipher.doFinal(ciphertext).toString(Charsets.UTF_8)
     }
 
-    private fun isCineCloudFile(url: String): Boolean = runCatching {
-        val uri = URI(url)
-        uri.host.orEmpty().contains("cinecloud", true) &&
-            uri.path.orEmpty().matches(Regex("""/f/[A-Za-z0-9_-]+/?"""))
-    }.getOrDefault(false)
+    private suspend fun emit(
+        url: String,
+        referer: String,
+        label: String,
+        quality: Int,
+        headers: Map<String, String>,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+        callback(
+            newExtractorLink(source = name, name = label, url = url, type = type) {
+                this.referer = referer
+                this.quality = if (quality > 0) quality else Qualities.Unknown.value
+                this.headers = headers
+            }
+        )
+    }
 
-    /**
-     * Attempts to resolve CineCloud /f/... to Vidzer and decrypt its /q/... response.
-     * The site's actual response schema can change; failures return false and allow the
-     * existing generic extractor route to run.
-     */
-    private suspend fun resolveVidzer(
-        inputUrl: String,
+    /** Tầng C1: đọc trang trình phát vidzer bằng HTTP (qk + apiUrl + AES-GCM). */
+    private suspend fun vidzerHttp(
+        d: Dbg,
+        playerUrl: String,
+        pageUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val fileUrl = inputUrl.substringBefore('#')
         try {
-            val page = app.get(fileUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-            if (page.code !in 200..299) return false
+            val url = if (playerUrl.contains("?")) playerUrl else "$playerUrl?autoplay=1"
+            val page = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
             val html = page.text
-            if (html.contains("cf-turnstile", true) || html.contains("Just a moment...", true)) return false
-
-            val doc = Jsoup.parse(html, fileUrl)
-            val csrf = sequenceOf(
-                doc.selectFirst("meta[name=csrf-token]")?.attr("content"),
-                doc.selectFirst("meta[name=_token]")?.attr("content"),
-                doc.selectFirst("input[name=_token]")?.attr("value"),
-                Regex("""["']X-CSRF-TOKEN["']\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.getOrNull(1)
-            ).firstOrNull { !it.isNullOrBlank() }.orEmpty()
-            if (csrf.isBlank()) {
-                Log.w("CineFreak", "Vidzer: CSRF token not found")
+            d.log("C1) vidzer GET -> ${page.code}, ${html.length} ký tự")
+            if (page.code !in 200..299) {
+                d.log("C1) đầu HTML: ${html.take(200).replace('\n', ' ')}")
                 return false
             }
-
-            val origin = runCatching { URI(fileUrl).let { "${it.scheme}://${it.host}" } }.getOrDefault(mainUrl)
-            val play = app.post(
-                fileUrl,
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to fileUrl,
-                    "Origin" to origin,
-                    "Accept" to "application/json",
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "X-CSRF-TOKEN" to csrf
-                ),
-                data = mapOf("a" to "play", "X-CSRF-TOKEN" to csrf)
-            )
-            if (play.code !in 200..299) return false
-
-            val playText = play.text.replace("\\/", "/")
-            val vidzerUrl = Regex(
-                """https?://(?:www\.)?vidzer\.me/w/[A-Za-z0-9_-]+(?:\?[^\s"'<>]*)?""",
-                RegexOption.IGNORE_CASE
-            ).find(playText)?.value ?: findUrlNode(runCatching { mapper.readTree(playText) }.getOrNull())
-            if (vidzerUrl.isNullOrBlank()) {
-                Log.w("CineFreak", "Vidzer URL not found in CineCloud play response")
-                return false
-            }
-
-            val playerUrl = absolute(vidzerUrl, fileUrl)
-            val player = app.get(
-                playerUrl,
-                headers = mapOf("User-Agent" to userAgent, "Referer" to fileUrl)
-            )
-            if (player.code !in 200..299) return false
-
-            val playerHtml = player.text
-            val qk = Regex("""\bqk\s*:\s*["']([^"']+)["']""").find(playerHtml)?.groupValues?.getOrNull(1)
-                ?: Regex("""["']qk["']\s*:\s*["']([^"']+)["']""").find(playerHtml)?.groupValues?.getOrNull(1)
-            val apiPath = Regex("""\bapiUrl\s*:\s*["']([^"']+)["']""").find(playerHtml)?.groupValues?.getOrNull(1)
-                ?: Regex("""["']apiUrl["']\s*:\s*["']([^"']+)["']""").find(playerHtml)?.groupValues?.getOrNull(1)
+            val qk = Regex("""\bqk\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.getOrNull(1)
+                ?: Regex("""["']qk["']\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.getOrNull(1)
+            val apiPath = Regex("""\bapiUrl\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.getOrNull(1)
+                ?: Regex("""["']apiUrl["']\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.getOrNull(1)
             if (qk.isNullOrBlank() || apiPath.isNullOrBlank()) {
-                Log.w("CineFreak", "Vidzer qk/apiUrl missing")
+                d.log("C1) thiếu qk/apiUrl (qk=${!qk.isNullOrBlank()}, api=${!apiPath.isNullOrBlank()}). Đầu HTML: ${html.take(300).replace('\n', ' ')}")
+                // thử tìm link media ngay trong HTML
+                val direct = Regex("""https?:[^"'\s<>\\]+\.(?:m3u8|mp4|mkv|webm)[^"'\s<>\\]*""", RegexOption.IGNORE_CASE)
+                    .find(html.replace("\\/", "/"))?.value
+                if (direct != null) {
+                    d.log("C1) tìm thấy media trong HTML: ${direct.take(120)}")
+                    emit(direct, url, "Vidzer", 0, mapOf("Referer" to url, "User-Agent" to userAgent), callback)
+                    return true
+                }
                 return false
             }
 
-            val apiUrl = absolute(apiPath, playerUrl)
+            val apiUrl = absolute(apiPath, url)
             val api = app.get(
                 apiUrl,
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to playerUrl,
-                    "Accept" to "application/json"
-                )
+                headers = mapOf("User-Agent" to userAgent, "Referer" to url, "Accept" to "application/json")
             )
+            d.log("C1) api GET $apiUrl -> ${api.code}, ${api.text.length} ký tự")
             if (api.code !in 200..299) return false
 
             val raw = api.text.trim()
             val payload = if (raw.startsWith("{")) raw else decryptVidzer(raw.substringAfterLast('.', raw), qk)
             val root = mapper.readTree(payload)
+            d.log("C1) payload keys=${root.fieldNames().asSequence().toList()}")
             val videoUrl = root.path("videoUrl").asText("").ifBlank {
                 if (root.path("video").isTextual) root.path("video").asText("") else root.path("video").path("url").asText("")
             }
-            if (!videoUrl.startsWith("http://", true) && !videoUrl.startsWith("https://", true)) return false
+            if (!videoUrl.startsWith("http://", true) && !videoUrl.startsWith("https://", true)) {
+                d.log("C1) không có videoUrl hợp lệ")
+                return false
+            }
 
             val resolutionNodes = root.path("resolutions")
             var quality = 0
             for (i in 0 until resolutionNodes.size()) {
                 val item = resolutionNodes[i]
                 if (item.path("url").asText() == videoUrl) {
-                    quality = Regex("""\d+""").find(item.path("quality").asText(""))?.value?.toIntOrNull() ?: 0
+                    quality = firstInt(item.path("quality").asText("")) ?: 0
                     break
                 }
             }
-
             val subtitles = root.path("subtitleTracks")
             for (i in 0 until subtitles.size()) {
                 val item = subtitles[i]
-                val subtitleUrl = absolute(item.path("url").asText(""), playerUrl)
+                val subtitleUrl = absolute(item.path("url").asText(""), url)
                 if (subtitleUrl.isNotBlank()) {
                     subtitleCallback(SubtitleFile(item.path("language").asText("en"), subtitleUrl))
                 }
             }
-
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "Vidzer${if (quality > 0) " ${quality}p" else ""}",
-                    url = videoUrl,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = playerUrl
-                    this.quality = if (quality > 0) quality else Qualities.Unknown.value
-                    this.headers = mapOf("Referer" to playerUrl, "User-Agent" to userAgent)
-                }
+            emit(
+                videoUrl, url, "Vidzer${if (quality > 0) " ${quality}p" else ""}", quality,
+                mapOf("Referer" to url, "User-Agent" to userAgent), callback
             )
-            Log.d("CineFreak", "Vidzer resolved (quality=$quality)")
+            d.log("C1) OK quality=$quality url=${videoUrl.take(120)}")
             return true
-        } catch (e: Exception) {
-            Log.e("CineFreak", "Vidzer resolution failed", e)
+        } catch (e: Throwable) {
+            d.err("C1) vidzerHttp", e)
             return false
         }
     }
 
-    private fun findUrlNode(node: JsonNode?): String? {
-        if (node == null) return null
-        if (node.isTextual) {
-            val value = node.asText()
-            if (value.startsWith("http", true) && value.contains("vidzer.me/w/", true)) return value
-        }
-        if (node.isObject) {
-            val fields = node.fields()
-            while (fields.hasNext()) {
-                val found = findUrlNode(fields.next().value)
-                if (found != null) return found
+    /** Tầng C2: mở trình phát vidzer trong WebView, bắt request video thật. */
+    private suspend fun vidzerWebView(d: Dbg, playerUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
+        return try {
+            val url = if (playerUrl.contains("?")) playerUrl else "$playerUrl?autoplay=1"
+            d.log("C2) WebView mở trình phát $url")
+            val resolver = WebViewResolver(
+                interceptUrl = Regex("""(?i)\.(m3u8|mp4|mkv|webm)(\?|$)"""),
+                additionalUrls = emptyList(),
+                userAgent = null,
+                useOkhttp = false,
+                script = null,
+                scriptCallback = null,
+                timeout = 60_000L
+            )
+            val (req, _) = resolver.resolveUsingWebView(
+                Request.Builder().url(url).header("Referer", "$mainUrl/").build()
+            )
+            if (req == null) {
+                d.log("C2) không bắt được request video")
+                return false
             }
+            val media = req.url.toString()
+            d.log("C2) bắt được ${media.take(150)}")
+            val hdr = HashMap<String, String>()
+            for (n in req.headers.names()) hdr[n] = req.header(n).orEmpty()
+            if (!hdr.containsKey("Referer")) hdr["Referer"] = url
+            if (!hdr.containsKey("User-Agent")) hdr["User-Agent"] = userAgent
+            emit(media, url, "Vidzer (WebView)", 0, hdr, callback)
+            true
+        } catch (e: Throwable) {
+            d.err("C2) vidzerWebView", e)
+            false
         }
-        if (node.isArray) {
-            for (child in node) {
-                val found = findUrlNode(child)
-                if (found != null) return found
-            }
-        }
-        return null
     }
 
-    private suspend fun emitDirect(
-        url: String,
-        referer: String,
-        label: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) return false
-        val type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-        callback(
-            newExtractorLink(source = name, name = label, url = url, type = type) {
-                this.referer = referer
-                this.quality = when {
-                    Regex("(?i)(2160|4k)").containsMatchIn(url) -> 2160
-                    Regex("(?i)1080").containsMatchIn(url) -> 1080
-                    Regex("(?i)720").containsMatchIn(url) -> 720
-                    Regex("(?i)480").containsMatchIn(url) -> 480
-                    else -> Qualities.Unknown.value
-                }
-                this.headers = mapOf("Referer" to referer, "User-Agent" to userAgent)
-            }
-        )
-        return true
-    }
-
-    private suspend fun resolveCloudPage(
-        inputUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val fileUrl = inputUrl.substringBefore('#')
-        val response = runCatching {
-            app.get(fileUrl, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to userAgent))
-        }.getOrNull() ?: return false
-        if (response.code !in 200..299) return false
-        val html = response.text
-        if (html.contains("cf-turnstile", true) || html.contains("Just a moment...", true)) return false
-
-        val doc = Jsoup.parse(html, fileUrl)
-        val targets = doc.select("a[href]").mapNotNull { a ->
-            val href = absolute(a.attr("href"), fileUrl)
-            val label = (a.text() + " " + a.attr("aria-label") + " " + a.className()).lowercase()
-            if (href.isBlank() || href == fileUrl) null
-            else if (Regex("telegram|facebook|tutorial|privacy", RegexOption.IGNORE_CASE).containsMatchIn(label)) null
-            else if (
-                Regex("fast cloud|instant|resumable|stream online|watch online|download now", RegexOption.IGNORE_CASE).containsMatchIn(label) ||
-                Regex("""/(x|w|d|gp|f|fc|fastdl)/[A-Za-z0-9_-]+""", RegexOption.IGNORE_CASE).containsMatchIn(href) ||
-                Regex("""(?i)\.(m3u8|mp4|mkv|webm)(?:[?#].*)?$""").containsMatchIn(href)
-            ) href to label else null
-        }.distinctBy { it.first }.take(12)
-
-        var found = false
-        for ((target, label) in targets) {
-            try {
-                if (Regex("""(?i)\.(m3u8|mp4|mkv|webm)(?:[?#].*)?$""").containsMatchIn(target) ||
-                    target.contains("r2.dev", true) || target.contains("workers.dev", true) ||
-                    target.contains("googleusercontent.com", true)) {
-                    found = emitDirect(target, fileUrl, "CineFreak · ${label.ifBlank { "Direct" }}", callback) || found
-                } else {
-                    loadExtractor(target, fileUrl, subtitleCallback) { extracted ->
-                        callback(extracted)
-                        found = true
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("CineFreak", "Cloud extractor failed: $target", e)
-            }
-        }
-        return found
-    }
+    // ───────────────────────── loadLinks ─────────────────────────
 
     override suspend fun loadLinks(
         data: String,
@@ -581,103 +760,49 @@ class CineFreakProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|||", limit = 3)
-        var pageUrl = parts.getOrNull(2).orEmpty().takeIf { it.startsWith("http", true) }
-        val rawLinks = parts.getOrNull(1).orEmpty().split('|')
-            .filter { it.startsWith("http://", true) || it.startsWith("https://", true) }
-        val links = LinkedHashSet<String>()
-        links.addAll(rawLinks)
-
-        if (pageUrl == null && parts.firstOrNull().orEmpty().startsWith("http", true)) {
-            pageUrl = parts.first()
-        }
-        if (pageUrl != null) {
-            runCatching {
-                val page = app.get(pageUrl, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to userAgent))
-                links.addAll(extractCloudLinks(page.text, pageUrl))
-                val doc = Jsoup.parse(page.text, pageUrl)
-                doc.select("video[src], source[src]").forEach { el ->
-                    val src = el.absUrl("src")
-                    if (src.startsWith("http", true)) links.add(src)
-                }
-                Regex("""(?i)["'](?:file|src|source|url|hls|videoUrl)["']\s*[:=]\s*["']([^"']+\.(?:m3u8|mp4|mkv|webm)(?:\?[^"']*)?)["']""")
-                    .findAll(page.text.replace("\\/", "/"))
-                    .forEach { links.add(absolute(it.groupValues[1], pageUrl)) }
-            }.onFailure { Log.e("CineFreak", "Failed to reread page", it) }
-        }
+        val d = Dbg("loadLinks")
+        val parts = data.split("|||")
+        val api = parts.getOrNull(0).orEmpty()
+        val ep = parts.getOrNull(1).orEmpty()
+        val pageUrl = parts.getOrNull(2).orEmpty()
+        val siteKey = parts.getOrNull(3)?.ifBlank { null } ?: defaultTsKey
+        d.log("data: api=${api.ifBlank { "(trống)" }} ep=$ep page=$pageUrl")
 
         var found = false
-        val seen = mutableSetOf<String>()
-
-        Log.d("CineFreak", "ENTER processing: ${links.size} links")
-        Log.d("CineFreak", "Page URL: $pageUrl")
-
-        for (link in links) {
-            if (!seen.add(link)) {
-                Log.d("CineFreak", "SKIP duplicate: $link")
-                continue
-            }
-
-        Log.d("CineFreak", "PROCESS link: $link")
-
+        var reason = "không có link"
         try {
-            if (isCineCloudFile(link)) {
-                Log.d("CineFreak", "MATCH CineCloud: $link")
-    
-                Log.d("CineFreak", "BEFORE resolveVidzer")
-                val resolved = resolveVidzer(link, subtitleCallback, callback)
-                Log.d("CineFreak", "AFTER resolveVidzer: $resolved")
-    
-                found = resolved || found
-
-                if (!resolved) {
-                    Log.d("CineFreak", "BEFORE resolveCloudPage")
-                    val cloudResolved =
-                        resolveCloudPage(link, subtitleCallback, callback)
-                    Log.d("CineFreak", "AFTER resolveCloudPage: $cloudResolved")
-    
-                    found = cloudResolved || found
-                }
-            } else if (
-                Regex("""(?i)\.(m3u8|mp4|mkv|webm|mpd)(?:[?#].*)?$""")
-                    .containsMatchIn(link) ||
-                link.contains("googleusercontent.com", true) ||
-                link.contains("workers.dev", true) ||
-                link.contains("r2.dev", true) ||
-                link.contains("r2.cloudflarestorage.com", true) ||
-                link.contains("pixeldrain", true)
-            ) {
-                Log.d("CineFreak", "MATCH direct media")
-                found = emitDirect(
-                    link,
-                    pageUrl ?: "$mainUrl/",
-                    "CineFreak",
-                    callback
-                ) || found
-            } else if (
-                link.contains("cinecloud", true) ||
-                link.contains("neodrive", true)
-            ) {
-                Log.d("CineFreak", "MATCH generic cloud: $link")
-                val cloudResolved =
-                    resolveCloudPage(link, subtitleCallback, callback)
-                Log.d("CineFreak", "Generic cloud result: $cloudResolved")
-                found = cloudResolved || found
+            if (api.isBlank() || ep.isBlank() || !pageUrl.startsWith("http")) {
+                reason = "dữ liệu tập phim cũ/thiếu - hãy mở lại phim (tải lại trang chi tiết)"
+                d.log(reason)
             } else {
-                Log.d("CineFreak", "BEFORE loadExtractor: $link")
-                loadExtractor(link, pageUrl ?: "$mainUrl/", subtitleCallback) {
-                    callback(it)
-                    found = true
+                var resp = playHttp(d, api, ep, pageUrl)
+                if (resp == null || resp.state != "ready" || resp.url.isBlank()) {
+                    resp = playWebView(d, api, ep, siteKey, pageUrl)
                 }
-                Log.d("CineFreak", "AFTER loadExtractor: $link")
+                when {
+                    resp == null -> reason = "không gọi được API phát (WebView/Turnstile thất bại)"
+                    resp.state == "ready" && resp.url.isNotBlank() -> {
+                        val playerUrl = absolute(resp.url, pageUrl)
+                        d.log("Trình phát: $playerUrl")
+                        found = vidzerHttp(d, playerUrl, pageUrl, subtitleCallback, callback)
+                        if (!found) found = vidzerWebView(d, playerUrl, callback)
+                        if (!found) reason = "đã có địa chỉ vidzer nhưng không lấy được video"
+                    }
+                    else -> reason = "API phát trả state='${resp.state}' need='${resp.need}' ${resp.message}".trim()
+                }
             }
-        } catch (e: Exception) {
-            Log.e("CineFreak", "Candidate failed: $link", e)
+        } catch (e: Throwable) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d.err("loadLinks", e)
+            reason = "ngoại lệ: ${e.message}"
         }
-    }
 
-    Log.d("CineFreak", "EXIT processing; found=$found; count=${links.size}")
-    return found
-            return found
+        if (!found) {
+            d.log("KẾT QUẢ: thất bại - $reason")
+            d.copy(reason)
+        } else {
+            d.log("KẾT QUẢ: có link")
         }
+        return found
     }
+}
