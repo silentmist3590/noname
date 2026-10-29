@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class MoviesApiPlugin : Plugin() {
     override fun load(context: Context) {
+        DebugLog.init(context)
         registerMainAPI(MoviesApiProvider())
     }
 }

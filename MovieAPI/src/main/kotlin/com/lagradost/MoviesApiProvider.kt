@@ -11,10 +11,8 @@ import java.net.URLEncoder
  * Plugin cho https://moviesapi.to
  *
  * - Danh sách/tìm kiếm: /api/discover/{movies|tv|views}
- * - Phát: moviesapi.to chỉ có trang embed (iframe) -> dùng WebViewResolver để bắt link .m3u8
- *     movie: https://moviesapi.to/movie/{id}
- *     tv   : https://moviesapi.to/tv/{id}/{season}/{episode}
- *   {id} = TMDB id hoặc IMDb id (tt1234567)
+ * - Phát: trang embed gọi /api/vidora/v1/movie/{id}  (xem logcat) -> thử gọi thẳng API này,
+ *   nếu không ra link thì mở trang embed bằng WebView, tự bấm play và bắt request .m3u8.
  */
 class MoviesApiProvider : MainAPI() {
     override var mainUrl = "https://moviesapi.to"
@@ -25,6 +23,7 @@ class MoviesApiProvider : MainAPI() {
 
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
+    private val imgExt = Regex("""\.(jpe?g|png|webp|avif)(\?.*)?$""", RegexOption.IGNORE_CASE)
 
     override val mainPage = mainPageOf(
         "$mainUrl/api/discover/views?type=movie&views=day" to "Trending Movies (Today)",
@@ -39,11 +38,11 @@ class MoviesApiProvider : MainAPI() {
     // ------------------------------------------------------------------ helpers
 
     private suspend fun getJson(url: String, referer: String? = "$mainUrl/"): JsonNode? = try {
-        mapper.readTree(
-            app.get(url, headers = mapOf("Accept" to "application/json"), referer = referer).text
-        )
+        val text = app.get(url, headers = mapOf("Accept" to "application/json"), referer = referer).text
+        DebugLog.log("http", "GET $url -> ${text.length}b: ${text.take(500)}")
+        mapper.readTree(text)
     } catch (e: Exception) {
-        e.printStackTrace()
+        DebugLog.error("http", "GET $url thất bại", e)
         null
     }
 
@@ -66,6 +65,46 @@ class MoviesApiProvider : MainAPI() {
             get(k)?.takeIf { !it.isNull && !it.isContainerNode }?.asText()?.takeIf { it.isNotBlank() }
         }
 
+    /**
+     * Tự dò ảnh trong JSON mà không cần biết tên field:
+     * ưu tiên key chứa "poster"/"thumb"/"cover"/"image", chấp nhận giá trị có đuôi ảnh.
+     * Với backdrop thì ưu tiên key chứa "backdrop"/"banner"/"background".
+     */
+    private fun JsonNode.findImage(backdrop: Boolean = false, depth: Int = 0): String? {
+        if (!isObject || depth > 2) return null
+        fun isBack(k: String) = k.contains("backdrop") || k.contains("banner") || k.contains("background")
+        val keys = fieldNames().asSequence().toList().sortedBy { k ->
+            val l = k.lowercase()
+            when {
+                backdrop && isBack(l) -> 0
+                !backdrop && l.contains("poster") -> 0
+                !backdrop && (l.contains("thumb") || l.contains("cover") || l == "image" || l.contains("img")) -> 1
+                else -> 2
+            }
+        }
+        for (k in keys) {
+            val l = k.lowercase()
+            if (!backdrop && isBack(l)) continue
+            if (backdrop && !isBack(l)) continue
+            val v = get(k) ?: continue
+            if (v.isTextual) {
+                val s = v.asText()
+                if (s.isNotBlank() && (imgExt.containsMatchIn(s) || l.contains("poster") || l.contains("backdrop"))) return s
+            } else if (v.isObject) {
+                v.findImage(false, depth + 1)?.let { return it }
+            }
+        }
+        // chế độ poster: không thấy key rõ ràng -> lấy bất kỳ chuỗi nào có đuôi ảnh (trừ backdrop)
+        if (!backdrop) {
+            for (k in keys) {
+                if (isBack(k.lowercase())) continue
+                val v = get(k) ?: continue
+                if (v.isTextual && imgExt.containsMatchIn(v.asText())) return v.asText()
+            }
+        }
+        return null
+    }
+
     private fun img(p: String?, size: String = "w500"): String? = when {
         p.isNullOrBlank() -> null
         p.startsWith("http") -> p
@@ -80,7 +119,7 @@ class MoviesApiProvider : MainAPI() {
     private fun JsonNode.toSearch(isTv: Boolean): SearchResponse? {
         val id = mediaId() ?: return null
         val title = str("title", "name", "original_title") ?: return null
-        val poster = img(str("poster", "poster_path", "poster_url", "image", "cover"))
+        val poster = img(findImage())
         val year = (str("year") ?: str("release_date", "first_air_date", "released"))
             ?.take(4)?.toIntOrNull()
         return if (isTv) {
@@ -102,7 +141,16 @@ class MoviesApiProvider : MainAPI() {
         val sep = if (request.data.contains("?")) "&" else "?"
         val url = "${request.data}${sep}page=$page&resultsPerPage=30"
         val isTv = request.data.contains("/discover/tv") || request.data.contains("type=tv")
-        val list = getJson(url)?.items().orEmpty().mapNotNull { it.toSearch(isTv) }
+        val raw = getJson(url)?.items().orEmpty()
+        val list = raw.mapNotNull { it.toSearch(isTv) }
+
+        if (raw.isEmpty()) {
+            DebugLog.error("main", "Không đọc được danh sách từ $url")
+        } else if (list.isEmpty()) {
+            DebugLog.error("main", "Có ${raw.size} item nhưng thiếu tmdb_id/imdb_id. Item đầu: ${raw.first()}")
+        } else if (list.all { it.posterUrl == null }) {
+            DebugLog.error("main", "Không tìm thấy poster. Item đầu: ${raw.first()}")
+        }
         return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
     }
 
@@ -173,6 +221,7 @@ class MoviesApiProvider : MainAPI() {
                 }
             }
         }
+        if (eps.isEmpty()) DebugLog.error("load", "Không dựng được danh sách tập cho id=$id (imdb=$imdbId)")
         return eps.sortedWith(compareBy({ it.season }, { it.episode }))
     }
 
@@ -180,7 +229,6 @@ class MoviesApiProvider : MainAPI() {
         val m = Regex("""/(movie|tv)/([^/?#]+)""").find(url) ?: return null
         val isTv = m.groupValues[1] == "tv"
         val rawId = m.groupValues[2]
-        // Hỗ trợ cả dạng hyphen /tv/66732-5-3 -> lấy phần id
         val id = if (isTv) rawId.substringBefore("-") else rawId
         val isImdb = id.startsWith("tt")
 
@@ -192,10 +240,11 @@ class MoviesApiProvider : MainAPI() {
         }
         val endpoint = if (isTv) "tv" else "movies"
         val node = getJson("$mainUrl/api/discover/$endpoint?$param=$id")?.items()?.firstOrNull()
+        if (node == null) DebugLog.error("load", "Không có dữ liệu chi tiết cho $endpoint $param=$id")
 
         val title = node?.str("title", "name", "original_title") ?: id
-        val poster = img(node?.str("poster", "poster_path", "poster_url", "image", "cover"))
-        val backdrop = img(node?.str("backdrop", "backdrop_path", "banner"), "w1280")
+        val poster = img(node?.findImage())
+        val backdrop = img(node?.findImage(backdrop = true), "w1280")
         val plot = node?.str("overview", "plot", "description", "synopsis")
         val year = node?.let { (it.str("year") ?: it.str("release_date", "first_air_date"))?.take(4)?.toIntOrNull() }
         val imdbId = node?.str("imdb_id", "imdbid", "imdbId") ?: id.takeIf { isImdb }
@@ -227,26 +276,101 @@ class MoviesApiProvider : MainAPI() {
 
     // ------------------------------------------------------------------ links
 
+    /** Trang embed -> endpoint API mà player của moviesapi.to gọi (thấy trong logcat). */
+    private fun vidoraUrl(embed: String): String? {
+        val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return null
+        val type = m.groupValues[1]
+        val id = m.groupValues[2]
+        return when {
+            type == "movie" -> "$mainUrl/api/vidora/v1/movie/$id"
+            m.groupValues[3].isNotEmpty() -> "$mainUrl/api/vidora/v1/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
+            else -> null
+        }
+    }
+
+    // Tự bấm play (trong WebView không có thao tác người dùng nên player không tự chạy)
+    private val autoPlayScript = """
+        (function(){
+          var n = 0;
+          var t = setInterval(function(){
+            n++;
+            try {
+              var p = document.querySelector('media-player');
+              if (p && p.play) { p.muted = true; p.play(); }
+              var v = document.querySelector('video');
+              if (v) { v.muted = true; var r = v.play(); if (r && r.catch) r.catch(function(){}); }
+              var b = document.querySelector('media-play-button, [aria-label="Play"], [data-play]');
+              if (b && n % 3 == 0) b.click();
+            } catch (e) {}
+            if (n > 25) clearInterval(t);
+          }, 1000);
+        })();
+    """.trimIndent()
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data = trang embed. Mở trong WebView ẩn và bắt request .m3u8 do player gọi.
-        val resolver = WebViewResolver(
-            interceptUrl = Regex("""\.m3u8"""),
-            useOkhttp = false,
-            timeout = 30_000L
-        )
-        val stream = app.get(data, referer = "$mainUrl/", interceptor = resolver).url
-        if (!stream.contains(".m3u8")) return false
+        DebugLog.log("links", "loadLinks data=$data")
+        var found = false
 
-        M3u8Helper.generateM3u8(
-            source = name,
-            streamUrl = stream,
-            referer = data
-        ).forEach(callback)
-        return true
+        // 1) Gọi thẳng API của player và tìm link .m3u8 trong response
+        val apiUrl = vidoraUrl(data)
+        if (apiUrl != null) {
+            try {
+                val body = app.get(
+                    apiUrl,
+                    referer = data,
+                    headers = mapOf("Accept" to "application/json, text/plain, */*", "Origin" to mainUrl)
+                ).text
+                DebugLog.log("vidora", "GET $apiUrl -> ${body.length}b: ${body.take(1200)}")
+                val clean = body.replace("\\/", "/").replace("\\u0026", "&")
+                val urls = Regex("""https?://[^\s"'\\<>]+\.m3u8[^\s"'\\<>]*""")
+                    .findAll(clean).map { it.value }.distinct().toList()
+                for (u in urls) {
+                    M3u8Helper.generateM3u8(source = name, streamUrl = u, referer = data).forEach {
+                        callback(it)
+                        found = true
+                    }
+                }
+            } catch (e: Exception) {
+                DebugLog.log("vidora", "API lỗi: $e")
+            }
+        }
+        if (found) return true
+
+        // 2) Fallback: WebView + tự bấm play, bắt request .m3u8
+        try {
+            val resolver = WebViewResolver(
+                interceptUrl = Regex("""\.m3u8"""),
+                useOkhttp = false,
+                script = autoPlayScript,
+                scriptCallback = { },
+                timeout = 25_000L
+            )
+            val stream = app.get(data, referer = "$mainUrl/", interceptor = resolver).url
+            DebugLog.log("webview", "kết quả: $stream")
+            if (stream.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(source = name, streamUrl = stream, referer = data).forEach {
+                    callback(it)
+                    found = true
+                }
+            }
+        } catch (e: Exception) {
+            DebugLog.log("webview", "lỗi: $e")
+        }
+        if (found) return true
+
+        // 3) Thất bại: ghi thêm endpoint "ice" để chẩn đoán rồi copy log vào clipboard
+        try {
+            val ice = app.get("$mainUrl/api/vidora/v1/ice", referer = data).text
+            DebugLog.log("vidora-ice", ice.take(600))
+        } catch (e: Exception) {
+            DebugLog.log("vidora-ice", "lỗi: $e")
+        }
+        DebugLog.error("links", "Không tìm thấy link phát cho $data")
+        return false
     }
 }
