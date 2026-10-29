@@ -27,13 +27,17 @@ import javax.crypto.spec.SecretKeySpec
 @CloudstreamPlugin
 class CineJoyPlugin : Plugin() {
     override fun load(context: Context) {
+        appContext = context
         registerMainAPI(CineJoyProvider())
+    }
+
+    companion object {
+        var appContext: Context? = null
     }
 }
 
 /**
  * CloudStream 3 Provider cho CineJoy (cinejoy.pk)
- * Phiên bản tích hợp tự động sao chép log lỗi vào Clipboard
  */
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
@@ -610,15 +614,17 @@ class CineJoyProvider : MainAPI() {
 
         log.append("Tổng liên kết tìm được: $totalLinks\n")
 
-        // TÍNH NĂNG MỚI: Tự động ghi log vào Clipboard khi không tìm thấy liên kết
+        // Tự động ghi log vào Clipboard sử dụng try-catch thuần
         if (totalLinks == 0) {
             android.util.Log.e("CineJoy", log.toString())
-            runCatching {
-                app.context?.let { ctx ->
+            try {
+                CineJoyPlugin.appContext?.let { ctx ->
                     val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val clip = ClipData.newPlainText("CineJoy Error Log", log.toString())
                     clipboard.setPrimaryClip(clip)
                 }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
 
