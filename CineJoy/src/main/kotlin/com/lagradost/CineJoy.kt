@@ -2,9 +2,11 @@ package com.lagradost.cloudstream3.plugins
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.fasterxml.jackson.annotation.JsonProperty
 import org.jsoup.nodes.Element
 
+@CloudstreamPlugin
 class CineJoy : MainAPI() {
     override var mainUrl = "https://cinejoy.to"
     private val backupUrl = "https://cinejoy.net"
@@ -36,11 +38,9 @@ class CineJoy : MainAPI() {
     private fun Element.toSearchResult(): SearchResponse? {
         val title = this.selectFirst("h3.title")?.text() ?: return null
         
-        // Kiểm tra phần tử thẻ <a> không null để lấy href dạng String non-null
         val aTag = this.selectFirst("a") ?: return null
         val href = fixUrl(aTag.attr("href"))
         
-        // Xử lý poster an toàn không bị lỗi String?
         val imgTag = this.selectFirst("img")
         val rawPoster = imgTag?.attr("data-src")?.takeIf { it.isNotBlank() } ?: imgTag?.attr("src") ?: ""
         val posterUrl = if (rawPoster.isNotBlank()) fixUrl(rawPoster) else null
@@ -55,7 +55,6 @@ class CineJoy : MainAPI() {
         val title = document.selectFirst("h1.movie-title")?.text() ?: "Không rõ"
         val description = document.selectFirst("div.description")?.text()
         
-        // Xử lý poster trang chi tiết an toàn
         val posterElement = document.selectFirst("img.poster")
         val posterSrc = posterElement?.attr("src") ?: ""
         val poster = if (posterSrc.isNotBlank()) fixUrl(posterSrc) else null
