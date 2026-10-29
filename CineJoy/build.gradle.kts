@@ -1,5 +1,5 @@
 cloudstream {
-    version = 5
+    version = 6
     language = "en"
     description = "CineJoy (cinejoy.pk) - Movies & TV series with Nitro multi-audio, HLS & fast stream servers"
     authors = listOf("TJ-Plugins")
