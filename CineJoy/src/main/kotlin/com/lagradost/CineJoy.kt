@@ -38,7 +38,7 @@ class CineJoyPlugin : Plugin() {
 
 /**
  * CloudStream 3 Provider cho CineJoy (cinejoy.pk)
- * Phiên bản nâng cấp chi tiết log lỗi cho Clipboard
+ * Phiên bản chuẩn hóa hoàn chỉnh, tự động copy log vào Clipboard khi lỗi
  */
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
@@ -801,7 +801,7 @@ class CineJoyProvider : MainAPI() {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
 
-            val ciphertext = cipher.cipher.doFinal(plaintext) // Fixed standard cipher initialization
+            val ciphertext = cipher.doFinal(plaintext)
             val header = "Salted__".toByteArray(Charsets.US_ASCII)
             val result = ByteArray(header.size + salt.size + ciphertext.size)
             System.arraycopy(header, 0, result, 0, header.size)
