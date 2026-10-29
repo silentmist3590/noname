@@ -58,6 +58,8 @@ class CineFreakProvider : MainAPI() {
     // ───────────────────────── log + clipboard ─────────────────────────
 
     private var lastCopy = 0L
+    @Volatile private var probeFailed = false
+    private val copyLogOnSuccess = true // đặt false khi đã ổn định
 
     private inner class Dbg(private val tag: String) {
         private val sb = StringBuilder()
@@ -618,7 +620,28 @@ class CineFreakProvider : MainAPI() {
         return cipher.doFinal(ciphertext).toString(Charsets.UTF_8)
     }
 
+    /** Gọi thử đúng URL video bằng Range để biết server có chấp nhận header này không. */
+    private suspend fun probe(d: Dbg, tag: String, url: String, headers: Map<String, String>): Boolean {
+        return try {
+            val r = app.get(url, headers = headers + ("Range" to "bytes=0-1023"))
+            val ct = r.headers["Content-Type"].orEmpty()
+            val head = runCatching {
+                r.okhttpResponse.body.byteStream().use { ins ->
+                    val buf = ByteArray(60)
+                    val n = ins.read(buf)
+                    (if (n > 0) String(buf, 0, n, Charsets.ISO_8859_1) else "").replace(Regex("[^\\x20-\\x7E]"), ".")
+                }
+            }.getOrDefault("")
+            d.log("   probe[$tag] -> ${r.code} type=$ct len=${r.headers["Content-Length"]} range=${r.headers["Content-Range"]} accept=${r.headers["Accept-Ranges"]} head='$head'")
+            r.code in 200..206 && !ct.contains("html", true) && !ct.contains("json", true)
+        } catch (e: Throwable) {
+            d.log("   probe[$tag] lỗi ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
     private suspend fun emit(
+        d: Dbg,
         url: String,
         referer: String,
         label: String,
@@ -627,11 +650,30 @@ class CineFreakProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         val type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+        val origin = runCatching { URI(referer).let { "${it.scheme}://${it.host}" } }.getOrDefault(mainUrl)
+        d.log("LINK $label type=$type url=$url")
+        d.log("   headers=$headers")
+        // vài kiểu header, chọn kiểu đầu tiên mà server trả được dữ liệu
+        val variants = linkedMapOf(
+            "gốc" to headers,
+            "origin" to (headers + ("Origin" to origin) + ("Referer" to "$origin/")),
+            "cinefreak" to mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl, "User-Agent" to userAgent),
+            "không-referer" to mapOf("User-Agent" to userAgent)
+        )
+        var chosen: Map<String, String>? = null
+        for ((tag, h) in variants) {
+            if (probe(d, tag, url, h)) { chosen = h; d.log("   -> dùng header kiểu '$tag'"); break }
+        }
+        if (chosen == null) {
+            d.log("   -> không kiểu nào probe được, vẫn phát với header gốc")
+            probeFailed = true
+        }
+        val use = chosen ?: headers
         callback(
             newExtractorLink(source = name, name = label, url = url, type = type) {
-                this.referer = referer
+                this.referer = use["Referer"] ?: referer
                 this.quality = if (quality > 0) quality else Qualities.Unknown.value
-                this.headers = headers
+                this.headers = use
             }
         )
     }
@@ -664,7 +706,7 @@ class CineFreakProvider : MainAPI() {
                     .find(html.replace("\\/", "/"))?.value
                 if (direct != null) {
                     d.log("C1) tìm thấy media trong HTML: ${direct.take(120)}")
-                    emit(direct, url, "Vidzer", 0, mapOf("Referer" to url, "User-Agent" to userAgent), callback)
+                    emit(d, direct, url, "Vidzer", 0, mapOf("Referer" to url, "User-Agent" to userAgent), callback)
                     return true
                 }
                 return false
@@ -708,7 +750,7 @@ class CineFreakProvider : MainAPI() {
                 }
             }
             emit(
-                videoUrl, url, "Vidzer${if (quality > 0) " ${quality}p" else ""}", quality,
+                d, videoUrl, url, "Vidzer${if (quality > 0) " ${quality}p" else ""}", quality,
                 mapOf("Referer" to url, "User-Agent" to userAgent), callback
             )
             d.log("C1) OK quality=$quality url=${videoUrl.take(120)}")
@@ -746,7 +788,7 @@ class CineFreakProvider : MainAPI() {
             for (n in req.headers.names()) hdr[n] = req.header(n).orEmpty()
             if (!hdr.containsKey("Referer")) hdr["Referer"] = url
             if (!hdr.containsKey("User-Agent")) hdr["User-Agent"] = userAgent
-            emit(media, url, "Vidzer (WebView)", 0, hdr, callback)
+            emit(d, media, url, "Vidzer (WebView)", 0, hdr, callback)
             true
         } catch (e: Throwable) {
             d.err("C2) vidzerWebView", e)
@@ -763,6 +805,7 @@ class CineFreakProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val d = Dbg("loadLinks")
+        probeFailed = false
         val parts = data.split("|||")
         val api = parts.getOrNull(0).orEmpty()
         val ep = parts.getOrNull(1).orEmpty()
@@ -804,6 +847,7 @@ class CineFreakProvider : MainAPI() {
             d.copy(reason)
         } else {
             d.log("KẾT QUẢ: có link")
+            if (probeFailed || copyLogOnSuccess) d.copy(if (probeFailed) "link phát có thể lỗi" else "thành công (log kiểm tra)")
         }
         return found
     }
