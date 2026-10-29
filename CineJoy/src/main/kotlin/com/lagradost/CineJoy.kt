@@ -5,9 +5,9 @@ import com.lagradost.cloudstream3.utils.*
 import com.fasterxml.jackson.annotation.JsonProperty
 import org.jsoup.nodes.Element
 
-class CineJoyProvider : MainProvider() {
-    override var mainUrl = "https://cinejoy.to" // Domain chính
-    private val backupUrl = "https://cinejoy.net" // Domain dự phòng khi mainUrl gặp lỗi 2004
+class CineJoy : MainAPI() { // Đã đổi từ MainProvider thành MainAPI
+    override var mainUrl = "https://cinejoy.to"
+    private val backupUrl = "https://cinejoy.net"
     
     override var name = "CineJoy"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
@@ -51,7 +51,11 @@ class CineJoyProvider : MainProvider() {
         
         val episodes = document.select("ul.list-episode li").mapIndexed { index, element ->
             val link = element.selectFirst("a")?.attr("href") ?: ""
-            Episode(link, name = "Tập ${index + 1}")
+            // Sử dụng newEpisode thay cho constructor cũ
+            newEpisode(link) {
+                this.name = "Tập ${index + 1}"
+                this.episode = index + 1
+            }
         }
 
         return newMovieLoadResponse(title, url, TvType.Movie, episodes) {
@@ -66,13 +70,11 @@ class CineJoyProvider : MainProvider() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Hàm nội bộ hỗ trợ gọi API và kiểm tra mã lỗi
         suspend fun fetchStream(targetUrl: String, serverName: String): Boolean {
             return try {
                 val response = app.get(targetUrl, headers = baseHeaders)
                 val apiResponse = response.parsedSafe<CineJoyResponse>()
 
-                // Phát hiện lỗi 2004 từ API
                 if (apiResponse?.code == 2004) {
                     return false
                 }
@@ -80,15 +82,17 @@ class CineJoyProvider : MainProvider() {
                 val streamUrl = apiResponse?.url ?: targetUrl
                 if (streamUrl.isBlank()) return false
 
+                // Sử dụng newExtractorLink thay cho constructor cũ
                 callback.invoke(
-                    ExtractorLink(
-                        source = name,
+                    newExtractorLink(
+                        source = serverName,
                         name = serverName,
                         url = streamUrl,
-                        referer = "$mainUrl/",
-                        quality = Qualities.P1080.value,
-                        isM3u8 = streamUrl.contains(".m3u8")
-                    )
+                        type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.P1080.value
+                    }
                 )
                 true
             } catch (e: Exception) {
@@ -96,10 +100,8 @@ class CineJoyProvider : MainProvider() {
             }
         }
 
-        // 1. Thử tải link từ Máy chủ chính (Main Server)
         var isSuccess = fetchStream(data, "CineJoy - Server chính")
 
-        // 2. TỰ ĐỘNG CHUYỂN SANG SERVER DỰ PHÒNG nếu máy chủ chính bị lỗi 2004 hoặc không phản hồi
         if (!isSuccess) {
             val backupDataUrl = data.replace(mainUrl, backupUrl)
             isSuccess = fetchStream(backupDataUrl, "CineJoy - Server dự phòng")
