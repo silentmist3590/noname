@@ -11,14 +11,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.SecureRandom
-import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
@@ -96,7 +93,7 @@ class CineJoyProvider : MainAPI() {
                 val res = runCatching {
                     app.get(url, headers = mapOf("User-Agent" to ua, "Accept" to "application/json"), timeout = 10L).text
                 }.getOrNull()
-                if (!res.isNullOrBlank()) {
+                if (!res.isNullOrBlank() && !res.trim().startsWith("<")) {
                     val json = runCatching { JSONObject(res) }.getOrNull()
                     if (json != null && !json.has("status_code")) {
                         tmdbPrefer = hi
@@ -229,33 +226,33 @@ class CineJoyProvider : MainAPI() {
         var totalLinks = 0
         val seenUrls = HashSet<String>()
 
-        // 1. VidRock API Debugging
+        // 1. VidRock API
         try {
             val vrPath = if (type == "tv") "tv/$id/$s/$e" else "movie/$id"
             val vrUrl = "$vidrockBase/api/$vrPath"
             log.append("VidRock trying URL: $vrUrl\n")
             val vrResp = app.get(vrUrl, headers = mapOf("User-Agent" to ua, "Referer" to "$vidrockBase/"), timeout = 10L).text
-            log.append("VidRock raw response snippet: ${vrResp.take(300)}\n")
+            
+            if (vrResp.trim().startsWith("<")) {
+                log.append("VidRock returned HTML/Cloudflare block snippet: ${vrResp.take(200)}\n")
+            } else {
+                val vrJson = JSONObject(vrResp)
+                val keys = vrJson.keys()
+                while (keys.hasNext()) {
+                    val serverName = keys.next()
+                    val serverObj = vrJson.optJSONObject(serverName) ?: continue
+                    val token = serverObj.optString("url", "")
+                    if (token.isBlank()) continue
 
-            val vrJson = JSONObject(vrResp)
-            val keys = vrJson.keys()
-            while (keys.hasNext()) {
-                val serverName = keys.next()
-                val serverObj = vrJson.optJSONObject(serverName) ?: continue
-                val token = serverObj.optString("url", "")
-                log.append("VidRock server $serverName token found length: ${token.length}\n")
-                if (token.isBlank()) continue
-
-                val decryptedUrl = decryptVidRock(token)
-                log.append("VidRock server $serverName decrypted: ${decryptedUrl.take(100)}\n")
-
-                if (decryptedUrl.startsWith("http") && !blockedHostRegex.containsMatchIn(decryptedUrl)) {
-                    if (seenUrls.add(decryptedUrl)) {
-                        callback(newExtractorLink("CineJoy", "VidRock $serverName", decryptedUrl, ExtractorLinkType.M3U8) {
-                            this.referer = "$vidrockBase/"
-                            this.quality = Qualities.P1080.value
-                        })
-                        totalLinks++
+                    val decryptedUrl = decryptVidRock(token, log)
+                    if (decryptedUrl.startsWith("http") && !blockedHostRegex.containsMatchIn(decryptedUrl)) {
+                        if (seenUrls.add(decryptedUrl)) {
+                            callback(newExtractorLink("CineJoy", "VidRock $serverName", decryptedUrl, ExtractorLinkType.M3U8) {
+                                this.referer = "$vidrockBase/"
+                                this.quality = Qualities.P1080.value
+                            })
+                            totalLinks++
+                        }
                     }
                 }
             }
@@ -263,7 +260,7 @@ class CineJoyProvider : MainAPI() {
             log.append("VidRock exception: ${ex.message}\n")
         }
 
-        // 2. NxSha API Debugging
+        // 2. NxSha API
         try {
             val nxReq = JSONObject().apply {
                 put("tmdbId", id.toString())
@@ -273,33 +270,44 @@ class CineJoyProvider : MainAPI() {
             }
             val encodedQuery = nxEncode(nxReq)
             val srvResp = app.get("$nxBase/api/servers?q=$encodedQuery", headers = mapOf("User-Agent" to ua), timeout = 10L).text
-            log.append("NxSha srvResp snippet: ${srvResp.take(200)}\n")
-
-            val srvHash = JSONObject(srvResp).optString("_hash", "")
-            if (srvHash.isNotBlank()) {
-                val srvDec = nxDecode(srvHash)
-                log.append("NxSha decrypted servers JSON: ${srvDec.toString().take(300)}\n")
-                val servers = srvDec.optJSONArray("servers") ?: JSONArray()
-                log.append("NxSha found servers count: ${servers.length()}\n")
+            
+            if (srvResp.trim().startsWith("<")) {
+                log.append("NxSha returned HTML/Cloudflare block snippet: ${srvResp.take(200)}\n")
             } else {
-                log.append("NxSha hash empty!\n")
+                val srvHash = JSONObject(srvResp).optString("_hash", "")
+                if (srvHash.isNotBlank()) {
+                    val srvDec = nxDecode(srvHash, log)
+                    val servers = srvDec.optJSONArray("servers") ?: JSONArray()
+                    log.append("NxSha found servers count: ${servers.length()}\n")
+                } else {
+                    log.append("NxSha hash empty in response: ${srvResp.take(200)}\n")
+                }
             }
         } catch (ex: Exception) {
             log.append("NxSha exception: ${ex.message}\n")
         }
 
-        // 3. VidLove API Debugging
+        // 3. VidLove API
         try {
             val vlBase = if (type == "tv") "/tv?id=$id&season=$s&episode=$e&mode=json" else "/movie?id=$id&mode=json"
             val fullUrl = "$vidloveBase$vlBase"
             log.append("VidLove trying URL: $fullUrl\n")
-            val resp = app.get(fullUrl, headers = mapOf("User-Agent" to ua, "Referer" to playerRef), timeout = 6L).text
-            log.append("VidLove response snippet: ${resp.take(300)}\n")
+            val resp = app.get(fullUrl, headers = mapOf("User-Agent" to ua, "Referer" to playerRef, "Origin" to "https://cinejoy.pk"), timeout = 6L).text
             
-            val j = JSONObject(resp)
-            val src = j.optJSONObject("source")
-            val sUrl = src?.optString("url", "") ?: ""
-            log.append("VidLove extracted source url: $sUrl\n")
+            if (resp.trim().startsWith("<")) {
+                log.append("VidLove blocked by Cloudflare (HTML returned)\n")
+            } else {
+                val j = JSONObject(resp)
+                val src = j.optJSONObject("source")
+                val sUrl = src?.optString("url", "") ?: ""
+                if (sUrl.startsWith("http") && !blockedHostRegex.containsMatchIn(sUrl) && seenUrls.add(sUrl)) {
+                    callback(newExtractorLink("CineJoy", "VidLove", sUrl, ExtractorLinkType.M3U8) {
+                        this.referer = playerRef
+                        this.quality = Qualities.P1080.value
+                    })
+                    totalLinks++
+                }
+            }
         } catch (ex: Exception) {
             log.append("VidLove exception: ${ex.message}\n")
         }
@@ -320,10 +328,13 @@ class CineJoyProvider : MainAPI() {
         return totalLinks > 0
     }
 
-    private fun decryptVidRock(token: String): String {
+    private fun decryptVidRock(token: String, log: StringBuilder): String {
         return runCatching {
             val parts = token.split(".")
-            if (parts.size != 3) return ""
+            if (parts.size != 3) {
+                log.append("VidRock token parts size != 3\n")
+                return ""
+            }
             val iv = Base64.decode(parts[0], Base64.URL_SAFE or Base64.NO_WRAP)
             val ciphertext = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP)
             val tag = Base64.decode(parts[2], Base64.URL_SAFE or Base64.NO_WRAP)
@@ -333,6 +344,8 @@ class CineJoyProvider : MainAPI() {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(hexStringToByteArray(vidrockKeyHex), "AES"), GCMParameterSpec(tag.size * 8, iv))
             String(cipher.doFinal(combined), Charsets.UTF_8)
+        }.onFailure {
+            log.append("VidRock decrypt error: ${it.message}\n")
         }.getOrDefault("")
     }
 
@@ -364,10 +377,13 @@ class CineJoyProvider : MainAPI() {
         return Pair(keyAndIv.copyOfRange(0, keyLen), keyAndIv.copyOfRange(keyLen, keyLen + ivLen))
     }
 
-    private fun nxDecode(hashStr: String): JSONObject {
+    private fun nxDecode(hashStr: String, log: StringBuilder): JSONObject {
         return runCatching {
             val raw = Base64.decode(hashStr, Base64.DEFAULT)
-            if (raw.size < 16) return JSONObject()
+            if (raw.size < 16) {
+                log.append("NxSha raw size < 16\n")
+                return JSONObject()
+            }
             val (salt, ciphertext) = if (String(raw, 0, 8, Charsets.US_ASCII) == "Salted__") {
                 Pair(raw.copyOfRange(8, 16), raw.copyOfRange(16, raw.size))
             } else {
@@ -377,6 +393,8 @@ class CineJoyProvider : MainAPI() {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             JSONObject(String(cipher.doFinal(ciphertext), Charsets.UTF_8))
+        }.onFailure {
+            log.append("NxSha decode error: ${it.message}\n")
         }.getOrDefault(JSONObject())
     }
 
