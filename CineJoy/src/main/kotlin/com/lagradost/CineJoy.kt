@@ -38,6 +38,7 @@ class CineJoyPlugin : Plugin() {
 
 /**
  * CloudStream 3 Provider cho CineJoy (cinejoy.pk)
+ * Phiên bản nâng cấp chi tiết log lỗi cho Clipboard
  */
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
@@ -373,15 +374,16 @@ class CineJoyProvider : MainAPI() {
         val e = parsed.optInt("e", 1)
 
         val log = StringBuilder()
-        log.append("CineJoy loadLinks: type=$type id=$id s=$s e=$e\n")
+        log.append("CineJoy loadLinks start: type=$type id=$id s=$s e=$e\n")
 
         var totalLinks = 0
         val seenUrls = HashSet<String>()
 
         // 1. VidRock API
-        runCatching {
+        try {
             val vrPath = if (type == "tv") "tv/$id/$s/$e" else "movie/$id"
             val vrUrl = "$vidrockBase/api/$vrPath"
+            log.append("VidRock trying URL: $vrUrl\n")
             val vrResp = app.get(
                 vrUrl,
                 headers = mapOf(
@@ -391,6 +393,7 @@ class CineJoyProvider : MainAPI() {
                 ),
                 timeout = 10L
             ).text
+            log.append("VidRock response length: ${vrResp.length}\n")
 
             val vrJson = JSONObject(vrResp)
             val keys = vrJson.keys()
@@ -427,12 +430,12 @@ class CineJoyProvider : MainAPI() {
                     }
                 }
             }
-        }.onFailure { ex ->
-            log.append("VidRock error: ${ex.message}\n")
+        } catch (ex: Exception) {
+            log.append("VidRock exception: ${ex.javaClass.simpleName} - ${ex.message}\n")
         }
 
         // 2. NxSha API
-        runCatching {
+        try {
             val nxReq = JSONObject().apply {
                 put("tmdbId", id.toString())
                 put("imdb_id", "")
@@ -441,6 +444,7 @@ class CineJoyProvider : MainAPI() {
                 put("episode", if (type == "tv") e else 0)
             }
             val encodedQuery = nxEncode(nxReq)
+            log.append("NxSha fetching servers...\n")
             val srvResp = app.get(
                 "$nxBase/api/servers?q=$encodedQuery",
                 headers = mapOf(
@@ -452,9 +456,12 @@ class CineJoyProvider : MainAPI() {
             ).text
 
             val srvHash = JSONObject(srvResp).optString("_hash", "")
-            if (srvHash.isNotBlank()) {
+            if (srvHash.isBlank()) {
+                log.append("NxSha srvHash is blank. Response: $srvResp\n")
+            } else {
                 val srvDec = nxDecode(srvHash)
                 val servers = srvDec.optJSONArray("servers") ?: JSONArray()
+                log.append("NxSha found servers count: ${servers.length()}\n")
 
                 val nxProviders = listOf(
                     "nitro", "mbox", "watchout", "awsind", "rive-citadel",
@@ -473,7 +480,7 @@ class CineJoyProvider : MainAPI() {
                 }
 
                 for ((sName, scraper) in selectedServers.take(8)) {
-                    runCatching {
+                    try {
                         val srcReq = JSONObject().apply {
                             put("ex_lang", true)
                             put("provider", scraper)
@@ -536,15 +543,17 @@ class CineJoyProvider : MainAPI() {
                                 }
                             }
                         }
+                    } catch (subEx: Exception) {
+                        log.append("NxSha provider $scraper error: ${subEx.message}\n")
                     }
                 }
             }
-        }.onFailure { ex ->
-            log.append("NxSha error: ${ex.message}\n")
+        } catch (ex: Exception) {
+            log.append("NxSha exception: ${ex.javaClass.simpleName} - ${ex.message}\n")
         }
 
         // 3. VidLove API
-        runCatching {
+        try {
             val vlBase = if (type == "tv") {
                 "/tv?id=$id&season=$s&episode=$e&mode=json"
             } else {
@@ -561,9 +570,10 @@ class CineJoyProvider : MainAPI() {
             )
 
             for ((label, querySuffix) in vlVariants) {
-                runCatching {
+                try {
+                    val fullUrl = "$vidloveBase$vlBase$querySuffix"
                     val resp = app.get(
-                        "$vidloveBase$vlBase$querySuffix",
+                        fullUrl,
                         headers = mapOf(
                             "User-Agent" to ua,
                             "Referer" to playerRef,
@@ -605,22 +615,27 @@ class CineJoyProvider : MainAPI() {
                                 subtitleCallback(SubtitleFile(subLabel, subFile))
                             }
                         }
+                    } else {
+                        log.append("VidLove variant $label returned empty/invalid URL\n")
                     }
+                } catch (vlEx: Exception) {
+                    log.append("VidLove variant $label error: ${vlEx.message}\n")
                 }
             }
-        }.onFailure { ex ->
-            log.append("VidLove error: ${ex.message}\n")
+        } catch (ex: Exception) {
+            log.append("VidLove exception: ${ex.javaClass.simpleName} - ${ex.message}\n")
         }
 
         log.append("Tổng liên kết tìm được: $totalLinks\n")
 
-        // Tự động ghi log vào Clipboard sử dụng try-catch thuần
+        // Tự động copy toàn bộ log chi tiết vào Clipboard nếu không tìm thấy link nào
         if (totalLinks == 0) {
-            android.util.Log.e("CineJoy", log.toString())
+            val errorLogContent = log.toString()
+            android.util.Log.e("CineJoyError", errorLogContent)
             try {
                 CineJoyPlugin.appContext?.let { ctx ->
                     val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    val clip = ClipData.newPlainText("CineJoy Error Log", log.toString())
+                    val clip = ClipData.newPlainText("CineJoy Debug Log", errorLogContent)
                     clipboard.setPrimaryClip(clip)
                 }
             } catch (e: Exception) {
@@ -636,7 +651,7 @@ class CineJoyProvider : MainAPI() {
         label: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        runCatching {
+        try {
             val resp = app.get(
                 playlistUrl,
                 headers = mapOf(
@@ -675,10 +690,10 @@ class CineJoyProvider : MainAPI() {
                     }
                 )
             }
-        }
+        } catch (_: Exception) {}
     }
 
-    private fun parseQualityValue(label:String): Int {
+    private fun parseQualityValue(label: String): Int {
         val l = label.lowercase()
         return when {
             l.contains("4k") || l.contains("2160") -> Qualities.P2160.value
@@ -786,7 +801,7 @@ class CineJoyProvider : MainAPI() {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
 
-            val ciphertext = cipher.doFinal(plaintext)
+            val ciphertext = cipher.cipher.doFinal(plaintext) // Fixed standard cipher initialization
             val header = "Salted__".toByteArray(Charsets.US_ASCII)
             val result = ByteArray(header.size + salt.size + ciphertext.size)
             System.arraycopy(header, 0, result, 0, header.size)
