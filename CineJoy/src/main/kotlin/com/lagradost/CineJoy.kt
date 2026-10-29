@@ -1,7 +1,5 @@
 package com.lagradost
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.util.Base64
 import com.lagradost.cloudstream3.*
@@ -24,8 +22,6 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-private const val DEBUG = true
-
 @CloudstreamPlugin
 class CineJoyPlugin : Plugin() {
     override fun load(context: Context) {
@@ -37,7 +33,7 @@ class CineJoyPlugin : Plugin() {
  * CloudStream 3 Provider cho CineJoy (cinejoy.pk)
  * Chuyển đổi hoàn chỉnh từ SkyStream plugin v6
  *
- * Tính năng chống lỗi:
+ * Tính năng:
  * - Chống chặn DNS & lỗi IPv6 (::1): Ưu tiên api.tmdb.org và hỗ trợ song song api.themoviedb.org
  * - Tự động thử nhiều TMDB API Key + Bearer Token
  * - Chống lỗi không tải được ảnh bìa/poster tại Việt Nam bằng wsrv.nl proxy
@@ -654,8 +650,8 @@ class CineJoyProvider : MainAPI() {
         }
 
         log.append("Tổng liên kết tìm được: $totalLinks\n")
-        if (DEBUG && totalLinks == 0) {
-            copyLogToClipboard(log.toString())
+        if (totalLinks == 0) {
+            android.util.Log.d("CineJoy", log.toString())
         }
 
         return totalLinks > 0
@@ -835,17 +831,5 @@ class CineJoyProvider : MainAPI() {
 
             URLEncoder.encode(Base64.encodeToString(result, Base64.NO_WRAP), "UTF-8")
         }.getOrDefault("")
-    }
-
-    // =========================================================================
-    // Diagnostics & Debugging
-    // =========================================================================
-
-    private fun copyLogToClipboard(logText: String) {
-        runCatching {
-            val ctx = com.lagradost.cloudstream3.AcraApplication.context
-            val cm = ctx?.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            cm?.setPrimaryClip(ClipData.newPlainText("CineJoy Debug Log", logText))
-        }
     }
 }
