@@ -1,212 +1,345 @@
 package com.lagradost
 
-import android.content.Context
-import android.content.ClipboardManager
-import android.content.ClipData
-import android.util.Base64
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.json.JSONArray
-import org.json.JSONObject
+import com.lagradost.cloudstream3.network.WebViewResolver
+import com.lagradost.cloudstream3.utils.*
 import java.net.URLEncoder
-import java.security.MessageDigest
-import java.security.SecureRandom
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
-@CloudstreamPlugin
-class CineJoyPlugin : Plugin() {
-    override fun load(context: Context) {
-        appContext = context
-        registerMainAPI(CineJoyProvider())
-    }
-
-    companion object {
-        var appContext: Context? = null
-    }
-}
-
-class CineJoyProvider : MainAPI() {
-    override var mainUrl = "https://cinejoy.pk"
-    override var name = "CineJoy"
-    override val hasMainPage = true
+/**
+ * Plugin cho https://moviesapi.to
+ *
+ * - Danh sách/tìm kiếm: /api/discover/{movies|tv|views}
+ * - Phát: trang embed gọi /api/vidora/v1/movie/{id} (cần header x-player-key)
+ *   nếu API fail -> fallback WebView bắt request .m3u8.
+ */
+class MoviesApiProvider : MainAPI() {
+    override var mainUrl = "https://moviesapi.to"
+    override var name = "MoviesAPI"
     override var lang = "en"
-    override val hasDownloadSupport = true
+    override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    private val ua =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    private val mapper = jacksonObjectMapper()
+    private val tmdbImg = "https://image.tmdb.org/t/p"
 
-    private val tmdbHosts = listOf(
-        "https://api.tmdb.org/3",
-        "https://api.themoviedb.org/3"
-    )
-    private var tmdbPrefer = 0
+    // Không dùng raw-string vì "$" trước """ dễ gây lỗi ở Kotlin mới.
+    // Regex: .jpg | .jpeg | .png | .webp | .avif (kèm ?query tùy chọn) ở cuối URL
+    private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\$", RegexOption.IGNORE_CASE)
 
-    private val tmdbKeys = listOf(
-        "8476a7ab80ad76f0936744df0430e67c",
-        "439c478a771f35c05022f9feabcca01c",
-        "15d2ea6d0dc1d476efbca3eba2b9bbfb"
-    )
+    private val userAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    private val tmdbBearerToken =
-        "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJiYmYxODFkOTRiMzk2MTg1ZDBhYmQ5NzA5M2ZkNDhlMCIsIm5iZiI6MTY5MjUzNzk2MS45MTgwMDAyLCJzdWIiOiI2NGUyMTQ2OTM3MTA5NzAxMWM1NDk3YjgiLCJzY29wZXMiOlsiYXBpX3JlYWQiXSwidmVyc2lvbiI6MX0.t4GsujVl9LceOrnPmx-WDdncTSAx60QBLAoaiuTCvXI"
+    /** Key bắt buộc của API vidora (trích từ bundle JS của moviesapi.to). */
+    private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
 
-    private val vidrockBase = "https://vidrock.net"
-    private val vidrockKeyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
+    /** Header cho API JSON (discover + vidora). Không có "*\/*" để tránh parser weirdness. */
+    private val apiHeaders: Map<String, String> by lazy {
+        mapOf(
+            "User-Agent"      to userAgent,
+            "Accept"          to "application/json",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Origin"          to mainUrl,
+            "Referer"         to "$mainUrl/",
+            "x-player-key"    to vidoraKey,
+        )
+    }
 
-    private val nxBase = "https://nxsha.space"
-    private val nxPass = "f4488ab4da401203d23baa129fc546153898162524635d6776826d0c867ccaa3"
-
-    private val vidloveBase = "https://api.vidlove.cc"
-    private val playerRef = "https://player.vidlove.cc/"
-
-    private val blockedHostRegex = Regex(
-        "gdflix|katdrive|sendcm|1fichier|fastpic|faststream|gdriveplayer|gdtot|filepress|sharer",
-        RegexOption.IGNORE_CASE
-    )
+    /** Header cho CDN workers.dev — m3u8 + segment. */
+    private val streamHeaders: Map<String, String> by lazy {
+        mapOf(
+            "User-Agent"      to userAgent,
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Origin"          to mainUrl,
+            "Referer"         to "$mainUrl/",
+        )
+    }
 
     override val mainPage = mainPageOf(
-        "/trending/movie/week" to "Trending Movies",
-        "/trending/tv/week" to "Trending Series",
-        "/movie/popular" to "Popular Movies",
-        "/movie/top_rated" to "Top Rated Movies",
-        "/tv/popular" to "Popular Series",
-        "/tv/top_rated" to "Top Rated Series",
-        "/movie/now_playing" to "In Theaters"
+        "$mainUrl/api/discover/views?type=movie&views=day" to "Trending Movies (Today)",
+        "$mainUrl/api/discover/views?type=tv&views=day" to "Trending TV (Today)",
+        "$mainUrl/api/discover/views?type=movie&views=week" to "Trending Movies (Week)",
+        "$mainUrl/api/discover/movies?ordering=created_at&direction=desc" to "Newly Added Movies",
+        "$mainUrl/api/discover/tv?ordering=last_upload_date&direction=desc" to "Recently Updated TV",
+        "$mainUrl/api/discover/movies?ordering=views&direction=desc" to "Most Viewed Movies",
+        "$mainUrl/api/discover/tv?ordering=views&direction=desc" to "Most Viewed TV",
     )
 
-    private suspend fun tmdbGet(path: String): JSONObject? {
-        val sep = if (path.contains("?")) "&" else "?"
-        for (k in tmdbHosts.indices) {
-            val hi = (tmdbPrefer + k) % tmdbHosts.size
-            val host = tmdbHosts[hi]
-            for (apiKey in tmdbKeys) {
-                val url = "$host$path${sep}api_key=$apiKey"
-                val res = runCatching {
-                    app.get(url, headers = mapOf("User-Agent" to ua, "Accept" to "application/json"), timeout = 10L).text
-                }.getOrNull()
-                if (!res.isNullOrBlank() && !res.trim().startsWith("<")) {
-                    val json = runCatching { JSONObject(res) }.getOrNull()
-                    if (json != null && !json.has("status_code")) {
-                        tmdbPrefer = hi
-                        return json
-                    }
-                }
+    // ------------------------------------------------------------------ helpers
+
+    private suspend fun getJson(url: String, referer: String? = "$mainUrl/"): JsonNode? = try {
+        val text = app.get(
+            url,
+            headers = mapOf(
+                "Accept"       to "application/json",
+                "User-Agent"   to userAgent,
+                "Origin"       to mainUrl,
+                "x-player-key" to vidoraKey,
+            ),
+            referer = referer
+        ).text
+        DebugLog.log("http", "GET $url -> ${text.length}b: ${text.take(500)}")
+        mapper.readTree(text)
+    } catch (e: Exception) {
+        DebugLog.error("http", "GET $url thất bại", e)
+        null
+    }
+
+    private fun JsonNode.items(): List<JsonNode> {
+        if (isArray) return toList()
+        for (k in listOf("data", "results", "items", "movies", "shows", "tv", "list")) {
+            val n = get(k) ?: continue
+            if (n.isArray) return n.toList()
+            if (n.isObject) {
+                val r = n.items()
+                if (r.isNotEmpty()) return r
+            }
+        }
+        return emptyList()
+    }
+
+    private fun JsonNode.str(vararg keys: String): String? =
+        keys.firstNotNullOfOrNull { k ->
+            get(k)?.takeIf { !it.isNull && !it.isContainerNode }?.asText()?.takeIf { it.isNotBlank() }
+        }
+
+    private fun JsonNode.findImage(backdrop: Boolean = false, depth: Int = 0): String? {
+        if (!isObject || depth > 2) return null
+        fun isBack(k: String) =
+            k.contains("backdrop") || k.contains("banner") || k.contains("background")
+        val keys = fieldNames().asSequence().toList().sortedBy { k ->
+            val l = k.lowercase()
+            when {
+                backdrop && isBack(l) -> 0
+                !backdrop && l.contains("poster") -> 0
+                !backdrop && (l.contains("thumb") || l.contains("cover") || l == "image" || l.contains("img")) -> 1
+                else -> 2
+            }
+        }
+        for (k in keys) {
+            val l = k.lowercase()
+            if (!backdrop && isBack(l)) continue
+            if (backdrop && !isBack(l)) continue
+            val v = get(k) ?: continue
+            if (v.isTextual) {
+                val s = v.asText()
+                if (s.isNotBlank() && (imgExt.containsMatchIn(s) || l.contains("poster") || l.contains("backdrop"))) return s
+            } else if (v.isObject) {
+                v.findImage(false, depth + 1)?.let { return it }
+            }
+        }
+        if (!backdrop) {
+            for (k in keys) {
+                if (isBack(k.lowercase())) continue
+                val v = get(k) ?: continue
+                if (v.isTextual && imgExt.containsMatchIn(v.asText())) return v.asText()
             }
         }
         return null
     }
 
-    private fun posterUrl(path: String?, size: String = "w500"): String? {
-        if (path.isNullOrBlank() || path == "null") return null
-        val clean = if (path.startsWith("/")) path else "/$path"
-        return "https://wsrv.nl/?url=" + URLEncoder.encode("https://image.tmdb.org/t/p/$size$clean", "UTF-8")
+    private fun img(p: String?, size: String = "w500"): String? = when {
+        p.isNullOrBlank() -> null
+        p.startsWith("http") -> p
+        p.startsWith("//") -> "https:$p"
+        p.startsWith("/") -> "$tmdbImg/$size$p"
+        else -> "$mainUrl/$p"
     }
 
-    private fun parseYear(dateStr: String?): Int? {
-        if (dateStr.isNullOrBlank()) return null
-        return Regex("^(\\d{4})").find(dateStr)?.groupValues?.get(1)?.toIntOrNull()
-    }
+    private fun JsonNode.mediaId(): String? =
+        str("tmdb_id", "tmdbid", "tmdbId", "tmdb") ?: str("imdb_id", "imdbid", "imdbId", "imdb")
 
-    private fun fixEpisode(e: Int): Int {
-        return if (e >= 800) (e % 100) + 1 + ((e / 100) - 8) * 2 else e
-    }
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val path = if (request.data.contains("?")) "${request.data}&page=$page" else "${request.data}?page=$page"
-        val json = tmdbGet(path) ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
-        val results = json.optJSONArray("results") ?: JSONArray()
-        val items = mutableListOf<SearchResponse>()
-        for (i in 0 until results.length()) {
-            val r = results.optJSONObject(i) ?: continue
-            val id = r.optInt("id", -1).takeIf { it > 0 } ?: continue
-            val isTv = r.has("first_air_date") || r.has("name") || r.optString("media_type") == "tv"
-            val title = r.optString("title", r.optString("name", "Unknown"))
-            val poster = posterUrl(r.optString("poster_path", ""))
-            val year = parseYear(r.optString("release_date", r.optString("first_air_date", "")))
-            val itemPayload = JSONObject().apply {
-                put("type", if (isTv) "tv" else "movie")
-                put("id", id)
-                put("title", title)
-            }.toString()
-            if (isTv) {
-                items.add(newTvSeriesSearchResponse(title, itemPayload, TvType.TvSeries) { this.posterUrl = poster; this.year = year })
-            } else {
-                items.add(newMovieSearchResponse(title, itemPayload, TvType.Movie) { this.posterUrl = poster; this.year = year })
+    private fun JsonNode.toSearch(isTv: Boolean): SearchResponse? {
+        val id = mediaId() ?: return null
+        val title = str("title", "name", "original_title") ?: return null
+        val poster = img(findImage())
+        val year = (str("year") ?: str("release_date", "first_air_date", "released"))
+            ?.take(4)?.toIntOrNull()
+        return if (isTv) {
+            newTvSeriesSearchResponse(title, "$mainUrl/tv/$id", TvType.TvSeries) {
+                this.posterUrl = poster
+                this.year = year
+            }
+        } else {
+            newMovieSearchResponse(title, "$mainUrl/movie/$id", TvType.Movie) {
+                this.posterUrl = poster
+                this.year = year
             }
         }
-        return newHomePageResponse(request.name, items, hasNext = page < (json.optInt("total_pages", 1)) && page < 25)
+    }
+
+    // ------------------------------------------------------------------ main page / search
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val sep = if (request.data.contains("?")) "&" else "?"
+        val url = "${request.data}${sep}page=$page&resultsPerPage=30"
+        val isTv = request.data.contains("/discover/tv") || request.data.contains("type=tv")
+        val raw = getJson(url)?.items().orEmpty()
+        val list = raw.mapNotNull { it.toSearch(isTv) }
+
+        if (raw.isEmpty()) {
+            DebugLog.error("main", "Không đọc được danh sách từ $url")
+        } else if (list.isEmpty()) {
+            DebugLog.error("main", "Có ${raw.size} item nhưng thiếu tmdb_id/imdb_id. Item đầu: ${raw.first()}")
+        } else if (list.all { it.posterUrl == null }) {
+            DebugLog.error("main", "Không tìm thấy poster. Item đầu: ${raw.first()}")
+        }
+        return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        if (query.isBlank()) return emptyList()
-        val q = URLEncoder.encode(query.trim(), "UTF-8")
-        val json = tmdbGet("/search/multi?query=$q&page=1&include_adult=false") ?: return emptyList()
-        val results = json.optJSONArray("results") ?: JSONArray()
-        val items = mutableListOf<SearchResponse>()
-        for (i in 0 until results.length()) {
-            val r = results.optJSONObject(i) ?: continue
-            val mediaType = r.optString("media_type", if (r.has("first_air_date")) "tv" else "movie")
-            if (mediaType != "movie" && mediaType != "tv") continue
-            val id = r.optInt("id", -1).takeIf { it > 0 } ?: continue
-            val isTv = mediaType == "tv"
-            val title = r.optString("title", r.optString("name", "Unknown"))
-            val poster = posterUrl(r.optString("poster_path", ""))
-            val year = parseYear(r.optString("release_date", r.optString("first_air_date", "")))
-            val itemPayload = JSONObject().apply {
-                put("type", mediaType)
-                put("id", id)
-                put("title", title)
-            }.toString()
-            if (isTv) {
-                items.add(newTvSeriesSearchResponse(title, itemPayload, TvType.TvSeries) { this.posterUrl = poster; this.year = year })
-            } else {
-                items.add(newMovieSearchResponse(title, itemPayload, TvType.Movie) { this.posterUrl = poster; this.year = year })
-            }
-        }
-        return items
+        if (query.length < 3) return emptyList()
+        val q = URLEncoder.encode(query, "UTF-8")
+        val movies = getJson("$mainUrl/api/discover/movies?query=$q&resultsPerPage=30")
+            ?.items().orEmpty().mapNotNull { it.toSearch(false) }
+        val shows = getJson("$mainUrl/api/discover/tv?query=$q&resultsPerPage=30")
+            ?.items().orEmpty().mapNotNull { it.toSearch(true) }
+        return movies + shows
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val parsed = parseDataUrl(url) ?: throw ErrorLoadingException("Invalid URL: $url")
-        val id = parsed.optInt("id")
-        val isTv = parsed.optString("type") == "tv"
-        if (!isTv) {
-            val json = tmdbGet("/movie/$id") ?: throw ErrorLoadingException("Details not found")
-            val title = json.optString("title", "Unknown")
-            val poster = posterUrl(json.optString("poster_path", ""))
-            val linkData = JSONObject().put("type", "movie").put("id", id).put("title", title).toString()
-            return newMovieLoadResponse(title, url, TvType.Movie, linkData) { this.posterUrl = poster }
+    // ------------------------------------------------------------------ load
+
+    private fun mkEpisode(
+        id: String, season: Int, episode: Int,
+        name: String? = null, desc: String? = null, poster: String? = null
+    ): Episode = newEpisode("$mainUrl/tv/$id/$season/$episode") {
+        this.season = season
+        this.episode = episode
+        this.name = name
+        this.description = desc
+        this.posterUrl = poster
+    }
+
+    private suspend fun buildEpisodes(id: String, node: JsonNode?, imdbId: String?): List<Episode> {
+        val eps = mutableListOf<Episode>()
+
+        val seasons = node?.get("seasons")
+        if (seasons != null && seasons.isArray) {
+            for (s in seasons) {
+                val sn = s.str("season_number", "season", "number")?.toIntOrNull() ?: continue
+                if (sn == 0) continue
+                val inner = s.get("episodes")
+                if (inner != null && inner.isArray && inner.size() > 0) {
+                    for (e in inner) {
+                        val en = e.str("episode_number", "episode", "number")?.toIntOrNull() ?: continue
+                        eps += mkEpisode(
+                            id, sn, en,
+                            e.str("name", "title"), e.str("overview"),
+                            img(e.str("still_path", "still", "image"), "w300")
+                        )
+                    }
+                } else {
+                    val count = s.str("episode_count", "episodes_count", "episodes")?.toIntOrNull() ?: 0
+                    for (en in 1..count) eps += mkEpisode(id, sn, en)
+                }
+            }
+        }
+
+        if (eps.isEmpty() && imdbId != null) {
+            val videos = getJson(
+                "https://v3-cinemeta.strem.io/meta/series/$imdbId.json", referer = null
+            )?.get("meta")?.get("videos")
+            if (videos != null && videos.isArray) {
+                for (v in videos) {
+                    val sn = v.get("season")?.asInt() ?: continue
+                    val en = v.get("episode")?.asInt() ?: continue
+                    if (sn == 0) continue
+                    eps += mkEpisode(
+                        id, sn, en,
+                        v.str("name", "title"), v.str("overview", "description"),
+                        v.str("thumbnail")
+                    )
+                }
+            }
+        }
+        if (eps.isEmpty()) DebugLog.error("load", "Không dựng được danh sách tập cho id=$id (imdb=$imdbId)")
+        return eps.sortedWith(compareBy({ it.season }, { it.episode }))
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        val m = Regex("""/(movie|tv)/([^/?#]+)""").find(url) ?: return null
+        val isTv = m.groupValues[1] == "tv"
+        val rawId = m.groupValues[2]
+        val id = if (isTv) rawId.substringBefore("-") else rawId
+        val isImdb = id.startsWith("tt")
+
+        val param = when {
+            isImdb && isTv -> "imdbid"
+            isImdb -> "imdb_id"
+            else -> "tmdbid"
+        }
+        val endpoint = if (isTv) "tv" else "movies"
+        val node = getJson("$mainUrl/api/discover/$endpoint?$param=$id")?.items()?.firstOrNull()
+        if (node == null) DebugLog.error("load", "Không có dữ liệu chi tiết cho $endpoint $param=$id")
+
+        val title = node?.str("title", "name", "original_title") ?: id
+        val poster = img(node?.findImage())
+        val backdrop = img(node?.findImage(backdrop = true), "w1280")
+        val plot = node?.str("overview", "plot", "description", "synopsis")
+        val year = node?.let { (it.str("year") ?: it.str("release_date", "first_air_date"))?.take(4)?.toIntOrNull() }
+        val imdbId = node?.str("imdb_id", "imdbid", "imdbId") ?: id.takeIf { isImdb }
+        val tagList = node?.get("genres")?.let { g ->
+            if (g.isArray) g.mapNotNull { if (it.isTextual) it.asText() else it.str("name", "title") }
+            else g.asText().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        }
+
+        return if (isTv) {
+            val episodes = buildEpisodes(id, node, imdbId)
+            newTvSeriesLoadResponse(title, "$mainUrl/tv/$id", TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.backgroundPosterUrl = backdrop
+                this.year = year
+                this.plot = plot
+                this.tags = tagList
+            }
         } else {
-            val json = tmdbGet("/tv/$id") ?: throw ErrorLoadingException("Details not found")
-            val title = json.optString("name", "Unknown")
-            val poster = posterUrl(json.optString("poster_path", ""))
-            val episodes = mutableListOf<Episode>()
-            val sJson = tmdbGet("/tv/$id/season/1")
-            val epArray = sJson?.optJSONArray("episodes") ?: JSONArray()
-            for (ei in 0 until epArray.length()) {
-                val ep = epArray.optJSONObject(ei) ?: continue
-                val epNum = ep.optInt("episode_number", ei + 1)
-                val epData = JSONObject().put("type", "tv").put("id", id).put("s", 1).put("e", epNum).toString()
-                episodes.add(newEpisode(epData) { this.name = ep.optString("name"); this.season = 1; this.episode = epNum })
+            val embed = "$mainUrl/movie/$id"
+            newMovieLoadResponse(title, embed, TvType.Movie, embed) {
+                this.posterUrl = poster
+                this.backgroundPosterUrl = backdrop
+                this.year = year
+                this.plot = plot
+                this.tags = tagList
             }
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) { this.posterUrl = poster }
         }
     }
 
-    private fun parseDataUrl(url: String): JSONObject? {
-        return runCatching {
-            if (url.startsWith("{")) JSONObject(url) else null
-        }.getOrNull()
+    // ------------------------------------------------------------------ links
+
+    private fun vidoraUrl(embed: String): String? {
+        val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return null
+        val type = m.groupValues[1]
+        val id = m.groupValues[2]
+        return when {
+            type == "movie" -> "$mainUrl/api/vidora/v1/movie/$id"
+            m.groupValues[3].isNotEmpty() ->
+                "$mainUrl/api/vidora/v1/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
+            else -> null
+        }
     }
+
+    // Raw-string JS không có dấu " để tránh xung đột delimiter.
+    private val autoPlayScript = """
+        (function(){
+          var n = 0;
+          var t = setInterval(function(){
+            n++;
+            try {
+              var p = document.querySelector('media-player');
+              if (p && p.play) { p.muted = true; p.play(); }
+              var v = document.querySelector('video');
+              if (v) { v.muted = true; var r = v.play(); if (r && r.catch) r.catch(function(){}); }
+              var b = document.querySelector('media-play-button');
+              if (b) b.click();
+              var b2 = document.querySelector('[data-play]');
+              if (b2 && n % 3 === 0) b2.click();
+            } catch (e) {}
+            if (n > 25) clearInterval(t);
+          }, 1000);
+        })();
+    """.trimIndent()
 
     override suspend fun loadLinks(
         data: String,
@@ -214,205 +347,121 @@ class CineJoyProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parsed = parseDataUrl(data) ?: return false
-        val type = parsed.optString("type", "movie")
-        val id = parsed.optInt("id", 0)
-        val s = parsed.optInt("s", 1)
-        val e = parsed.optInt("e", 1)
+        DebugLog.log("links", "loadLinks data=$data")
+        var found = false
 
-        val log = StringBuilder()
-        log.append("CineJoy loadLinks start: type=$type id=$id s=$s e=$e\n")
+        // 1) Gọi API vidora (BẮT BUỘC có x-player-key)
+        val apiUrl = vidoraUrl(data)
+        if (apiUrl != null) {
+            try {
+                val body = app.get(
+                    apiUrl,
+                    headers = apiHeaders,
+                    referer = "$mainUrl/"
+                ).text
+                DebugLog.log("vidora", "GET $apiUrl -> ${body.length}b: ${body.take(800)}")
 
-        var totalLinks = 0
-        val seenUrls = HashSet<String>()
+                val json = mapper.readTree(body)
 
-        // 1. VidRock API
-        try {
-            val vrPath = if (type == "tv") "tv/$id/$s/$e" else "movie/$id"
-            val vrUrl = "$vidrockBase/api/$vrPath"
-            log.append("VidRock trying URL: $vrUrl\n")
-            val vrResp = app.get(vrUrl, headers = mapOf("User-Agent" to ua, "Referer" to "$vidrockBase/"), timeout = 10L).text
-            
-            if (vrResp.trim().startsWith("<")) {
-                log.append("VidRock returned HTML/Cloudflare block snippet: ${vrResp.take(200)}\n")
-            } else {
-                val vrJson = JSONObject(vrResp)
-                val keys = vrJson.keys()
-                while (keys.hasNext()) {
-                    val serverName = keys.next()
-                    val serverObj = vrJson.optJSONObject(serverName) ?: continue
-                    val token = serverObj.optString("url", "")
-                    if (token.isBlank()) continue
+                if (json.get("result")?.asBoolean() != true) {
+                    DebugLog.error(
+                        "vidora",
+                        "result != true (kiểm tra x-player-key). Body: ${body.take(300)}"
+                    )
+                }
 
-                    val decryptedUrl = decryptVidRock(token, log)
-                    if (decryptedUrl.startsWith("http") && !blockedHostRegex.containsMatchIn(decryptedUrl)) {
-                        if (seenUrls.add(decryptedUrl)) {
-                            callback(newExtractorLink("CineJoy", "VidRock $serverName", decryptedUrl, ExtractorLinkType.M3U8) {
-                                this.referer = "$vidrockBase/"
-                                this.quality = Qualities.P1080.value
-                            })
-                            totalLinks++
+                val sources = json.get("sources")
+                if (sources != null && sources.isArray) {
+                    for (src in sources) {
+                        val url = src.str("url") ?: continue
+                        if (!url.contains(".m3u8")) continue
+
+                        val ok = try {
+                            val probe = app.get(
+                                url,
+                                headers = streamHeaders,
+                                referer = "$mainUrl/"
+                            ).text
+                            probe.trimStart().startsWith("#EXTM3U")
+                        } catch (e: Exception) {
+                            DebugLog.error("m3u8-probe", "probe fail: ${e.message}")
+                            false
+                        }
+
+                        if (ok) {
+                            // Đẩy link M3U8 kèm headers để ExoPlayer tải được m3u8 + segment
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = name,
+                                    name   = name,
+                                    url    = url,
+                                    type   = ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = "$mainUrl/"
+                                    this.quality = Qualities.Unknown.value
+                                    this.headers = streamHeaders
+                                }
+                            )
+                            found = true
+                        } else {
+                            DebugLog.error("m3u8-probe", "m3u8 không fetch được với headers hiện tại")
                         }
                     }
                 }
+
+                // Phụ đề đính kèm
+                val tracks = sources?.firstOrNull()?.get("tracks")
+                if (tracks != null && tracks.isArray) {
+                    for (t in tracks) {
+                        val fileNode = t.get("file") ?: continue
+                        if (fileNode.isNull) continue
+                        val file = fileNode.asText()
+                        if (file.isBlank()) continue
+                        val lang = t.str("language") ?: "unknown"
+                        // Dùng trực tiếp data-class để tránh khác biệt signature newSubtitleFile
+                        subtitleCallback.invoke(SubtitleFile(lang, file))
+                    }
+                }
+            } catch (e: Exception) {
+                DebugLog.error("vidora", "API error", e)
             }
-        } catch (ex: Exception) {
-            log.append("VidRock exception: ${ex.message}\n")
         }
 
-        // 2. NxSha API
+        if (found) return true
+
+        // 2) Fallback: WebView + tự bấm play, bắt .m3u8
         try {
-            val nxReq = JSONObject().apply {
-                put("tmdbId", id.toString())
-                put("type", type)
-                put("season", if (type == "tv") s else 0)
-                put("episode", if (type == "tv") e else 0)
+            val resolver = WebViewResolver(
+                interceptUrl   = Regex("\\.m3u8"),
+                useOkhttp      = false,
+                script         = autoPlayScript,
+                scriptCallback = { },
+                timeout        = 25_000L
+            )
+            val stream = app.get(data, referer = "$mainUrl/", interceptor = resolver).url
+            DebugLog.log("webview", "kết quả: $stream")
+            if (stream.contains(".m3u8")) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name   = name,
+                        url    = stream,
+                        type   = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                        this.headers = streamHeaders
+                    }
+                )
+                found = true
             }
-            val encodedQuery = nxEncode(nxReq)
-            val srvResp = app.get("$nxBase/api/servers?q=$encodedQuery", headers = mapOf("User-Agent" to ua), timeout = 10L).text
-            
-            if (srvResp.trim().startsWith("<")) {
-                log.append("NxSha returned HTML/Cloudflare block snippet: ${srvResp.take(200)}\n")
-            } else {
-                val srvHash = JSONObject(srvResp).optString("_hash", "")
-                if (srvHash.isNotBlank()) {
-                    val srvDec = nxDecode(srvHash, log)
-                    val servers = srvDec.optJSONArray("servers") ?: JSONArray()
-                    log.append("NxSha found servers count: ${servers.length()}\n")
-                } else {
-                    log.append("NxSha hash empty in response: ${srvResp.take(200)}\n")
-                }
-            }
-        } catch (ex: Exception) {
-            log.append("NxSha exception: ${ex.message}\n")
+        } catch (e: Exception) {
+            DebugLog.log("webview", "lỗi: $e")
         }
 
-        // 3. VidLove API
-        try {
-            val vlBase = if (type == "tv") "/tv?id=$id&season=$s&episode=$e&mode=json" else "/movie?id=$id&mode=json"
-            val fullUrl = "$vidloveBase$vlBase"
-            log.append("VidLove trying URL: $fullUrl\n")
-            val resp = app.get(fullUrl, headers = mapOf("User-Agent" to ua, "Referer" to playerRef, "Origin" to "https://cinejoy.pk"), timeout = 6L).text
-            
-            if (resp.trim().startsWith("<")) {
-                log.append("VidLove blocked by Cloudflare (HTML returned)\n")
-            } else {
-                val j = JSONObject(resp)
-                val src = j.optJSONObject("source")
-                val sUrl = src?.optString("url", "") ?: ""
-                if (sUrl.startsWith("http") && !blockedHostRegex.containsMatchIn(sUrl) && seenUrls.add(sUrl)) {
-                    callback(newExtractorLink("CineJoy", "VidLove", sUrl, ExtractorLinkType.M3U8) {
-                        this.referer = playerRef
-                        this.quality = Qualities.P1080.value
-                    })
-                    totalLinks++
-                }
-            }
-        } catch (ex: Exception) {
-            log.append("VidLove exception: ${ex.message}\n")
+        if (!found) {
+            DebugLog.error("links", "Không tìm thấy link phát cho $data")
         }
-
-        log.append("Tổng liên kết tìm được: $totalLinks\n")
-
-        if (totalLinks == 0) {
-            val errorLogContent = log.toString()
-            android.util.Log.e("CineJoyError", errorLogContent)
-            try {
-                CineJoyPlugin.appContext?.let { ctx ->
-                    val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("CineJoy Debug Log", errorLogContent))
-                }
-            } catch (_: Exception) {}
-        }
-
-        return totalLinks > 0
-    }
-
-    private fun decryptVidRock(token: String, log: StringBuilder): String {
-        return runCatching {
-            val parts = token.split(".")
-            if (parts.size != 3) {
-                log.append("VidRock token parts size != 3\n")
-                return ""
-            }
-            val iv = Base64.decode(parts[0], Base64.URL_SAFE or Base64.NO_WRAP)
-            val ciphertext = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP)
-            val tag = Base64.decode(parts[2], Base64.URL_SAFE or Base64.NO_WRAP)
-            val combined = ByteArray(ciphertext.size + tag.size)
-            System.arraycopy(ciphertext, 0, combined, 0, ciphertext.size)
-            System.arraycopy(tag, 0, combined, ciphertext.size, tag.size)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(hexStringToByteArray(vidrockKeyHex), "AES"), GCMParameterSpec(tag.size * 8, iv))
-            String(cipher.doFinal(combined), Charsets.UTF_8)
-        }.onFailure {
-            log.append("VidRock decrypt error: ${it.message}\n")
-        }.getOrDefault("")
-    }
-
-    private fun hexStringToByteArray(s: String): ByteArray {
-        val len = s.length
-        val data = ByteArray(len / 2)
-        for (i in 0 until len step 2) {
-            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
-        }
-        return data
-    }
-
-    private fun evpBytesToKey(password: ByteArray, salt: ByteArray, keyLen: Int, ivLen: Int): Pair<ByteArray, ByteArray> {
-        val md = MessageDigest.getInstance("MD5")
-        var currentHash = ByteArray(0)
-        val totalNeeded = keyLen + ivLen
-        val keyAndIv = ByteArray(totalNeeded)
-        var count = 0
-        while (count < totalNeeded) {
-            md.reset()
-            if (currentHash.isNotEmpty()) md.update(currentHash)
-            md.update(password)
-            md.update(salt)
-            currentHash = md.digest()
-            val toCopy = minOf(currentHash.size, totalNeeded - count)
-            System.arraycopy(currentHash, 0, keyAndIv, count, toCopy)
-            count += toCopy
-        }
-        return Pair(keyAndIv.copyOfRange(0, keyLen), keyAndIv.copyOfRange(keyLen, keyLen + ivLen))
-    }
-
-    private fun nxDecode(hashStr: String, log: StringBuilder): JSONObject {
-        return runCatching {
-            val raw = Base64.decode(hashStr, Base64.DEFAULT)
-            if (raw.size < 16) {
-                log.append("NxSha raw size < 16\n")
-                return JSONObject()
-            }
-            val (salt, ciphertext) = if (String(raw, 0, 8, Charsets.US_ASCII) == "Salted__") {
-                Pair(raw.copyOfRange(8, 16), raw.copyOfRange(16, raw.size))
-            } else {
-                Pair(ByteArray(8), raw)
-            }
-            val (key, iv) = evpBytesToKey(nxPass.toByteArray(Charsets.UTF_8), salt, 32, 16)
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            JSONObject(String(cipher.doFinal(ciphertext), Charsets.UTF_8))
-        }.onFailure {
-            log.append("NxSha decode error: ${it.message}\n")
-        }.getOrDefault(JSONObject())
-    }
-
-    private fun nxEncode(obj: JSONObject): String {
-        return runCatching {
-            val plaintext = obj.toString().toByteArray(Charsets.UTF_8)
-            val salt = ByteArray(8)
-            SecureRandom().nextBytes(salt)
-            val (key, iv) = evpBytesToKey(nxPass.toByteArray(Charsets.UTF_8), salt, 32, 16)
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            val ciphertext = cipher.doFinal(plaintext)
-            val header = "Salted__".toByteArray(Charsets.US_ASCII)
-            val result = ByteArray(header.size + salt.size + ciphertext.size)
-            System.arraycopy(header, 0, result, 0, header.size)
-            System.arraycopy(salt, 0, result, header.size, salt.size)
-            System.arraycopy(ciphertext, 0, result, header.size + salt.size, ciphertext.size)
-            URLEncoder.encode(Base64.encodeToString(result, Base64.NO_WRAP), "UTF-8")
-        }.getOrDefault("")
+        return found
     }
 }
