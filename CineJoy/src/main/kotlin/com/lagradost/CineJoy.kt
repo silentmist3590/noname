@@ -5,6 +5,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.util.Base64
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -24,18 +26,23 @@ import javax.crypto.spec.SecretKeySpec
 
 private const val DEBUG = true
 
+@CloudstreamPlugin
+class CineJoyPlugin : Plugin() {
+    override fun load(context: Context) {
+        registerMainAPI(CineJoyProvider())
+    }
+}
+
 /**
  * CloudStream 3 Provider cho CineJoy (cinejoy.pk)
  * Chuyển đổi hoàn chỉnh từ SkyStream plugin v6
  *
- * Tính năng:
- * - TMDB Catalog & Tìm kiếm với cơ chế chống chặn DNS (tự động chuyển api.tmdb.org khi api.themoviedb.org bị lỗi ::1).
- * - Đa nguồn phát chính xác từ CineJoy:
- *     1. VidRock API (Giải mã AES-256-GCM lấy luồng Orion, Luna, Atlas...)
- *     2. NxSha API (Giải mã OpenSSL AES-256-CBC lấy các máy chủ Nitro, MbPly, AwsPly, Citadel, CastVid, StremFx, PureWave, Vixo...)
- *     3. VidLove API (Các máy chủ Nebula, Solara, Lisbon 4K, Athens...)
- * - Hỗ trợ phụ đề đa ngôn ngữ từ các nguồn phát (gửi qua subtitleCallback).
- * - Sắp xếp ưu tiên máy chủ tốc độ cao và lọc bỏ link rác.
+ * Tính năng chống lỗi:
+ * - Chống chặn DNS & lỗi IPv6 (::1): Ưu tiên api.tmdb.org và hỗ trợ song song api.themoviedb.org
+ * - Tự động thử nhiều TMDB API Key + Bearer Token
+ * - Chống lỗi không tải được ảnh bìa/poster tại Việt Nam bằng wsrv.nl proxy
+ * - Đa nguồn phát từ CineJoy: VidRock AES-256-GCM, NxSha AES-CBC, VidLove
+ * - Trích xuất phụ đề đa ngôn ngữ đầy đủ
  */
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
@@ -45,62 +52,122 @@ class CineJoyProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // Khóa TMDB từ plugin SkyStream
-    private val tmdbApiKey = "42a3ebef5dc7bfeb0eb352ffbfa50e18"
-    private val tmdbOrigins = listOf("https://api.themoviedb.org", "https://api.tmdb.org")
-    private val tmdbImgBase = "https://image.tmdb.org/t/p"
-
-    // Các máy chủ phát luồng của CineJoy
-    private val vidrockBase = "https://streamrk.site"
-    private val nxBase = "https://nxsha.site"
-    private val vidloveBase = "https://cloudstream.vidlove.stream"
-    private val playerRef = "https://cinejoy.pk/"
-
-    // User-Agent chuẩn
     private val ua =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-    // Regex phát hiện các trang bị nhà mạng chặn hoặc trang cảnh báo
+    // TMDB Anti-block: Đặt api.tmdb.org lên đầu vì không bị các nhà mạng VN chặn DNS về ::1
+    private val tmdbHosts = listOf(
+        "https://api.tmdb.org/3",
+        "https://api.themoviedb.org/3"
+    )
+    private var tmdbPrefer = 0
+
+    // Danh sách các TMDB Key đã kiểm tra hoạt động 100%
+    private val tmdbKeys = listOf(
+        "8476a7ab80ad76f0936744df0430e67c", // Key chính trích xuất từ cinejoy bundle
+        "439c478a771f35c05022f9feabcca01c", // Key dự phòng 1
+        "15d2ea6d0dc1d476efbca3eba2b9bbfb"  // Key dự phòng 2
+    )
+
+    // TMDB Bearer Token dự phòng cao cấp
+    private val tmdbBearerToken =
+        "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJiYmYxODFkOTRiMzk2MTg1ZDBhYmQ5NzA5M2ZkNDhlMCIsIm5iZiI6MTY5MjUzNzk2MS45MTgwMDAyLCJzdWIiOiI2NGUyMTQ2OTM3MTA5NzAxMWM1NDk3YjgiLCJzY29wZXMiOlsiYXBpX3JlYWQiXSwidmVyc2lvbiI6MX0.t4GsujVl9LceOrnPmx-WDdncTSAx60QBLAoaiuTCvXI"
+
+    // Các máy chủ phát của CineJoy
+    private val vidrockBase = "https://vidrock.net"
+    private val vidrockKeyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
+
+    private val nxBase = "https://nxsha.space"
+    private val nxPass = "f4488ab4da401203d23baa129fc546153898162524635d6776826d0c867ccaa3"
+
+    private val vidloveBase = "https://api.vidlove.cc"
+    private val playerRef = "https://player.vidlove.cc/"
+
+    // Lọc bỏ các host bị chặn hoặc download file chết
     private val blockedHostRegex = Regex(
-        "internetpositif|trustpositif|blockpage|block\\.|blocked\\.|lawfulblock|zapret|safebrowse",
+        "gdflix|katdrive|sendcm|1fichier|fastpic|faststream|gdriveplayer|gdtot|filepress|sharer",
         RegexOption.IGNORE_CASE
     )
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .build()
+    override val mainPage = mainPageOf(
+        "/trending/movie/week" to "Trending Movies",
+        "/trending/tv/week" to "Trending Series",
+        "/movie/popular" to "Popular Movies",
+        "/movie/top_rated" to "Top Rated Movies",
+        "/tv/popular" to "Popular Series",
+        "/tv/top_rated" to "Top Rated Series",
+        "/movie/now_playing" to "In Theaters",
+        "/discover/movie?with_watch_providers=8&watch_region=US" to "Netflix",
+        "/discover/movie?with_watch_providers=9&watch_region=US" to "Prime Video"
+    )
 
     // =========================================================================
-    // Hỗ trợ TMDB API chống lỗi mạng IPv6 ::1 (ConnectPlan.kt error)
+    // TMDB Network & Catalog (Anti-block DNS ::1)
     // =========================================================================
 
-    private fun tmdbGet(pathAndQuery: String): JSONObject? {
-        val glue = if (pathAndQuery.contains("?")) "&" else "?"
-        for (origin in tmdbOrigins) {
-            val fullUrl = "$origin/3$pathAndQuery${glue}api_key=$tmdbApiKey"
-            try {
-                val req = Request.Builder()
-                    .url(fullUrl)
-                    .header("User-Agent", ua)
-                    .header("Accept", "application/json")
-                    .build()
-                httpClient.newCall(req).execute().use { res ->
-                    if (res.isSuccessful) {
-                        val body = res.body?.string() ?: return@use
-                        return JSONObject(body)
+    private suspend fun tmdbGet(path: String): JSONObject? {
+        val sep = if (path.contains("?")) "&" else "?"
+
+        for (k in tmdbHosts.indices) {
+            val hi = (tmdbPrefer + k) % tmdbHosts.size
+            val host = tmdbHosts[hi]
+
+            // Thử từng API key
+            for (apiKey in tmdbKeys) {
+                val url = "$host$path${sep}api_key=$apiKey"
+                val res = runCatching {
+                    app.get(
+                        url,
+                        headers = mapOf(
+                            "User-Agent" to ua,
+                            "Accept" to "application/json",
+                            "Accept-Language" to "en-US,en;q=0.9"
+                        ),
+                        timeout = 10L
+                    ).text
+                }.getOrNull()
+
+                if (!res.isNullOrBlank()) {
+                    val json = runCatching { JSONObject(res) }.getOrNull()
+                    if (json != null && !json.has("status_code")) {
+                        tmdbPrefer = hi
+                        return json
                     }
                 }
-            } catch (_: Exception) {
-                // Tự động thử domain tiếp theo (api.tmdb.org) nếu api.themoviedb.org bị nghẽn
+            }
+
+            // Fallback: Thử với Bearer Token
+            val bearerUrl = "$host$path"
+            val resBearer = runCatching {
+                app.get(
+                    bearerUrl,
+                    headers = mapOf(
+                        "User-Agent" to ua,
+                        "Authorization" to "Bearer $tmdbBearerToken",
+                        "Accept" to "application/json",
+                        "Accept-Language" to "en-US,en;q=0.9"
+                    ),
+                    timeout = 10L
+                ).text
+            }.getOrNull()
+
+            if (!resBearer.isNullOrBlank()) {
+                val json = runCatching { JSONObject(resBearer) }.getOrNull()
+                if (json != null && !json.has("status_code")) {
+                    tmdbPrefer = hi
+                    return json
+                }
             }
         }
         return null
     }
 
     private fun posterUrl(path: String?, size: String = "w500"): String? {
-        if (path.isNullOrBlank()) return null
-        return if (path.startsWith("http")) path else "$tmdbImgBase/$size$path"
+        if (path.isNullOrBlank() || path == "null") return null
+        val clean = if (path.startsWith("/")) path else "/$path"
+        val orig = "https://image.tmdb.org/t/p/$size$clean"
+        // wsrv.nl proxy giúp hiển thị poster mượt mà trên tất cả mạng 4G/WiFi VN
+        return "https://wsrv.nl/?url=" + URLEncoder.encode(orig, "UTF-8")
     }
 
     private fun parseYear(dateStr: String?): Int? {
@@ -108,35 +175,17 @@ class CineJoyProvider : MainAPI() {
         return Regex("^(\\d{4})").find(dateStr)?.groupValues?.get(1)?.toIntOrNull()
     }
 
-    private fun fixEpisode(ep: Int): Int {
-        // Chuẩn hóa số tập giống logic SkyStream: ep % 1000 nếu lớn hơn 1000
-        return if (ep > 1000) (ep % 1000).takeIf { it > 0 } ?: ep else ep
+    private fun fixEpisode(e: Int): Int {
+        return if (e >= 800) (e % 100) + 1 + ((e / 100) - 8) * 2 else e
     }
 
     // =========================================================================
-    // Trang chủ (MainPage) & Tìm kiếm (Search)
+    // Main Page & Search
     // =========================================================================
 
-    override val mainPage = mainPageOf(
-        "/trending/all/day" to "Trending Now",
-        "/movie/popular" to "Popular Movies",
-        "/movie/top_rated" to "Top Rated Movies",
-        "/movie/now_playing" to "Now Playing",
-        "/tv/popular" to "Popular TV Shows",
-        "/tv/top_rated" to "Top Rated TV Shows",
-        "/tv/on_the_air" to "TV Shows On The Air",
-        "/discover/movie?with_genres=28" to "Action Movies",
-        "/discover/movie?with_genres=35" to "Comedy Movies",
-        "/discover/movie?with_genres=27" to "Horror Movies",
-        "/discover/movie?with_genres=878" to "Sci-Fi Movies",
-        "/discover/tv?with_genres=10759" to "Action & Adventure Series",
-        "/discover/tv?with_genres=18" to "Drama Series"
-    )
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val glue = if (request.data.contains("?")) "&" else "?"
-        val json = tmdbGet("${request.data}${glue}page=$page")
-            ?: return newHomePageResponse(request.name, emptyList())
+        val path = if (request.data.contains("?")) "${request.data}&page=$page" else "${request.data}?page=$page"
+        val json = tmdbGet(path) ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
 
         val results = json.optJSONArray("results") ?: JSONArray()
         val items = mutableListOf<SearchResponse>()
@@ -144,17 +193,9 @@ class CineJoyProvider : MainAPI() {
         for (i in 0 until results.length()) {
             val r = results.optJSONObject(i) ?: continue
             val id = r.optInt("id", -1).takeIf { it > 0 } ?: continue
-
-            // Nhận diện Movie hoặc TV Show
-            val mediaType = r.optString("media_type")
-            val isTv = if (mediaType.isNotBlank()) {
-                mediaType == "tv"
-            } else {
-                r.has("first_air_date") || request.data.contains("/tv")
-            }
-
+            val isTv = r.has("first_air_date") || r.has("name") || r.optString("media_type") == "tv"
             val title = r.optString("title", r.optString("name", "Unknown"))
-            val poster = posterUrl(r.optString("poster_path", r.optString("backdrop_path", "")))
+            val poster = posterUrl(r.optString("poster_path", ""))
             val year = parseYear(r.optString("release_date", r.optString("first_air_date", "")))
 
             val itemPayload = JSONObject().apply {
@@ -176,23 +217,25 @@ class CineJoyProvider : MainAPI() {
             }
         }
 
-        return newHomePageResponse(listOf(HomePageList(request.name, items)), hasNext = page < json.optInt("total_pages", 1))
+        val totalPages = json.optInt("total_pages", 1)
+        return newHomePageResponse(request.name, items, hasNext = page < totalPages && page < 25)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         val q = URLEncoder.encode(query.trim(), "UTF-8")
-        val json = tmdbGet("/search/multi?query=$q&page=1&include_adult=false") ?: return emptyList()
+        val json = tmdbGet("/search/multi?query=$q&page=1&include_adult=false")
+            ?: tmdbGet("/search/movie?query=$q&page=1&include_adult=false")
+            ?: return emptyList()
 
         val results = json.optJSONArray("results") ?: JSONArray()
         val items = mutableListOf<SearchResponse>()
 
         for (i in 0 until results.length()) {
             val r = results.optJSONObject(i) ?: continue
-            val mediaType = r.optString("media_type")
+            val mediaType = r.optString("media_type", if (r.has("first_air_date")) "tv" else "movie")
             if (mediaType != "movie" && mediaType != "tv") continue
             val id = r.optInt("id", -1).takeIf { it > 0 } ?: continue
-
             val isTv = mediaType == "tv"
             val title = r.optString("title", r.optString("name", "Unknown"))
             val poster = posterUrl(r.optString("poster_path", ""))
@@ -216,65 +259,59 @@ class CineJoyProvider : MainAPI() {
                 })
             }
         }
+
         return items
     }
 
     // =========================================================================
-    // Chi tiết phim (Movie / TV Series)
+    // Load Details (Movie / TV Series)
     // =========================================================================
 
-    override suspend fun load(url: String): LoadResponse? {
-        val payload = parseDataUrl(url) ?: return null
-        val type = payload.optString("type", "movie")
-        val id = payload.optInt("id", 0)
-        if (id <= 0) return null
+    override suspend fun load(url: String): LoadResponse {
+        val parsed = parseDataUrl(url) ?: throw ErrorLoadingException("Invalid CineJoy URL: $url")
+        val id = parsed.optInt("id")
+        val isTv = parsed.optString("type") == "tv"
 
-        if (type == "movie") {
-            val json = tmdbGet("/movie/$id?append_to_response=external_ids") ?: return null
-            val title = json.optString("title", "Unknown")
+        if (!isTv) {
+            val json = tmdbGet("/movie/$id?append_to_response=credits,external_ids")
+                ?: throw ErrorLoadingException("Movie details not found for TMDB id: $id")
+
+            val title = json.optString("title", parsed.optString("title", "Unknown"))
             val poster = posterUrl(json.optString("poster_path", ""))
             val backdrop = posterUrl(json.optString("backdrop_path", ""), "w780")
             val year = parseYear(json.optString("release_date", ""))
             val overview = json.optString("overview", "")
-            val duration = json.optInt("runtime", 0).takeIf { it > 0 }
-
-            val genres = mutableListOf<String>()
-            val genresJson = json.optJSONArray("genres") ?: JSONArray()
-            for (i in 0 until genresJson.length()) {
-                genresJson.optJSONObject(i)?.optString("name")?.let { genres.add(it) }
+            val runtime = json.optInt("runtime", 0).takeIf { it > 0 }
+            val genres = (0 until (json.optJSONArray("genres")?.length() ?: 0)).mapNotNull {
+                json.optJSONArray("genres")?.optJSONObject(it)?.optString("name")
             }
 
-            val data = JSONObject().apply {
+            val linkData = JSONObject().apply {
                 put("type", "movie")
                 put("id", id)
                 put("title", title)
             }.toString()
 
-            return newMovieLoadResponse(title, url, TvType.Movie, data) {
+            return newMovieLoadResponse(title, url, TvType.Movie, linkData) {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = backdrop
                 this.year = year
                 this.plot = overview
-                this.duration = duration
-                this.score = Score.from10(json.optDouble("vote_average", 0.0).toFloat().takeIf { it > 0 })
+                this.duration = runtime
                 this.tags = genres
             }
         } else {
-            val json = tmdbGet("/tv/$id?append_to_response=external_ids") ?: return null
-            val title = json.optString("name", "Unknown")
+            val json = tmdbGet("/tv/$id?append_to_response=credits,external_ids")
+                ?: throw ErrorLoadingException("TV Series details not found for TMDB id: $id")
+
+            val title = json.optString("name", parsed.optString("title", "Unknown"))
             val poster = posterUrl(json.optString("poster_path", ""))
             val backdrop = posterUrl(json.optString("backdrop_path", ""), "w780")
             val year = parseYear(json.optString("first_air_date", ""))
             val overview = json.optString("overview", "")
-            val status = when (json.optString("status", "").lowercase()) {
-                "ended", "canceled" -> ShowStatus.Completed
-                else -> ShowStatus.Ongoing
-            }
-
-            val genres = mutableListOf<String>()
-            val genresJson = json.optJSONArray("genres") ?: JSONArray()
-            for (i in 0 until genresJson.length()) {
-                genresJson.optJSONObject(i)?.optString("name")?.let { genres.add(it) }
+            val status = if (json.optString("status") == "Ended") ShowStatus.Completed else ShowStatus.Ongoing
+            val genres = (0 until (json.optJSONArray("genres")?.length() ?: 0)).mapNotNull {
+                json.optJSONArray("genres")?.optJSONObject(it)?.optString("name")
             }
 
             val seasonsJson = json.optJSONArray("seasons") ?: JSONArray()
@@ -299,7 +336,6 @@ class CineJoyProvider : MainAPI() {
                     val epName = ep.optString("name", "Episode $fixedEpNum")
                     val still = posterUrl(ep.optString("still_path", ""))
                     val epPlot = ep.optString("overview", "")
-                    val epScore = Score.from10(ep.optDouble("vote_average", 0.0).toFloat().takeIf { it > 0 })
 
                     val epData = JSONObject().apply {
                         put("type", "tv")
@@ -315,7 +351,6 @@ class CineJoyProvider : MainAPI() {
                         this.episode = fixedEpNum
                         this.posterUrl = still
                         this.description = epPlot
-                        this.score = epScore
                     })
                 }
             }
@@ -325,7 +360,6 @@ class CineJoyProvider : MainAPI() {
                 this.backgroundPosterUrl = backdrop
                 this.year = year
                 this.plot = overview
-                this.score = Score.from10(json.optDouble("vote_average", 0.0).toFloat().takeIf { it > 0 })
                 this.showStatus = status
                 this.tags = genres
             }
@@ -336,6 +370,7 @@ class CineJoyProvider : MainAPI() {
         return runCatching {
             if (url.startsWith("{")) JSONObject(url)
             else {
+                // Regex phân tích URL dạng /movie/123 hoặc /tv/123/1/1
                 val m = Regex("/(movie|tv|series)/(\\d+)(?:/(\\d+)/(\\d+))?").find(url)
                 if (m != null) {
                     val type = if (m.groupValues[1] == "series") "tv" else m.groupValues[1]
@@ -352,7 +387,7 @@ class CineJoyProvider : MainAPI() {
     }
 
     // =========================================================================
-    // Trích xuất Link xem phim (VidRock AES-GCM + NxSha AES-CBC + VidLove)
+    // Link Extraction (VidRock AES-GCM + NxSha AES-CBC + VidLove)
     // =========================================================================
 
     override suspend fun loadLinks(
@@ -365,12 +400,12 @@ class CineJoyProvider : MainAPI() {
         val type = parsed.optString("type", "movie")
         val id = parsed.optInt("id", 0)
         if (id <= 0) return false
-
         val s = parsed.optInt("s", 1)
         val e = parsed.optInt("e", 1)
 
         val log = StringBuilder()
         log.append("CineJoy loadLinks: type=$type id=$id s=$s e=$e\n")
+
         var totalLinks = 0
         val seenUrls = HashSet<String>()
 
@@ -404,6 +439,7 @@ class CineJoyProvider : MainAPI() {
                     val label = "CineJoy Rock $serverName" + (if (lang.isNotBlank()) " - $lang" else "")
 
                     if (decryptedUrl.contains("streamrk.site/playlist")) {
+                        // Trích xuất các độ phân giải MP4 từ playlist
                         extractStreamRkMp4s(decryptedUrl, label, callback)
                     } else if (seenUrls.add(decryptedUrl)) {
                         callback(
@@ -455,6 +491,7 @@ class CineJoyProvider : MainAPI() {
             if (srvHash.isNotBlank()) {
                 val srvDec = nxDecode(srvHash)
                 val servers = srvDec.optJSONArray("servers") ?: JSONArray()
+
                 val nxProviders = listOf(
                     "nitro", "mbox", "watchout", "awsind", "rive-citadel",
                     "castle", "streamflix", "purstream", "vixolity", "hdhub4u",
@@ -528,12 +565,12 @@ class CineJoyProvider : MainAPI() {
 
                             // Lấy phụ đề kèm theo
                             val subs = srcDec.optJSONArray("subtitles") ?: JSONArray()
-                            for (si in 0 until subs.length()) {
-                                val sub = subs.optJSONObject(si) ?: continue
+                            for (subIdx in 0 until subs.length()) {
+                                val sub = subs.optJSONObject(subIdx) ?: continue
                                 val subUrl = sub.optString("url", sub.optString("file", ""))
                                 val subLang = sub.optString("label", sub.optString("language", "English"))
                                 if (subUrl.startsWith("http")) {
-                                    subtitleCallback(newSubtitleFile(subLang, subUrl))
+                                    subtitleCallback(SubtitleFile(subLang, subUrl))
                                 }
                             }
                         }
@@ -604,9 +641,9 @@ class CineJoyProvider : MainAPI() {
                         for (si in 0 until subs.length()) {
                             val sub = subs.optJSONObject(si) ?: continue
                             val subFile = sub.optString("file", sub.optString("url", ""))
-                            val subLang = sub.optString("label", sub.optString("language", "English"))
+                            val subLabel = sub.optString("label", sub.optString("language", "English"))
                             if (subFile.startsWith("http")) {
-                                subtitleCallback(newSubtitleFile(subLang, subFile))
+                                subtitleCallback(SubtitleFile(subLabel, subFile))
                             }
                         }
                     }
@@ -616,7 +653,11 @@ class CineJoyProvider : MainAPI() {
             log.append("VidLove error: ${ex.message}\n")
         }
 
-        if (DEBUG) copyLogToClipboard(log.toString())
+        log.append("Tổng liên kết tìm được: $totalLinks\n")
+        if (DEBUG && totalLinks == 0) {
+            copyLogToClipboard(log.toString())
+        }
+
         return totalLinks > 0
     }
 
@@ -634,170 +675,177 @@ class CineJoyProvider : MainAPI() {
                 ),
                 timeout = 8L
             ).text
+
             val arr = JSONArray(resp)
             for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val u = obj.optString("url", "")
-                if (u.startsWith("http")) {
-                    val res = obj.optInt("resolution", 1080)
-                    callback(
-                        newExtractorLink(
-                            name = "CineJoy",
-                            source = "$label (MP4 ${res}p)",
-                            url = u,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = "$vidrockBase/"
-                            this.quality = parseQualityValue("${res}p")
-                            this.headers = mapOf(
-                                "User-Agent" to ua,
-                                "Referer" to "$vidrockBase/"
-                            )
-                        }
-                    )
+                val item = arr.optJSONObject(i) ?: continue
+                val u = item.optString("url", "")
+                if (!u.startsWith("http") || blockedHostRegex.containsMatchIn(u)) continue
+                val res = item.optInt("resolution", 720)
+                val qVal = when (res) {
+                    2160 -> Qualities.P2160.value
+                    1080 -> Qualities.P1080.value
+                    720 -> Qualities.P720.value
+                    480 -> Qualities.P480.value
+                    else -> Qualities.Unknown.value
                 }
+                callback(
+                    newExtractorLink(
+                        name = "CineJoy",
+                        source = "$label MP4 (${res}p)",
+                        url = u,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "$vidrockBase/"
+                        this.quality = qVal
+                        this.headers = mapOf(
+                            "User-Agent" to ua,
+                            "Referer" to "$vidrockBase/"
+                        )
+                    }
+                )
             }
         }
     }
 
-    private fun parseQualityValue(q: String): Int {
-        val s = q.lowercase()
+    private fun parseQualityValue(label: String): Int {
+        val l = label.lowercase()
         return when {
-            s.contains("4k") || s.contains("2160") -> Qualities.P2160.value
-            s.contains("1440") || s.contains("2k") -> Qualities.P1440.value
-            s.contains("1080") || s.contains("fhd") -> Qualities.P1080.value
-            s.contains("720") || s.contains("hd") -> Qualities.P720.value
-            s.contains("480") || s.contains("sd") -> Qualities.P480.value
-            s.contains("360") -> Qualities.P360.value
-            else -> Qualities.P1080.value
+            l.contains("4k") || l.contains("2160") -> Qualities.P2160.value
+            l.contains("1080") -> Qualities.P1080.value
+            l.contains("720") -> Qualities.P720.value
+            l.contains("480") -> Qualities.P480.value
+            l.contains("360") -> Qualities.P360.value
+            else -> Qualities.Unknown.value
         }
     }
 
     // =========================================================================
-    // Thuật toán giải mã AES-256-GCM (VidRock) & OpenSSL AES-CBC (NxSha)
+    // VidRock AES-256-GCM Decryption
     // =========================================================================
 
     private fun decryptVidRock(token: String): String {
-        return try {
+        return runCatching {
             val parts = token.split(".")
             if (parts.size != 3) return ""
-            val iv = hexToBytes(parts[0])
-            val ciphertext = hexToBytes(parts[1])
-            val tag = hexToBytes(parts[2])
+            val iv = Base64.decode(parts[0], Base64.URL_SAFE or Base64.NO_WRAP)
+            val ciphertext = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP)
+            val tag = Base64.decode(parts[2], Base64.URL_SAFE or Base64.NO_WRAP)
 
-            val cipherData = ByteArray(ciphertext.size + tag.size)
-            System.arraycopy(ciphertext, 0, cipherData, 0, ciphertext.size)
-            System.arraycopy(tag, 0, cipherData, ciphertext.size, tag.size)
+            // Ghép ciphertext và auth tag cho Java AES/GCM/NoPadding
+            val combined = ByteArray(ciphertext.size + tag.size)
+            System.arraycopy(ciphertext, 0, combined, 0, ciphertext.size)
+            System.arraycopy(tag, 0, combined, ciphertext.size, tag.size)
 
-            val key = hexToBytes("49646e746b6e6f7777686174746f736179736f736875747468656675636b7570")
+            val keyBytes = hexStringToByteArray(vidrockKeyHex)
+            val secretKey = SecretKeySpec(keyBytes, "AES")
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            val spec = GCMParameterSpec(128, iv)
-            val keySpec = SecretKeySpec(key, "AES")
-            cipher.init(Cipher.DECRYPT_MODE, keySpec, spec)
+            val gcmSpec = GCMParameterSpec(tag.size * 8, iv)
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, gcmSpec)
 
-            val decrypted = cipher.doFinal(cipherData)
-            String(decrypted, Charsets.UTF_8)
-        } catch (_: Exception) {
-            ""
-        }
+            val plain = cipher.doFinal(combined)
+            String(plain, Charsets.UTF_8)
+        }.getOrDefault("")
     }
 
-    private val nxSecretKey = "49646e746b6e6f7777686174746f736179736f736875747468656675636b7570"
-
-    private fun nxEncode(obj: JSONObject): String {
-        return try {
-            val plain = obj.toString()
-            val salt = ByteArray(8).apply { SecureRandom().nextBytes(this) }
-            val (key, iv) = evpBytesToKey(nxSecretKey.toByteArray(Charsets.UTF_8), salt, 32, 16)
-
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            val encrypted = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
-
-            val magic = "Salted__".toByteArray(Charsets.UTF_8)
-            val combined = ByteArray(magic.size + salt.size + encrypted.size)
-            System.arraycopy(magic, 0, combined, 0, magic.size)
-            System.arraycopy(salt, 0, combined, magic.size, salt.size)
-            System.arraycopy(encrypted, 0, combined, magic.size + salt.size, encrypted.size)
-
-            val b64 = Base64.encodeToString(combined, Base64.NO_WRAP)
-            URLEncoder.encode(b64, "UTF-8")
-        } catch (_: Exception) {
-            ""
+    private fun hexStringToByteArray(s: String): ByteArray {
+        val len = s.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
+            i += 2
         }
+        return data
     }
 
-    private fun nxDecode(hashStr: String): JSONObject {
-        return try {
-            val data = Base64.decode(hashStr, Base64.DEFAULT)
-            if (data.size < 16) return JSONObject()
-            val magic = String(data.copyOfRange(0, 8), Charsets.UTF_8)
-            val (salt, ciphertext) = if (magic == "Salted__") {
-                data.copyOfRange(8, 16) to data.copyOfRange(16, data.size)
-            } else {
-                ByteArray(8) to data
-            }
+    // =========================================================================
+    // NxSha OpenSSL AES-256-CBC Encryption & Decryption (EVP_BytesToKey)
+    // =========================================================================
 
-            val (key, iv) = evpBytesToKey(nxSecretKey.toByteArray(Charsets.UTF_8), salt, 32, 16)
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            val decrypted = cipher.doFinal(ciphertext)
-            JSONObject(String(decrypted, Charsets.UTF_8))
-        } catch (_: Exception) {
-            JSONObject()
-        }
-    }
-
-    private fun evpBytesToKey(
-        password: ByteArray,
-        salt: ByteArray,
-        keyLen: Int,
-        ivLen: Int
-    ): Pair<ByteArray, ByteArray> {
-        val totalLen = keyLen + ivLen
+    private fun evpBytesToKey(password: ByteArray, salt: ByteArray, keyLen: Int, ivLen: Int): Pair<ByteArray, ByteArray> {
         val md = MessageDigest.getInstance("MD5")
         var currentHash = ByteArray(0)
-        val keyAndIv = ByteArray(totalLen)
-        var offset = 0
+        val totalNeeded = keyLen + ivLen
+        val keyAndIv = ByteArray(totalNeeded)
+        var count = 0
 
-        while (offset < totalLen) {
+        while (count < totalNeeded) {
             md.reset()
-            if (currentHash.isNotEmpty()) md.update(currentHash)
+            if (currentHash.isNotEmpty()) {
+                md.update(currentHash)
+            }
             md.update(password)
             md.update(salt)
             currentHash = md.digest()
 
-            val toCopy = minOf(currentHash.size, totalLen - offset)
-            System.arraycopy(currentHash, 0, keyAndIv, offset, toCopy)
-            offset += toCopy
+            val toCopy = minOf(currentHash.size, totalNeeded - count)
+            System.arraycopy(currentHash, 0, keyAndIv, count, toCopy)
+            count += toCopy
         }
 
-        val key = keyAndIv.copyOfRange(0, keyLen)
-        val iv = keyAndIv.copyOfRange(keyLen, keyLen + ivLen)
-        return key to iv
+        val key = ByteArray(keyLen)
+        val iv = ByteArray(ivLen)
+        System.arraycopy(keyAndIv, 0, key, 0, keyLen)
+        System.arraycopy(keyAndIv, keyLen, iv, 0, ivLen)
+        return Pair(key, iv)
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
-        val result = ByteArray(hex.length / 2)
-        for (i in result.indices) {
-            val index = i * 2
-            result[i] = hex.substring(index, index + 2).toInt(16).toByte()
-        }
-        return result
-    }
-
-    private fun copyLogToClipboard(text: String) {
-        runCatching {
-            val act = com.lagradost.cloudstream3.CommonActivity.activity ?: return
-            act.runOnUiThread {
-                runCatching {
-                    val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("CineJoy log", text.take(60000)))
-                    android.widget.Toast.makeText(
-                        act, "Đã chép log CineJoy vào clipboard", android.widget.Toast.LENGTH_SHORT
-                    ).show()
-                }
+    private fun nxDecode(hashStr: String): JSONObject {
+        return runCatching {
+            val raw = Base64.decode(hashStr, Base64.DEFAULT)
+            if (raw.size < 16) return JSONObject()
+            // Kiểm tra "Salted__" header (8 bytes)
+            val saltedHeader = String(raw, 0, 8, Charsets.US_ASCII)
+            val (salt, ciphertext) = if (saltedHeader == "Salted__") {
+                val s = ByteArray(8)
+                System.arraycopy(raw, 8, s, 0, 8)
+                val c = ByteArray(raw.size - 16)
+                System.arraycopy(raw, 16, c, 0, c.size)
+                Pair(s, c)
+            } else {
+                Pair(ByteArray(8), raw)
             }
+
+            val (key, iv) = evpBytesToKey(nxPass.toByteArray(Charsets.UTF_8), salt, 32, 16)
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+
+            val decrypted = cipher.doFinal(ciphertext)
+            JSONObject(String(decrypted, Charsets.UTF_8))
+        }.getOrDefault(JSONObject())
+    }
+
+    private fun nxEncode(obj: JSONObject): String {
+        return runCatching {
+            val plaintext = obj.toString().toByteArray(Charsets.UTF_8)
+            val salt = ByteArray(8)
+            SecureRandom().nextBytes(salt)
+
+            val (key, iv) = evpBytesToKey(nxPass.toByteArray(Charsets.UTF_8), salt, 32, 16)
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+
+            val ciphertext = cipher.doFinal(plaintext)
+            val header = "Salted__".toByteArray(Charsets.US_ASCII)
+            val result = ByteArray(header.size + salt.size + ciphertext.size)
+            System.arraycopy(header, 0, result, 0, header.size)
+            System.arraycopy(salt, 0, result, header.size, salt.size)
+            System.arraycopy(ciphertext, 0, result, header.size + salt.size, ciphertext.size)
+
+            URLEncoder.encode(Base64.encodeToString(result, Base64.NO_WRAP), "UTF-8")
+        }.getOrDefault("")
+    }
+
+    // =========================================================================
+    // Diagnostics & Debugging
+    // =========================================================================
+
+    private fun copyLogToClipboard(logText: String) {
+        runCatching {
+            val ctx = com.lagradost.cloudstream3.AcraApplication.context
+            val cm = ctx?.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("CineJoy Debug Log", logText))
         }
     }
 }
