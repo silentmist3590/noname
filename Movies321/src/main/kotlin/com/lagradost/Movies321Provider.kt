@@ -121,7 +121,8 @@ class Movies321Provider : MainAPI() {
 
     private fun image(path: String?, size: String): String? {
         if (path.isNullOrBlank() || path == "null") return null
-        return img + size + (if (path.startsWith("/")) path else "/$path")
+        // image.tmdb.org bị chặn ở một số mạng nên đi qua proxy ảnh wsrv.nl
+        return "https://wsrv.nl/?url=" + URLEncoder.encode(img + size + (if (path.startsWith("/")) path else "/$path"), "UTF-8")
     }
 
     private fun yearOf(date: String?): Int? =
@@ -317,7 +318,13 @@ class Movies321Provider : MainAPI() {
         val declared: String, val rank: Int
     )
 
-    private data class Verdict(val state: String, val m3u8: Boolean)   // state: ok | dead | unknown
+    private data class Verdict(
+        val state: String,                       // ok | dead | unknown
+        val m3u8: Boolean,
+        val headers: Map<String, String>? = null, // bộ header đã chạy được
+        val note: String = "",
+        val url: String? = null                   // link thay thế (link gốc bỏ qua proxy)
+    )
 
     /** Lấy JSON bằng OkHttp chặn luồng (request đầu tiên của site có thể mất ~20 giây). */
     private fun blockingGet(client: OkHttpClient, url: String, headers: Map<String, String>): Pair<Int, String> {
@@ -351,47 +358,173 @@ class Movies321Provider : MainAPI() {
         return null
     }
 
-    private fun probeOne(client: OkHttpClient, url: String, headers: Map<String, String>): Verdict {
-        val rb = Request.Builder().url(url)
-        headers.forEach { (k, v) -> rb.header(k, v) }
-        rb.header("Accept", "*/*").header("Range", "bytes=0-2047")
+    private fun getBytes(
+        client: OkHttpClient, url: String, headers: Map<String, String>, range: String?, limit: Long
+    ): Pair<Int, String> {
         return try {
+            val rb = Request.Builder().url(url)
+            headers.forEach { (k, v) -> rb.header(k, v) }
+            rb.header("Accept", "*/*")
+            if (range != null) rb.header("Range", range)
             client.newCall(rb.build()).execute().use { r ->
-                val code = r.code
-                if (code == 200 || code == 206) {
-                    val head = runCatching { r.peekBody(2048).string() }.getOrDefault("")
-                        .replace("﻿", "").trimStart()
-                    when {
-                        head.startsWith("#EXTM3U") -> Verdict("ok", true)
-                        Regex("^<(!doctype|html|\\?xml)", RegexOption.IGNORE_CASE).containsMatchIn(head) ->
-                            if (head.contains("<MPD", true)) Verdict("ok", false) else Verdict("dead", false)
-                        head.isNotEmpty() -> Verdict("ok", false)
-                        else -> Verdict("unknown", false)
-                    }
-                } else if (code == 401 || code == 403 || code == 429) {
-                    Verdict("unknown", false)
+                val body = runCatching { r.peekBody(limit).string() }.getOrDefault("")
+                if (r.code == 200 || r.code == 206) {
+                    r.code to body
                 } else {
-                    Verdict("dead", false)
+                    r.code to body.take(200).replace('\n', ' ')
                 }
             }
         } catch (e: UnknownHostException) {
-            Verdict("dead", false)
+            -1 to "dns"
         } catch (e: Exception) {
-            Verdict("unknown", false)
+            0 to (e.message ?: e.javaClass.simpleName)
         }
     }
 
+    private fun resolveUrl(base: String, ref: String): String {
+        if (ref.startsWith("http://") || ref.startsWith("https://")) return ref
+        return runCatching { java.net.URI(base).resolve(ref).toString() }.getOrDefault(ref)
+    }
+
+    /**
+     * Kiểm tra tới tận đoạn video đầu tiên: tải playlist, nếu là master thì tải playlist con,
+     * rồi xin 1KB đầu của đoạn đầu. Link nào đoạn video trả 403/404 sẽ gây lỗi 2004 khi phát.
+     */
+    private fun chain(client: OkHttpClient, url: String, headers: Map<String, String>): Verdict {
+        val (c1, b1) = getBytes(client, url, headers, null, 400_000)
+        if (c1 == -1) return Verdict("dead", false, note = "DNS")
+        if (c1 != 200 && c1 != 206) {
+            val st = if (c1 == 401 || c1 == 403 || c1 == 429 || c1 == 0) "unknown" else "dead"
+            return Verdict(st, false, note = "playlist HTTP $c1 ${b1.take(220)}")
+        }
+        val head = b1.replace("\uFEFF", "").trimStart()
+        if (!head.startsWith("#EXTM3U")) {
+            if (Regex("^<(!doctype|html|\\?xml)", RegexOption.IGNORE_CASE).containsMatchIn(head)) {
+                return if (head.contains("<MPD", true)) Verdict("ok", false, headers, "mpd")
+                else Verdict("dead", false, note = "trả về HTML")
+            }
+            return if (head.isNotEmpty()) Verdict("ok", false, headers, "không phải m3u8")
+            else Verdict("unknown", false, note = "rỗng")
+        }
+        var text = head
+        var base = url
+        if (text.contains("#EXT-X-STREAM-INF")) {
+            val lines = text.lines()
+            val idx = lines.indexOfFirst { it.startsWith("#EXT-X-STREAM-INF") }
+            val v = lines.drop(idx + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }?.trim()
+                ?: return Verdict("unknown", true, note = "master không có variant")
+            base = resolveUrl(url, v)
+            val (c2, b2) = getBytes(client, base, headers, null, 400_000)
+            if (c2 != 200 && c2 != 206) return Verdict("unknown", true, note = "variant HTTP $c2")
+            text = b2.trimStart()
+        }
+        val seg = text.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+            ?: return Verdict("unknown", true, note = "không thấy đoạn video")
+        val segUrl = resolveUrl(base, seg)
+        val (c3, _) = getBytes(client, segUrl, headers, "bytes=0-1023", 1024)
+        return if (c3 == 200 || c3 == 206) Verdict("ok", true, headers, "đoạn video HTTP $c3")
+        else Verdict("unknown", true, note = "đoạn video HTTP $c3 ${segUrl.take(80)}")
+    }
+
+    /** Referer/Origin mà link proxy mang theo trong tham số headers=<json> (dành cho máy chủ gốc). */
+    private fun embeddedHeaders(url: String): Map<String, String>? = runCatching {
+        val raw = Regex("[?&]headers=([^&]+)").find(url)?.groupValues?.get(1) ?: return@runCatching null
+        val j = JSONObject(java.net.URLDecoder.decode(raw, "UTF-8"))
+        val m = HashMap<String, String>()
+        m["User-Agent"] = ua
+        j.optString("Referer", "").takeIf { it.isNotBlank() }?.let { m["Referer"] = it }
+        j.optString("Origin", "").takeIf { it.isNotBlank() }?.let { m["Origin"] = it }
+        m
+    }.getOrNull()
+
+    /** Giải mã tham số url=<...> của link proxy để lấy link gốc phía sau. */
+    private fun innerUrl(url: String): String? = runCatching {
+        val raw = Regex("[?&]url=([^&]+)").find(url)?.groupValues?.get(1) ?: return@runCatching null
+        java.net.URLDecoder.decode(raw, "UTF-8").takeIf { it.startsWith("http") }
+    }.getOrNull()
+
+    /**
+     * Link proxy của site có thể mang header giả IP (X-Forwarded-For...) trong tham số headers=<json>.
+     * Cloudflare trả 403 cho các header đó, nên tạo bản link đã bỏ chúng đi.
+     */
+    private fun cleanProxyUrl(url: String): String? = runCatching {
+        val m = Regex("([?&]headers=)([^&]+)").find(url) ?: return@runCatching null
+        val j = JSONObject(java.net.URLDecoder.decode(m.groupValues[2], "UTF-8"))
+        val bad = Regex(
+            "^(x-forwarded-.*|x-real-ip|x-client-ip|x-originating-ip|cf-connecting-ip|true-client-ip|cf-ipcountry|x-country)$",
+            RegexOption.IGNORE_CASE
+        )
+        var changed = false
+        for (k in j.keys().asSequence().toList()) {
+            if (bad.matches(k)) { j.remove(k); changed = true }
+        }
+        if (!changed) return@runCatching null
+        url.replaceRange(m.range, m.groupValues[1] + URLEncoder.encode(j.toString(), "UTF-8"))
+    }.getOrNull()
+
+    private fun isProxy(url: String) = url.contains(".workers.dev/")
+
+    private fun probeOne(
+        client: OkHttpClient, url: String, setA: Map<String, String>, setB: Map<String, String>,
+        extra: List<Map<String, String>>
+    ): Verdict {
+        val notes = StringBuilder()
+        var first: Verdict? = null
+        fun attempt(tag: String, target: String, hs: Map<String, String>, replaceUrl: Boolean): Verdict? {
+            val v = chain(client, target, hs)
+            if (v.state == "ok") {
+                return v.copy(
+                    note = v.note + " (" + tag + ")",
+                    url = if (replaceUrl) target else null
+                )
+            }
+            if (first == null) first = v
+            notes.append(" | ").append(tag).append(": ").append(v.note.take(150))
+            return null
+        }
+
+        // 1. Đúng cách site làm: Referer/Origin của site
+        attempt("site", url, setA, false)?.let { return it }
+
+        // 1b. Cùng link proxy nhưng bỏ header giả IP khỏi tham số headers=
+        cleanProxyUrl(url)?.let { cu -> attempt("sạch", cu, setA, true)?.let { return it } }
+
+        // 2. Bỏ qua proxy: gọi thẳng link gốc với Referer/Origin mà link proxy mang theo
+        val emb = embeddedHeaders(url)
+        var inner = innerUrl(url)
+        var depth = 0
+        while (inner != null && depth < 3) {
+            if (emb != null) attempt("gốc" + depth, inner, emb, true)?.let { return it }
+            else for (e in extra) attempt("gốc" + depth + "+ref", inner, e, true)?.let { return it }
+            inner = innerUrl(inner)
+            depth++
+        }
+
+        // 3. Link trực tiếp không có Referer riêng: thử các Referer thấy ở các nguồn khác
+        if (!isProxy(url) && emb == null) {
+            for (e in extra) attempt("ref=" + (e["Referer"] ?: ""), url, e, false)?.let { return it }
+        }
+        // 4. Không Referer
+        attempt("trống", url, setB, false)?.let { return it }
+
+        val f = first!!
+        return f.copy(note = notes.toString().drop(3).ifBlank { f.note })
+    }
+
     /** Kiểm tra song song bằng luồng thường (không cần coroutines). */
-    private fun probeAll(cands: List<Cand>, headers: Map<String, String>): List<Verdict> {
+    private fun probeAll(
+        cands: List<Cand>, setA: Map<String, String>, setB: Map<String, String>,
+        extra: List<Map<String, String>>
+    ): List<Verdict> {
         if (cands.isEmpty()) return emptyList()
         val client = app.baseClient.newBuilder()
-            .callTimeout(9, TimeUnit.SECONDS)
+            .callTimeout(8, TimeUnit.SECONDS)
             .followRedirects(true)
             .build()
         val pool = Executors.newFixedThreadPool(minOf(cands.size, 8))
         return try {
-            val fs = cands.map { c -> pool.submit(Callable { probeOne(client, c.url, headers) }) }
-            fs.map { f -> runCatching { f.get(14, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false)) }
+            val fs = cands.map { c -> pool.submit(Callable { probeOne(client, c.url, setA, setB, extra) }) }
+            fs.map { f -> runCatching { f.get(70, TimeUnit.SECONDS) }.getOrDefault(Verdict("unknown", false, note = "quá thời gian")) }
         } finally {
             pool.shutdownNow()
         }
@@ -419,6 +552,7 @@ class Movies321Provider : MainAPI() {
     ): Boolean {
         val log = StringBuilder("321Movies loadLinks\ndata=$data\n")
         var found = false
+        var verified = 0
         try {
             val ref = refOf(data)
             if (ref == null) {
@@ -464,13 +598,14 @@ class Movies321Provider : MainAPI() {
             }
 
             val headers = siteHeaders()
-            val verdicts = probeAll(cands, headers)
+            val extra = cands.mapNotNull { embeddedHeaders(it.url) }.distinctBy { it["Referer"] }
+            val verdicts = probeAll(cands, headers, mapOf("User-Agent" to ua), extra)
             val ok = mutableListOf<Pair<Cand, Verdict>>()
             val unknown = mutableListOf<Pair<Cand, Verdict>>()
             cands.forEachIndexed { i, c ->
                 val v = verdicts[i]
-                log.append("  [").append(v.state).append("] ").append(c.family).append(" | ")
-                    .append(c.label).append(" | ").append(c.url.take(90)).append('\n')
+                log.append("  [").append(v.state).append(" ").append(v.note).append("] ").append(c.family).append(" | ")
+                    .append(c.label).append(" | ").append((v.url ?: c.url).take(150)).append('\n')
                 if (v.state == "ok") ok.add(c to v) else if (v.state == "unknown") unknown.add(c to v)
             }
             val order = Comparator<Pair<Cand, Verdict>> { a, b ->
@@ -478,11 +613,13 @@ class Movies321Provider : MainAPI() {
                 val hb = heightOf(b.first.label).let { if (it == 0) 500 else it }
                 if (ha != hb) hb.compareTo(ha) else a.first.rank.compareTo(b.first.rank)
             }
+            verified = ok.size
             ok.sortWith(order)
             unknown.sortWith(order)
 
+            // Chỉ hiện link chưa kiểm tra được khi không có link nào đã kiểm tra chạy được
             val picked = ok.map { it to false } +
-                unknown.take(maxOf(0, 6 - ok.size)).map { it to true }
+                (if (ok.isEmpty()) unknown.take(4).map { it to true } else emptyList())
 
             val names = HashMap<String, Int>()
             for ((pair, unverified) in picked) {
@@ -498,14 +635,17 @@ class Movies321Provider : MainAPI() {
                 if (n > 1) disp += " #$n"
 
                 val isM3u8 = if (v.state == "ok") v.m3u8 else c.declared.equals("hls", true)
+                val hs = v.headers ?: headers
                 callback(
                     newExtractorLink(
-                        name, disp, c.url,
+                        name, disp, v.url ?: c.url,
                         if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = qualityValue(heightOf(c.label))
-                        this.headers = headers
+                        this.referer = hs["Referer"] ?: ""
+                        // Link đã kiểm tra xếp trên (CloudStream sắp theo quality), link chưa chắc chắn xếp cuối
+                        this.quality = if (unverified) 100
+                        else heightOf(c.label).let { if (it > 0) qualityValue(it) else Qualities.P720.value }
+                        this.headers = hs
                     }
                 )
                 found = true
@@ -517,7 +657,7 @@ class Movies321Provider : MainAPI() {
                 .append(e.message).append('\n')
             return found
         } finally {
-            if (DEBUG && !found) copyLog(log.toString())
+            if (DEBUG && (!found || verified == 0)) copyLog(log.toString())
         }
     }
 
