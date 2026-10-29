@@ -43,7 +43,7 @@ class MoviesApiProvider : MainAPI() {
             app.get(url, headers = mapOf("Accept" to "application/json"), referer = referer).text
         )
     } catch (e: Exception) {
-        logError(e)
+        e.printStackTrace()
         null
     }
 
