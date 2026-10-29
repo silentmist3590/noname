@@ -608,48 +608,76 @@ class CineFreakProvider : MainAPI() {
 
         var found = false
         val seen = mutableSetOf<String>()
-        for (link in links) {
-            if (!seen.add(link)) continue
-            try {
-                if (isCineCloudFile(link)) {
-                    Log.d("CineFreak", "Trying Vidzer resolver: $link")
 
-                    val resolved = resolveVidzer(link, subtitleCallback, callback)
-                    Log.d("CineFreak", "Vidzer resolver result: $resolved")
-
-                    found = resolved || found
-
-                    if (!resolved) {
-                        Log.d("CineFreak", "Trying generic cloud resolver: $link")
-                        val cloudResolved = resolveCloudPage(link, subtitleCallback, callback)
-                        Log.d("CineFreak", "Generic cloud resolver result: $cloudResolved")
-                        found = cloudResolved || found
-                    }
-                } else if (
-                    Regex("""(?i)\.(m3u8|mp4|mkv|webm|mpd)(?:[?#].*)?$""").containsMatchIn(link) ||
-                    link.contains("googleusercontent.com", true) || link.contains("workers.dev", true) ||
-                    link.contains("r2.dev", true) || link.contains("r2.cloudflarestorage.com", true) ||
-                    link.contains("pixeldrain", true)
-                ) {
-                    found = emitDirect(link, pageUrl ?: "$mainUrl/", "CineFreak", callback) || found
-                } else if (link.contains("cinecloud", true) || link.contains("neodrive", true)) {
-                    found = resolveCloudPage(link, subtitleCallback, callback) || found
-                } else {
-                    loadExtractor(link, pageUrl ?: "$mainUrl/", subtitleCallback) { extracted ->
-                        callback(extracted)
-                        found = true
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("CineFreak", "Failed candidate: $link", e)
-            }
-        }
+        Log.d("CineFreak", "ENTER processing: ${links.size} links")
         Log.d("CineFreak", "Page URL: $pageUrl")
-        Log.d("CineFreak", "Total candidate links: ${links.size}")
 
-        links.forEachIndexed { index, link ->
-            Log.d("CineFreak", "Candidate[$index]: $link")
+        for (link in links) {
+            if (!seen.add(link)) {
+                Log.d("CineFreak", "SKIP duplicate: $link")
+                continue
+            }
+
+        Log.d("CineFreak", "PROCESS link: $link")
+
+        try {
+            if (isCineCloudFile(link)) {
+                Log.d("CineFreak", "MATCH CineCloud: $link")
+    
+                Log.d("CineFreak", "BEFORE resolveVidzer")
+                val resolved = resolveVidzer(link, subtitleCallback, callback)
+                Log.d("CineFreak", "AFTER resolveVidzer: $resolved")
+    
+                found = resolved || found
+
+                if (!resolved) {
+                    Log.d("CineFreak", "BEFORE resolveCloudPage")
+                    val cloudResolved =
+                        resolveCloudPage(link, subtitleCallback, callback)
+                    Log.d("CineFreak", "AFTER resolveCloudPage: $cloudResolved")
+    
+                    found = cloudResolved || found
+                }
+            } else if (
+                Regex("""(?i)\.(m3u8|mp4|mkv|webm|mpd)(?:[?#].*)?$""")
+                    .containsMatchIn(link) ||
+                link.contains("googleusercontent.com", true) ||
+                link.contains("workers.dev", true) ||
+                link.contains("r2.dev", true) ||
+                link.contains("r2.cloudflarestorage.com", true) ||
+                link.contains("pixeldrain", true)
+            ) {
+                Log.d("CineFreak", "MATCH direct media")
+                found = emitDirect(
+                    link,
+                    pageUrl ?: "$mainUrl/",
+                    "CineFreak",
+                    callback
+                ) || found
+            } else if (
+                link.contains("cinecloud", true) ||
+                link.contains("neodrive", true)
+            ) {
+                Log.d("CineFreak", "MATCH generic cloud: $link")
+                val cloudResolved =
+                    resolveCloudPage(link, subtitleCallback, callback)
+                Log.d("CineFreak", "Generic cloud result: $cloudResolved")
+                found = cloudResolved || found
+            } else {
+                Log.d("CineFreak", "BEFORE loadExtractor: $link")
+                loadExtractor(link, pageUrl ?: "$mainUrl/", subtitleCallback) {
+                    callback(it)
+                    found = true
+                }
+                Log.d("CineFreak", "AFTER loadExtractor: $link")
+            }
+        } catch (e: Exception) {
+            Log.e("CineFreak", "Candidate failed: $link", e)
         }
-        return found
     }
-}
+
+    Log.d("CineFreak", "EXIT processing; found=$found; count=${links.size}")
+    return found
+            return found
+        }
+    }
