@@ -13,6 +13,10 @@ import java.net.URLEncoder
  * - Danh sách/tìm kiếm: /api/discover/{movies|tv|views}
  * - Phát: trang embed gọi /api/vidora/v1/movie/{id}  (xem logcat) -> thử gọi thẳng API này,
  *   nếu không ra link thì mở trang embed bằng WebView, tự bấm play và bắt request .m3u8.
+ *
+ * QUAN TRỌNG: API /api/vidora/v1/* BẮT BUỘC phải có header `x-player-key`
+ * (xem bundle JS của moviesapi.to). Thiếu header này API trả `result: false`,
+ * `sources: []` → không có m3u8. M3u8 CDN cũng cần `Origin` + `Referer`.
  */
 class MoviesApiProvider : MainAPI() {
     override var mainUrl = "https://moviesapi.to"
@@ -24,6 +28,34 @@ class MoviesApiProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
     private val imgExt = Regex("""\.(jpe?g|png|webp|avif)(\?.*)?$""", RegexOption.IGNORE_CASE)
+
+    // ---------------------------------------------------------------- headers
+
+    private val userAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
+
+    /** Key bắt buộc cho API vidora (trích từ bundle JS của moviesapi.to). */
+    private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
+
+    /** Headers cho request JSON (API discover + API vidora). */
+    private val apiHeaders = mapOf(
+        "User-Agent"      to userAgent,
+        "Accept"          to "application/json, text/plain, */*",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Origin"          to mainUrl,
+        "Referer"         to "$mainUrl/",
+        "x-player-key"    to vidoraKey,
+    )
+
+    /** Headers cho CDN (workers.dev) — m3u8 + segment. */
+    private val streamHeaders = mapOf(
+        "User-Agent"      to userAgent,
+        "Accept"          to "*/*",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Origin"          to mainUrl,
+        "Referer"         to "$mainUrl/",
+    )
 
     override val mainPage = mainPageOf(
         "$mainUrl/api/discover/views?type=movie&views=day" to "Trending Movies (Today)",
@@ -38,7 +70,16 @@ class MoviesApiProvider : MainAPI() {
     // ------------------------------------------------------------------ helpers
 
     private suspend fun getJson(url: String, referer: String? = "$mainUrl/"): JsonNode? = try {
-        val text = app.get(url, headers = mapOf("Accept" to "application/json"), referer = referer).text
+        val text = app.get(
+            url,
+            headers = mapOf(
+                "Accept"       to "application/json, text/plain, */*",
+                "User-Agent"   to userAgent,
+                "Origin"       to mainUrl,
+                "x-player-key" to vidoraKey,
+            ),
+            referer = referer
+        ).text
         DebugLog.log("http", "GET $url -> ${text.length}b: ${text.take(500)}")
         mapper.readTree(text)
     } catch (e: Exception) {
@@ -283,7 +324,8 @@ class MoviesApiProvider : MainAPI() {
         val id = m.groupValues[2]
         return when {
             type == "movie" -> "$mainUrl/api/vidora/v1/movie/$id"
-            m.groupValues[3].isNotEmpty() -> "$mainUrl/api/vidora/v1/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
+            m.groupValues[3].isNotEmpty() ->
+                "$mainUrl/api/vidora/v1/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
             else -> null
         }
     }
@@ -316,61 +358,134 @@ class MoviesApiProvider : MainAPI() {
         DebugLog.log("links", "loadLinks data=$data")
         var found = false
 
-        // 1) Gọi thẳng API của player và tìm link .m3u8 trong response
+        // ------------------------------------------------------------------
+        // 1) Gọi thẳng API vidora — PHẢI có x-player-key
+        // ------------------------------------------------------------------
         val apiUrl = vidoraUrl(data)
         if (apiUrl != null) {
             try {
                 val body = app.get(
                     apiUrl,
-                    referer = data,
-                    headers = mapOf("Accept" to "application/json, text/plain, */*", "Origin" to mainUrl)
+                    headers = apiHeaders,
+                    referer = "$mainUrl/"
                 ).text
-                DebugLog.log("vidora", "GET $apiUrl -> ${body.length}b: ${body.take(1200)}")
-                val clean = body.replace("\\/", "/").replace("\\u0026", "&")
-                val urls = Regex("""https?://[^\s"'\\<>]+\.m3u8[^\s"'\\<>]*""")
-                    .findAll(clean).map { it.value }.distinct().toList()
-                for (u in urls) {
-                    M3u8Helper.generateM3u8(source = name, streamUrl = u, referer = data).forEach {
-                        callback(it)
-                        found = true
+                DebugLog.log("vidora", "GET $apiUrl -> ${body.length}b: ${body.take(800)}")
+
+                val json = mapper.readTree(body)
+
+                if (json.get("result")?.asBoolean() != true) {
+                    DebugLog.error(
+                        "vidora",
+                        "result != true (kiểm tra x-player-key). Body: ${body.take(300)}"
+                    )
+                }
+
+                val sources = json.get("sources")
+                if (sources != null && sources.isArray) {
+                    for (src in sources) {
+                        val url = src.str("url") ?: continue
+                        if (!url.contains(".m3u8")) continue
+
+                        // Xác minh m3u8 fetch được bằng headers đầy đủ
+                        val ok = try {
+                            val probe = app.get(
+                                url,
+                                headers = streamHeaders,
+                                referer = "$mainUrl/"
+                            ).text
+                            probe.trimStart().startsWith("#EXTM3U")
+                        } catch (e: Exception) {
+                            DebugLog.error("m3u8-probe", "probe fail: ${e.message}")
+                            false
+                        }
+
+                        if (ok) {
+                            // Thử M3u8Helper để tách các quality (nếu hỗ trợ headers)
+                            val links = try {
+                                M3u8Helper.generateM3u8(
+                                    source = name,
+                                    streamUrl = url,
+                                    referer = "$mainUrl/"
+                                )
+                            } catch (_: Exception) { emptyList() }
+
+                            if (links.isNotEmpty()) {
+                                links.forEach { callback(it) }
+                            } else {
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = name,
+                                        name   = name,
+                                        url    = url,
+                                        type   = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = "$mainUrl/"
+                                        this.quality = Qualities.Unknown.value
+                                        this.headers = streamHeaders
+                                    }
+                                )
+                            }
+                            found = true
+                        } else {
+                            DebugLog.error("m3u8-probe", "m3u8 không fetch được với headers hiện tại")
+                        }
+                    }
+                }
+
+                // ---- Phụ đề đính kèm (sources[0].tracks) ----
+                val tracks = sources?.firstOrNull()?.get("tracks")
+                if (tracks != null && tracks.isArray) {
+                    for (t in tracks) {
+                        val fileNode = t.get("file")
+                        if (fileNode == null || fileNode.isNull) continue
+                        val file  = fileNode.asText()
+                        val label = t.str("label") ?: "Unknown"
+                        val lang  = t.str("language") ?: ""
+                        subtitleCallback.invoke(newSubtitleFile(lang, file, label))
                     }
                 }
             } catch (e: Exception) {
-                DebugLog.log("vidora", "API lỗi: $e")
+                DebugLog.error("vidora", "API error", e)
             }
         }
+
         if (found) return true
 
+        // ------------------------------------------------------------------
         // 2) Fallback: WebView + tự bấm play, bắt request .m3u8
+        // ------------------------------------------------------------------
         try {
             val resolver = WebViewResolver(
-                interceptUrl = Regex("""\.m3u8"""),
-                useOkhttp = false,
-                script = autoPlayScript,
+                interceptUrl   = Regex(""".m3u8"""),
+                useOkhttp      = false,
+                script         = autoPlayScript,
                 scriptCallback = { },
-                timeout = 25_000L
+                timeout        = 25_000L
             )
             val stream = app.get(data, referer = "$mainUrl/", interceptor = resolver).url
             DebugLog.log("webview", "kết quả: $stream")
             if (stream.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(source = name, streamUrl = stream, referer = data).forEach {
-                    callback(it)
-                    found = true
-                }
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name   = name,
+                        url    = stream,
+                        type   = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                        this.headers = streamHeaders
+                    }
+                )
+                found = true
             }
         } catch (e: Exception) {
             DebugLog.log("webview", "lỗi: $e")
         }
-        if (found) return true
 
-        // 3) Thất bại: ghi thêm endpoint "ice" để chẩn đoán rồi copy log vào clipboard
-        try {
-            val ice = app.get("$mainUrl/api/vidora/v1/ice", referer = data).text
-            DebugLog.log("vidora-ice", ice.take(600))
-        } catch (e: Exception) {
-            DebugLog.log("vidora-ice", "lỗi: $e")
+        if (!found) {
+            DebugLog.error("links", "Không tìm thấy link phát cho $data")
         }
-        DebugLog.error("links", "Không tìm thấy link phát cho $data")
-        return false
+        return found
     }
 }
