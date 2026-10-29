@@ -5,7 +5,7 @@ import com.lagradost.cloudstream3.utils.*
 import com.fasterxml.jackson.annotation.JsonProperty
 import org.jsoup.nodes.Element
 
-class CineJoy : MainAPI() { // Đã đổi từ MainProvider thành MainAPI
+class CineJoy : MainAPI() {
     override var mainUrl = "https://cinejoy.to"
     private val backupUrl = "https://cinejoy.net"
     
@@ -35,8 +35,15 @@ class CineJoy : MainAPI() { // Đã đổi từ MainProvider thành MainAPI
 
     private fun Element.toSearchResult(): SearchResponse? {
         val title = this.selectFirst("h3.title")?.text() ?: return null
-        val href = fixUrl(this.selectFirst("a")?.attr("href") ?: return null)
-        val posterUrl = fixUrl(this.selectFirst("img")?.attr("data-src") ?: this.selectFirst("img")?.attr("src"))
+        
+        // Kiểm tra phần tử thẻ <a> không null để lấy href dạng String non-null
+        val aTag = this.selectFirst("a") ?: return null
+        val href = fixUrl(aTag.attr("href"))
+        
+        // Xử lý poster an toàn không bị lỗi String?
+        val imgTag = this.selectFirst("img")
+        val rawPoster = imgTag?.attr("data-src")?.takeIf { it.isNotBlank() } ?: imgTag?.attr("src") ?: ""
+        val posterUrl = if (rawPoster.isNotBlank()) fixUrl(rawPoster) else null
         
         return newMovieSearchResponse(title, href, TvType.Movie) {
             this.posterUrl = posterUrl
@@ -47,11 +54,14 @@ class CineJoy : MainAPI() { // Đã đổi từ MainProvider thành MainAPI
         val document = app.get(url, headers = baseHeaders).document
         val title = document.selectFirst("h1.movie-title")?.text() ?: "Không rõ"
         val description = document.selectFirst("div.description")?.text()
-        val poster = fixUrl(document.selectFirst("img.poster")?.attr("src"))
+        
+        // Xử lý poster trang chi tiết an toàn
+        val posterElement = document.selectFirst("img.poster")
+        val posterSrc = posterElement?.attr("src") ?: ""
+        val poster = if (posterSrc.isNotBlank()) fixUrl(posterSrc) else null
         
         val episodes = document.select("ul.list-episode li").mapIndexed { index, element ->
             val link = element.selectFirst("a")?.attr("href") ?: ""
-            // Sử dụng newEpisode thay cho constructor cũ
             newEpisode(link) {
                 this.name = "Tập ${index + 1}"
                 this.episode = index + 1
@@ -82,7 +92,6 @@ class CineJoy : MainAPI() { // Đã đổi từ MainProvider thành MainAPI
                 val streamUrl = apiResponse?.url ?: targetUrl
                 if (streamUrl.isBlank()) return false
 
-                // Sử dụng newExtractorLink thay cho constructor cũ
                 callback.invoke(
                     newExtractorLink(
                         source = serverName,
