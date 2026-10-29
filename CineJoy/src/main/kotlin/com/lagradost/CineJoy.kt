@@ -245,6 +245,8 @@ class CineJoyProvider : MainAPI() {
                     if (token.isBlank()) continue
 
                     val decryptedUrl = if (token.startsWith("http")) token else decryptVidRock(token, log)
+                    log.append("VidRock server $serverName final URL: ${decryptedUrl.take(100)}\n")
+
                     if (decryptedUrl.startsWith("http") && !blockedHostRegex.containsMatchIn(decryptedUrl)) {
                         if (seenUrls.add(decryptedUrl)) {
                             callback(newExtractorLink("CineJoy", "VidRock $serverName", decryptedUrl, ExtractorLinkType.M3U8) {
@@ -287,7 +289,7 @@ class CineJoyProvider : MainAPI() {
             log.append("NxSha exception: ${ex.message}\n")
         }
 
-        // 3. VidLove API (với bổ sung header chống Cloudflare cơ bản)
+        // 3. VidLove API
         try {
             val vlBase = if (type == "tv") "/tv?id=$id&season=$s&episode=$e&mode=json" else "/movie?id=$id&mode=json"
             val fullUrl = "$vidloveBase$vlBase"
@@ -339,20 +341,20 @@ class CineJoyProvider : MainAPI() {
 
     private fun decryptVidRock(token: String, log: StringBuilder): String {
         return runCatching {
-            val parts = token.split(".")
-            if (parts.size != 3) {
-                log.append("VidRock token parts size != 3 (Token length: ${token.length})\n")
-                return ""
+            val decoded = Base64.decode(token, Base64.URL_SAFE or Base64.NO_WRAP)
+            if (decoded.size > 28) {
+                // Xử lý dạng gộp IV (12 bytes đầu) + Ciphertext + Tag
+                val iv = decoded.copyOfRange(0, 12)
+                val ciphertextAndTag = decoded.copyOfRange(12, decoded.size)
+                val keyBytes = hexStringToByteArray(vidrockKeyHex)
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                val gcmSpec = GCMParameterSpec(128, iv)
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), gcmSpec)
+                return String(cipher.doFinal(ciphertextAndTag), Charsets.UTF_8)
+            } else {
+                log.append("VidRock decoded size too small: ${decoded.size}\n")
+                ""
             }
-            val iv = Base64.decode(parts[0], Base64.URL_SAFE or Base64.NO_WRAP)
-            val ciphertext = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP)
-            val tag = Base64.decode(parts[2], Base64.URL_SAFE or Base64.NO_WRAP)
-            val combined = ByteArray(ciphertext.size + tag.size)
-            System.arraycopy(ciphertext, 0, combined, 0, ciphertext.size)
-            System.arraycopy(tag, 0, combined, ciphertext.size, tag.size)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(hexStringToByteArray(vidrockKeyHex), "AES"), GCMParameterSpec(tag.size * 8, iv))
-            String(cipher.doFinal(combined), Charsets.UTF_8)
         }.onFailure {
             log.append("VidRock decrypt error: ${it.message}\n")
         }.getOrDefault("")
@@ -398,11 +400,21 @@ class CineJoyProvider : MainAPI() {
             } else {
                 Pair(ByteArray(8), raw)
             }
-            log.append("NxSha ciphertext size: ${ciphertext.size}\n")
             val (key, iv) = evpBytesToKey(nxPass.toByteArray(Charsets.UTF_8), salt, 32, 16)
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            JSONObject(String(cipher.doFinal(ciphertext), Charsets.UTF_8))
+            
+            // Thử giải mã với PKCS5Padding, nếu lỗi block length thì fallback sang NoPadding
+            val decrypted = try {
+                val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                cipher.doFinal(ciphertext)
+            } catch (e: Exception) {
+                log.append("NxSha CBC/PKCS5 failed, trying NoPadding: ${e.message}\n")
+                val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                cipher.doFinal(ciphertext)
+            }
+            
+            JSONObject(String(decrypted, Charsets.UTF_8))
         }.onFailure {
             log.append("NxSha decode error: ${it.message}\n")
         }.getOrDefault(JSONObject())
