@@ -1,7 +1,3 @@
-plugins {
-    kotlin("android")
-}
-
 cloudstream {
     language = "en"
     description = "CineJoy (cinejoy.pk) - Movies & TV series with Nitro multi-audio, HLS & fast stream servers"
