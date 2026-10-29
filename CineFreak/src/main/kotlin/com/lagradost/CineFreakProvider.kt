@@ -52,7 +52,7 @@ class CineFreakProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val indexApi = "https://search.yagaverse.net/api/search"
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    private val version = 11
+    private val version = 15
     private val defaultTsKey = "0x4AAAAAAFUUpvP7IaTI_12V"
 
     // ───────────────────────── log + clipboard ─────────────────────────
@@ -651,14 +651,16 @@ class CineFreakProvider : MainAPI() {
     ) {
         val type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
         val origin = runCatching { URI(referer).let { "${it.scheme}://${it.host}" } }.getOrDefault(mainUrl)
-        d.log("LINK $label type=$type url=$url")
+        d.log("LINK $label type=$type len=${url.length} url=${url.take(110)}...")
         d.log("   headers=$headers")
         // vài kiểu header, chọn kiểu đầu tiên mà server trả được dữ liệu
+        val ck = headers["Cookie"]?.let { mapOf("Cookie" to it) } ?: emptyMap()
         val variants = linkedMapOf(
+            "như-trình-duyệt" to (mapOf("User-Agent" to userAgent) + ck),
             "gốc" to headers,
             "origin" to (headers + ("Origin" to origin) + ("Referer" to "$origin/")),
-            "cinefreak" to mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl, "User-Agent" to userAgent),
-            "không-referer" to mapOf("User-Agent" to userAgent)
+            "cinefreak" to (mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl, "User-Agent" to userAgent) + ck),
+            "không-referer-không-cookie" to mapOf("User-Agent" to userAgent)
         )
         var chosen: Map<String, String>? = null
         for ((tag, h) in variants) {
@@ -678,6 +680,21 @@ class CineFreakProvider : MainAPI() {
         )
     }
 
+    /** Lấy name=value từ các header Set-Cookie của một phản hồi. */
+    private fun setCookies(r: com.lagradost.nicehttp.NiceResponse): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        runCatching {
+            for (line in r.headers.values("Set-Cookie")) {
+                val nv = line.substringBefore(';')
+                val k = nv.substringBefore('=').trim()
+                val v = nv.substringAfter('=', "").trim()
+                if (k.isNotEmpty()) out[k] = v
+            }
+        }
+        if (out.isEmpty()) runCatching { out.putAll(r.cookies) }
+        return out
+    }
+
     /** Tầng C1: đọc trang trình phát vidzer bằng HTTP (qk + apiUrl + AES-GCM). */
     private suspend fun vidzerHttp(
         d: Dbg,
@@ -691,6 +708,9 @@ class CineFreakProvider : MainAPI() {
             val page = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
             val html = page.text
             d.log("C1) vidzer GET -> ${page.code}, ${html.length} ký tự")
+            val jar = LinkedHashMap<String, String>()
+            jar.putAll(setCookies(page))
+            d.log("C1) cookie từ trang: ${jar.keys}")
             if (page.code !in 200..299) {
                 d.log("C1) đầu HTML: ${html.take(200).replace('\n', ' ')}")
                 return false
@@ -715,8 +735,11 @@ class CineFreakProvider : MainAPI() {
             val apiUrl = absolute(apiPath, url)
             val api = app.get(
                 apiUrl,
-                headers = mapOf("User-Agent" to userAgent, "Referer" to url, "Accept" to "application/json")
+                headers = mapOf("User-Agent" to userAgent, "Referer" to url, "Accept" to "application/json") +
+                    (if (jar.isNotEmpty()) mapOf("Cookie" to jar.entries.joinToString("; ") { "${it.key}=${it.value}" }) else emptyMap())
             )
+            jar.putAll(setCookies(api))
+            d.log("C1) cookie sau api: ${jar.keys}")
             d.log("C1) api GET $apiUrl -> ${api.code}, ${api.text.length} ký tự")
             if (api.code !in 200..299) return false
 
@@ -724,6 +747,9 @@ class CineFreakProvider : MainAPI() {
             val payload = if (raw.startsWith("{")) raw else decryptVidzer(raw.substringAfterLast('.', raw), qk)
             val root = mapper.readTree(payload)
             d.log("C1) payload keys=${root.fieldNames().asSequence().toList()}")
+            d.log("C1) gateway=${root.path("gateway").toString().take(300)} hevc=${root.path("hevc").toString().take(120)}")
+            d.log("C1) resolutions=${root.path("resolutions").toString().replace(Regex("\"url\":\"([^\"]{0,60})[^\"]*\""), "\"url\":\"$1...\"").take(500)}")
+            d.log("C1) audio=${root.path("audioTracks").toString().replace(Regex("\"url\":\"([^\"]{0,60})[^\"]*\""), "\"url\":\"$1...\"").take(400)}")
             val videoUrl = root.path("videoUrl").asText("").ifBlank {
                 if (root.path("video").isTextual) root.path("video").asText("") else root.path("video").path("url").asText("")
             }
@@ -749,9 +775,12 @@ class CineFreakProvider : MainAPI() {
                     subtitleCallback(SubtitleFile(item.path("language").asText("en"), subtitleUrl))
                 }
             }
+            val cookieHeader = jar.entries.joinToString("; ") { "${it.key}=${it.value}" }
             emit(
                 d, videoUrl, url, "Vidzer${if (quality > 0) " ${quality}p" else ""}", quality,
-                mapOf("Referer" to url, "User-Agent" to userAgent), callback
+                mapOf("Referer" to url, "User-Agent" to userAgent) +
+                    (if (cookieHeader.isNotEmpty()) mapOf("Cookie" to cookieHeader) else emptyMap()),
+                callback
             )
             d.log("C1) OK quality=$quality url=${videoUrl.take(120)}")
             return true
@@ -788,6 +817,8 @@ class CineFreakProvider : MainAPI() {
             for (n in req.headers.names()) hdr[n] = req.header(n).orEmpty()
             if (!hdr.containsKey("Referer")) hdr["Referer"] = url
             if (!hdr.containsKey("User-Agent")) hdr["User-Agent"] = userAgent
+            runCatching { android.webkit.CookieManager.getInstance().getCookie(media) }.getOrNull()
+                ?.takeIf { it.isNotBlank() && !hdr.containsKey("Cookie") }?.let { hdr["Cookie"] = it; d.log("C2) cookie WebView: ${it.substringBefore('=')}=...") }
             emit(d, media, url, "Vidzer (WebView)", 0, hdr, callback)
             true
         } catch (e: Throwable) {
