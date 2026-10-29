@@ -612,9 +612,19 @@ class CineFreakProvider : MainAPI() {
             if (!seen.add(link)) continue
             try {
                 if (isCineCloudFile(link)) {
+                    Log.d("CineFreak", "Trying Vidzer resolver: $link")
+
                     val resolved = resolveVidzer(link, subtitleCallback, callback)
+                    Log.d("CineFreak", "Vidzer resolver result: $resolved")
+
                     found = resolved || found
-                    if (!resolved) found = resolveCloudPage(link, subtitleCallback, callback) || found
+
+                    if (!resolved) {
+                        Log.d("CineFreak", "Trying generic cloud resolver: $link")
+                        val cloudResolved = resolveCloudPage(link, subtitleCallback, callback)
+                        Log.d("CineFreak", "Generic cloud resolver result: $cloudResolved")
+                        found = cloudResolved || found
+                    }
                 } else if (
                     Regex("""(?i)\.(m3u8|mp4|mkv|webm|mpd)(?:[?#].*)?$""").containsMatchIn(link) ||
                     link.contains("googleusercontent.com", true) || link.contains("workers.dev", true) ||
@@ -634,7 +644,12 @@ class CineFreakProvider : MainAPI() {
                 Log.e("CineFreak", "Failed candidate: $link", e)
             }
         }
-        Log.d("CineFreak", "loadLinks result: found=$found; candidates=${links.size}")
+        Log.d("CineFreak", "Page URL: $pageUrl")
+        Log.d("CineFreak", "Total candidate links: ${links.size}")
+
+        links.forEachIndexed { index, link ->
+            Log.d("CineFreak", "Candidate[$index]: $link")
+        }
         return found
     }
 }
