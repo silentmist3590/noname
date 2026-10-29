@@ -7,13 +7,6 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import java.net.URLEncoder
 
-/**
- * Plugin for https://moviesapi.to
- *
- * - List/search: /api/discover/{movies|tv|views}
- * - Playback: embed page calls /api/vidora/v1/movie/{id} (requires x-player-key header)
- *   If API fails -> fallback WebView to capture .m3u8 request.
- */
 class MoviesApiProvider : MainAPI() {
     override var mainUrl = "https://moviesapi.to"
     override var name = "MoviesAPI"
@@ -24,17 +17,14 @@ class MoviesApiProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
 
-    // Regex: .jpg | .jpeg | .png | .webp | .avif (with optional ?query at end)
     private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\\z", RegexOption.IGNORE_CASE)
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    // Required key for the vidora API (extracted from moviesapi.to JS bundle)
     private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
 
-    // Headers for JSON API (discover + vidora)
     private val apiHeaders: Map<String, String> by lazy {
         mapOf(
             "User-Agent"      to userAgent,
@@ -46,7 +36,6 @@ class MoviesApiProvider : MainAPI() {
         )
     }
 
-    // Headers for CDN workers.dev - m3u8 + segment
     private val streamHeaders: Map<String, String> by lazy {
         mapOf(
             "User-Agent"      to userAgent,
@@ -65,8 +54,6 @@ class MoviesApiProvider : MainAPI() {
         "$mainUrl/api/discover/movies?ordering=views&direction=desc" to "Most Viewed Movies",
         "$mainUrl/api/discover/tv?ordering=views&direction=desc" to "Most Viewed TV",
     )
-
-    // ---------------------------------------------------------------- helpers
 
     private suspend fun getJson(url: String, referer: String? = "$mainUrl/"): JsonNode? = try {
         val text = app.get(
@@ -169,8 +156,6 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------- main page / search
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sep = if (request.data.contains("?")) "&" else "?"
         val url = "${request.data}${sep}page=$page&resultsPerPage=30"
@@ -197,8 +182,6 @@ class MoviesApiProvider : MainAPI() {
             ?.items().orEmpty().mapNotNull { it.toSearch(true) }
         return movies + shows
     }
-
-    // ---------------------------------------------------------------- load
 
     private fun mkEpisode(
         id: String, season: Int, episode: Int,
@@ -305,8 +288,6 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------- links
-
     private fun vidoraUrl(embed: String): String? {
         val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return null
         val type = m.groupValues[1]
@@ -319,7 +300,6 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // JS for WebView auto-play. No double-quote characters inside, to avoid escaping issues.
     private val autoPlayScript = """
         (function(){
           var n = 0;
@@ -349,7 +329,6 @@ class MoviesApiProvider : MainAPI() {
         DebugLog.log("links", "loadLinks data=$data")
         var found = false
 
-        // Step 1: call vidora API (requires x-player-key)
         val apiUrl = vidoraUrl(data)
         if (apiUrl != null) {
             try {
@@ -407,7 +386,6 @@ class MoviesApiProvider : MainAPI() {
                     }
                 }
 
-                // Subtitles from sources[0].tracks
                 val tracks = sources?.firstOrNull()?.get("tracks")
                 if (tracks != null && tracks.isArray) {
                     for (t in tracks) {
@@ -416,13 +394,8 @@ class MoviesApiProvider : MainAPI() {
                         val file = fileNode.asText()
                         if (file.isBlank()) continue
                         val lang = t.str("language") ?: "unknown"
-                        val label = t.str("label") ?: ""
                         subtitleCallback.invoke(
-                            newSubtitleFile(
-                                url  = file,
-                                lang = lang,
-                                name = label.ifBlank { lang }
-                            )
+                            newSubtitleFile(url = file, lang = lang)
                         )
                     }
                 }
@@ -433,7 +406,6 @@ class MoviesApiProvider : MainAPI() {
 
         if (found) return true
 
-        // Step 2: fallback WebView to capture .m3u8
         try {
             val resolver = WebViewResolver(
                 interceptUrl   = Regex("\\.m3u8"),
