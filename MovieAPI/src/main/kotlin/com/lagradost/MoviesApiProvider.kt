@@ -5,6 +5,9 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
 
 class MoviesApiProvider : MainAPI() {
@@ -17,12 +20,19 @@ class MoviesApiProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
 
+    // TMDB public API key (used for poster/backdrop lookup)
+    private val tmdbKey = "e716f19ab4d25edc5247239a8f3494f8"
+
     private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\\z", RegexOption.IGNORE_CASE)
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
+    // x-player-key used by the vidora API.
+    // This value rotates on the live site. If you get {"error":"Unauthorized"},
+    // open https://moviesapi.to/movie/1291595 in Chrome, F12 -> Network ->
+    // filter "vidora" -> copy request header "x-player-key" and paste below.
     private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
 
     private val apiHeaders: Map<String, String> by lazy {
@@ -55,19 +65,20 @@ class MoviesApiProvider : MainAPI() {
         "$mainUrl/api/discover/tv?ordering=views&direction=desc" to "Most Viewed TV",
     )
 
+    // ---------------------------------------------------------------- helpers
+
     private suspend fun getJson(url: String, referer: String? = "$mainUrl/"): JsonNode? = try {
         val text = app.get(
             url,
             headers = mapOf(
-                "Accept"       to "application/json",
-                "User-Agent"   to userAgent,
-                "Origin"       to mainUrl,
-                "x-player-key" to vidoraKey,
+                "Accept"     to "application/json",
+                "User-Agent" to userAgent,
+                "Origin"     to mainUrl,
             ),
             referer = referer
         ).text
-        DebugLog.log("http", "GET $url -> ${text.length}b: ${text.take(500)}")
-        mapper.readTree(text)
+        DebugLog.log("http", "GET $url -> ${text.length}b: ${text.take(300)}")
+        if (text.isBlank()) null else mapper.readTree(text)
     } catch (e: Exception) {
         DebugLog.error("http", "GET $url failed", e)
         null
@@ -137,12 +148,80 @@ class MoviesApiProvider : MainAPI() {
     private fun JsonNode.mediaId(): String? =
         str("tmdb_id", "tmdbid", "tmdbId", "tmdb") ?: str("imdb_id", "imdbid", "imdbId", "imdb")
 
-    private fun JsonNode.toSearch(isTv: Boolean): SearchResponse? {
+    private fun JsonNode.tmdbId(): String? =
+        str("tmdb_id", "tmdbid", "tmdbId", "tmdb")
+
+    private fun JsonNode.imdbId(): String? =
+        str("imdb_id", "imdbid", "imdbId", "imdb")
+
+    private fun JsonNode.title(): String? =
+        str("title", "name", "original_title", "orig_title")
+
+    // -------------------------------------------------- TMDB poster fallback
+
+    private suspend fun tmdbPoster(
+        tmdbid: String?, imdbId: String?, isTv: Boolean
+    ): Pair<String?, String?> {
+        try {
+            // Preferred: use tmdbid directly (single call)
+            if (tmdbid != null) {
+                val type = if (isTv) "tv" else "movie"
+                val info = app.get(
+                    "https://api.themoviedb.org/3/$type/$tmdbid?api_key=$tmdbKey"
+                ).text
+                if (info.isNotBlank()) {
+                    val j = mapper.readTree(info)
+                    val pp = j.get("poster_path")?.asText()
+                        ?.takeIf { it != "null" && it.isNotBlank() }
+                    val bp = j.get("backdrop_path")?.asText()
+                        ?.takeIf { it != "null" && it.isNotBlank() }
+                    if (pp != null || bp != null) {
+                        return (pp?.let { "$tmdbImg/w500$it" })
+                            to (bp?.let { "$tmdbImg/w1280$it" })
+                    }
+                }
+            }
+            // Fallback: find by imdb_id
+            if (imdbId != null && imdbId.startsWith("tt")) {
+                val find = app.get(
+                    "https://api.themoviedb.org/3/find/$imdbId?api_key=$tmdbKey&external_source=imdb_id"
+                ).text
+                if (find.isNotBlank()) {
+                    val j = mapper.readTree(find)
+                    val arr = if (isTv) j.get("tv_results") else j.get("movie_results")
+                    if (arr != null && arr.isArray && arr.size() > 0) {
+                        val first = arr.get(0)
+                        val pp = first.get("poster_path")?.asText()
+                            ?.takeIf { it != "null" && it.isNotBlank() }
+                        val bp = first.get("backdrop_path")?.asText()
+                            ?.takeIf { it != "null" && it.isNotBlank() }
+                        return (pp?.let { "$tmdbImg/w500$it" })
+                            to (bp?.let { "$tmdbImg/w1280$it" })
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            DebugLog.log("tmdb", "poster lookup failed: ${e.message}")
+        }
+        return null to null
+    }
+
+    // -------------------------------------------------- list entry (suspend)
+
+    private suspend fun JsonNode.toSearch(isTv: Boolean): SearchResponse? {
         val id = mediaId() ?: return null
-        val title = str("title", "name", "original_title") ?: return null
-        val poster = img(findImage())
+        val title = title() ?: return null
+
+        var poster = img(findImage())
         val year = (str("year") ?: str("release_date", "first_air_date", "released"))
             ?.take(4)?.toIntOrNull()
+
+        // List API returns no poster - fetch from TMDB
+        if (poster == null) {
+            val (tp, _) = tmdbPoster(tmdbId(), imdbId(), isTv)
+            poster = tp
+        }
+
         return if (isTv) {
             newTvSeriesSearchResponse(title, "$mainUrl/tv/$id", TvType.TvSeries) {
                 this.posterUrl = poster
@@ -156,19 +235,25 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
+    // -------------------------------------------------- main page
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sep = if (request.data.contains("?")) "&" else "?"
         val url = "${request.data}${sep}page=$page&resultsPerPage=30"
         val isTv = request.data.contains("/discover/tv") || request.data.contains("type=tv")
         val raw = getJson(url)?.items().orEmpty()
-        val list = raw.mapNotNull { it.toSearch(isTv) }
+
+        // Parallel poster lookup via TMDB for each item
+        val list: List<SearchResponse> = coroutineScope {
+            raw.map { item -> async { item.toSearch(isTv) } }
+                .awaitAll()
+                .filterNotNull()
+        }
 
         if (raw.isEmpty()) {
-            DebugLog.error("main", "Cannot read list from $url")
+            DebugLog.error("main", "Empty response from $url")
         } else if (list.isEmpty()) {
-            DebugLog.error("main", "Got ${raw.size} items but no tmdb_id/imdb_id. First: ${raw.first()}")
-        } else if (list.all { it.posterUrl == null }) {
-            DebugLog.error("main", "No poster found. First: ${raw.first()}")
+            DebugLog.error("main", "Got ${raw.size} items but couldn't parse. First: ${raw.first()}")
         }
         return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
     }
@@ -182,6 +267,8 @@ class MoviesApiProvider : MainAPI() {
             ?.items().orEmpty().mapNotNull { it.toSearch(true) }
         return movies + shows
     }
+
+    // -------------------------------------------------- load
 
     private fun mkEpisode(
         id: String, season: Int, episode: Int,
@@ -236,7 +323,6 @@ class MoviesApiProvider : MainAPI() {
                 }
             }
         }
-        if (eps.isEmpty()) DebugLog.error("load", "Cannot build episodes for id=$id (imdb=$imdbId)")
         return eps.sortedWith(compareBy({ it.season }, { it.episode }))
     }
 
@@ -256,15 +342,26 @@ class MoviesApiProvider : MainAPI() {
         val node = getJson("$mainUrl/api/discover/$endpoint?$param=$id")?.items()?.firstOrNull()
         if (node == null) DebugLog.error("load", "No detail data for $endpoint $param=$id")
 
-        val title = node?.str("title", "name", "original_title") ?: id
-        val poster = img(node?.findImage())
-        val backdrop = img(node?.findImage(backdrop = true), "w1280")
+        val title = node?.title() ?: id
+        var poster = img(node?.findImage())
+        var backdrop = img(node?.findImage(backdrop = true), "w1280")
         val plot = node?.str("overview", "plot", "description", "synopsis")
-        val year = node?.let { (it.str("year") ?: it.str("release_date", "first_air_date"))?.take(4)?.toIntOrNull() }
-        val imdbId = node?.str("imdb_id", "imdbid", "imdbId") ?: id.takeIf { isImdb }
+        val year = node?.let {
+            (it.str("year") ?: it.str("release_date", "first_air_date"))
+                ?.take(4)?.toIntOrNull()
+        }
+        val imdbId = node?.imdbId() ?: id.takeIf { isImdb }
+        val tmdbid = node?.tmdbId() ?: if (!isImdb) id else null
         val tagList = node?.get("genres")?.let { g ->
             if (g.isArray) g.mapNotNull { if (it.isTextual) it.asText() else it.str("name", "title") }
             else g.asText().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        }
+
+        // Fallback to TMDB for poster/backdrop if missing
+        if (poster == null || backdrop == null) {
+            val (tp, tb) = tmdbPoster(tmdbid, imdbId, isTv)
+            if (poster == null) poster = tp
+            if (backdrop == null) backdrop = tb
         }
 
         return if (isTv) {
@@ -288,6 +385,8 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
+    // -------------------------------------------------- loadLinks
+
     private fun vidoraUrl(embed: String): String? {
         val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return null
         val type = m.groupValues[1]
@@ -306,16 +405,21 @@ class MoviesApiProvider : MainAPI() {
           var t = setInterval(function(){
             n++;
             try {
-              var p = document.querySelector('media-player');
-              if (p && p.play) { p.muted = true; p.play(); }
-              var v = document.querySelector('video');
-              if (v) { v.muted = true; var r = v.play(); if (r && r.catch) r.catch(function(){}); }
-              var b = document.querySelector('media-play-button');
-              if (b) b.click();
-              var b2 = document.querySelector('[data-play]');
-              if (b2 && n % 3 === 0) b2.click();
+              document.querySelectorAll('video, audio').forEach(function(el){
+                el.muted = true;
+                var p = el.play();
+                if (p && p.catch) p.catch(function(){});
+              });
+              var bs = document.querySelectorAll('button, [role="button"], [data-play], media-play-button');
+              bs.forEach(function(b){
+                var a = (b.getAttribute('aria-label') || '').toLowerCase();
+                var t = (b.textContent || '').trim().toLowerCase();
+                if (a.indexOf('play') >= 0 || t === 'play' || b.hasAttribute('data-play')) {
+                  try { b.click(); } catch (e) {}
+                }
+              });
             } catch (e) {}
-            if (n > 25) clearInterval(t);
+            if (n > 20) clearInterval(t);
           }, 1000);
         })();
     """.trimIndent()
@@ -342,9 +446,13 @@ class MoviesApiProvider : MainAPI() {
                 val json = mapper.readTree(body)
 
                 if (json.get("result")?.asBoolean() != true) {
+                    val err = json.get("error")?.asText() ?: "unknown"
                     DebugLog.error(
                         "vidora",
-                        "result != true (check x-player-key). Body: ${body.take(300)}"
+                        "API auth failed ($err). The x-player-key has likely rotated. " +
+                        "Fix: open https://moviesapi.to/movie/1291595 in Chrome, F12 -> " +
+                        "Network -> filter 'vidora' -> copy request header 'x-player-key' " +
+                        "-> update vidoraKey constant. Body: ${body.take(200)}"
                     )
                 }
 
@@ -354,35 +462,19 @@ class MoviesApiProvider : MainAPI() {
                         val url = src.str("url") ?: continue
                         if (!url.contains(".m3u8")) continue
 
-                        val ok = try {
-                            val probe = app.get(
-                                url,
-                                headers = streamHeaders,
-                                referer = "$mainUrl/"
-                            ).text
-                            probe.trimStart().startsWith("#EXTM3U")
-                        } catch (e: Exception) {
-                            DebugLog.error("m3u8-probe", "probe failed: ${e.message}")
-                            false
-                        }
-
-                        if (ok) {
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = name,
-                                    name   = name,
-                                    url    = url,
-                                    type   = ExtractorLinkType.M3U8
-                                ) {
-                                    this.referer = "$mainUrl/"
-                                    this.quality = Qualities.Unknown.value
-                                    this.headers = streamHeaders
-                                }
-                            )
-                            found = true
-                        } else {
-                            DebugLog.error("m3u8-probe", "m3u8 not fetchable with current headers")
-                        }
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name   = name,
+                                url    = url,
+                                type   = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "$mainUrl/"
+                                this.quality = Qualities.Unknown.value
+                                this.headers = streamHeaders
+                            }
+                        )
+                        found = true
                     }
                 }
 
@@ -394,9 +486,7 @@ class MoviesApiProvider : MainAPI() {
                         val file = fileNode.asText()
                         if (file.isBlank()) continue
                         val lang = t.str("language") ?: "unknown"
-                        subtitleCallback.invoke(
-                            newSubtitleFile(url = file, lang = lang)
-                        )
+                        subtitleCallback.invoke(newSubtitleFile(url = file, lang = lang))
                     }
                 }
             } catch (e: Exception) {
@@ -406,13 +496,14 @@ class MoviesApiProvider : MainAPI() {
 
         if (found) return true
 
+        // Fallback: WebView to capture m3u8
         try {
             val resolver = WebViewResolver(
                 interceptUrl   = Regex("\\.m3u8"),
                 useOkhttp      = false,
                 script         = autoPlayScript,
                 scriptCallback = { },
-                timeout        = 25_000L
+                timeout        = 30_000L
             )
             val stream = app.get(data, referer = "$mainUrl/", interceptor = resolver).url
             DebugLog.log("webview", "result: $stream")
@@ -436,7 +527,7 @@ class MoviesApiProvider : MainAPI() {
         }
 
         if (!found) {
-            DebugLog.error("links", "No playable link found for $data")
+            DebugLog.error("links", "No playable link for $data")
         }
         return found
     }
