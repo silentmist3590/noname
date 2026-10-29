@@ -11,12 +11,8 @@ import java.net.URLEncoder
  * Plugin cho https://moviesapi.to
  *
  * - Danh sách/tìm kiếm: /api/discover/{movies|tv|views}
- * - Phát: trang embed gọi /api/vidora/v1/movie/{id}  (xem logcat) -> thử gọi thẳng API này,
- *   nếu không ra link thì mở trang embed bằng WebView, tự bấm play và bắt request .m3u8.
- *
- * QUAN TRỌNG: API /api/vidora/v1/* BẮT BUỘC phải có header `x-player-key`
- * (xem bundle JS của moviesapi.to). Thiếu header này API trả `result: false`,
- * `sources: []` → không có m3u8. M3u8 CDN cũng cần `Origin` + `Referer`.
+ * - Phát: trang embed gọi /api/vidora/v1/movie/{id} (cần header x-player-key)
+ *   nếu API fail -> fallback WebView bắt request .m3u8.
  */
 class MoviesApiProvider : MainAPI() {
     override var mainUrl = "https://moviesapi.to"
@@ -27,35 +23,39 @@ class MoviesApiProvider : MainAPI() {
 
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
-    private val imgExt = Regex("""\.(jpe?g|png|webp|avif)(\?.*)?$""", RegexOption.IGNORE_CASE)
 
-    // ---------------------------------------------------------------- headers
+    // Không dùng raw-string vì "$" trước """ dễ gây lỗi ở Kotlin mới.
+    // Regex: .jpg | .jpeg | .png | .webp | .avif (kèm ?query tùy chọn) ở cuối URL
+    private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\$", RegexOption.IGNORE_CASE)
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    /** Key bắt buộc cho API vidora (trích từ bundle JS của moviesapi.to). */
+    /** Key bắt buộc của API vidora (trích từ bundle JS của moviesapi.to). */
     private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
 
-    /** Headers cho request JSON (API discover + API vidora). */
-    private val apiHeaders = mapOf(
-        "User-Agent"      to userAgent,
-        "Accept"          to "application/json, text/plain, */*",
-        "Accept-Language" to "en-US,en;q=0.9",
-        "Origin"          to mainUrl,
-        "Referer"         to "$mainUrl/",
-        "x-player-key"    to vidoraKey,
-    )
+    /** Header cho API JSON (discover + vidora). Không có "*\/*" để tránh parser weirdness. */
+    private val apiHeaders: Map<String, String> by lazy {
+        mapOf(
+            "User-Agent"      to userAgent,
+            "Accept"          to "application/json",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Origin"          to mainUrl,
+            "Referer"         to "$mainUrl/",
+            "x-player-key"    to vidoraKey,
+        )
+    }
 
-    /** Headers cho CDN (workers.dev) — m3u8 + segment. */
-    private val streamHeaders = mapOf(
-        "User-Agent"      to userAgent,
-        "Accept"          to "*/*",
-        "Accept-Language" to "en-US,en;q=0.9",
-        "Origin"          to mainUrl,
-        "Referer"         to "$mainUrl/",
-    )
+    /** Header cho CDN workers.dev — m3u8 + segment. */
+    private val streamHeaders: Map<String, String> by lazy {
+        mapOf(
+            "User-Agent"      to userAgent,
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Origin"          to mainUrl,
+            "Referer"         to "$mainUrl/",
+        )
+    }
 
     override val mainPage = mainPageOf(
         "$mainUrl/api/discover/views?type=movie&views=day" to "Trending Movies (Today)",
@@ -73,7 +73,7 @@ class MoviesApiProvider : MainAPI() {
         val text = app.get(
             url,
             headers = mapOf(
-                "Accept"       to "application/json, text/plain, */*",
+                "Accept"       to "application/json",
                 "User-Agent"   to userAgent,
                 "Origin"       to mainUrl,
                 "x-player-key" to vidoraKey,
@@ -87,7 +87,6 @@ class MoviesApiProvider : MainAPI() {
         null
     }
 
-    /** Lấy mảng item từ nhiều dạng response: [..] | {data:[..]} | {data:{data:[..]}} | {results:[..]} */
     private fun JsonNode.items(): List<JsonNode> {
         if (isArray) return toList()
         for (k in listOf("data", "results", "items", "movies", "shows", "tv", "list")) {
@@ -106,14 +105,10 @@ class MoviesApiProvider : MainAPI() {
             get(k)?.takeIf { !it.isNull && !it.isContainerNode }?.asText()?.takeIf { it.isNotBlank() }
         }
 
-    /**
-     * Tự dò ảnh trong JSON mà không cần biết tên field:
-     * ưu tiên key chứa "poster"/"thumb"/"cover"/"image", chấp nhận giá trị có đuôi ảnh.
-     * Với backdrop thì ưu tiên key chứa "backdrop"/"banner"/"background".
-     */
     private fun JsonNode.findImage(backdrop: Boolean = false, depth: Int = 0): String? {
         if (!isObject || depth > 2) return null
-        fun isBack(k: String) = k.contains("backdrop") || k.contains("banner") || k.contains("background")
+        fun isBack(k: String) =
+            k.contains("backdrop") || k.contains("banner") || k.contains("background")
         val keys = fieldNames().asSequence().toList().sortedBy { k ->
             val l = k.lowercase()
             when {
@@ -135,7 +130,6 @@ class MoviesApiProvider : MainAPI() {
                 v.findImage(false, depth + 1)?.let { return it }
             }
         }
-        // chế độ poster: không thấy key rõ ràng -> lấy bất kỳ chuỗi nào có đuôi ảnh (trừ backdrop)
         if (!backdrop) {
             for (k in keys) {
                 if (isBack(k.lowercase())) continue
@@ -196,7 +190,7 @@ class MoviesApiProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        if (query.length < 3) return emptyList() // API yêu cầu tối thiểu 3 ký tự
+        if (query.length < 3) return emptyList()
         val q = URLEncoder.encode(query, "UTF-8")
         val movies = getJson("$mainUrl/api/discover/movies?query=$q&resultsPerPage=30")
             ?.items().orEmpty().mapNotNull { it.toSearch(false) }
@@ -221,7 +215,6 @@ class MoviesApiProvider : MainAPI() {
     private suspend fun buildEpisodes(id: String, node: JsonNode?, imdbId: String?): List<Episode> {
         val eps = mutableListOf<Episode>()
 
-        // 1) Nếu API trả sẵn "seasons"
         val seasons = node?.get("seasons")
         if (seasons != null && seasons.isArray) {
             for (s in seasons) {
@@ -244,7 +237,6 @@ class MoviesApiProvider : MainAPI() {
             }
         }
 
-        // 2) Fallback: Cinemeta (Stremio) — cần IMDb id
         if (eps.isEmpty() && imdbId != null) {
             val videos = getJson(
                 "https://v3-cinemeta.strem.io/meta/series/$imdbId.json", referer = null
@@ -273,7 +265,6 @@ class MoviesApiProvider : MainAPI() {
         val id = if (isTv) rawId.substringBefore("-") else rawId
         val isImdb = id.startsWith("tt")
 
-        // Tên tham số theo tài liệu: movies -> imdb_id / tmdbid ; tv -> imdbid / tmdbid
         val param = when {
             isImdb && isTv -> "imdbid"
             isImdb -> "imdb_id"
@@ -317,7 +308,6 @@ class MoviesApiProvider : MainAPI() {
 
     // ------------------------------------------------------------------ links
 
-    /** Trang embed -> endpoint API mà player của moviesapi.to gọi (thấy trong logcat). */
     private fun vidoraUrl(embed: String): String? {
         val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return null
         val type = m.groupValues[1]
@@ -330,7 +320,7 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // Tự bấm play (trong WebView không có thao tác người dùng nên player không tự chạy)
+    // Raw-string JS không có dấu " để tránh xung đột delimiter.
     private val autoPlayScript = """
         (function(){
           var n = 0;
@@ -341,8 +331,10 @@ class MoviesApiProvider : MainAPI() {
               if (p && p.play) { p.muted = true; p.play(); }
               var v = document.querySelector('video');
               if (v) { v.muted = true; var r = v.play(); if (r && r.catch) r.catch(function(){}); }
-              var b = document.querySelector('media-play-button, [aria-label="Play"], [data-play]');
-              if (b && n % 3 == 0) b.click();
+              var b = document.querySelector('media-play-button');
+              if (b) b.click();
+              var b2 = document.querySelector('[data-play]');
+              if (b2 && n % 3 === 0) b2.click();
             } catch (e) {}
             if (n > 25) clearInterval(t);
           }, 1000);
@@ -358,9 +350,7 @@ class MoviesApiProvider : MainAPI() {
         DebugLog.log("links", "loadLinks data=$data")
         var found = false
 
-        // ------------------------------------------------------------------
-        // 1) Gọi thẳng API vidora — PHẢI có x-player-key
-        // ------------------------------------------------------------------
+        // 1) Gọi API vidora (BẮT BUỘC có x-player-key)
         val apiUrl = vidoraUrl(data)
         if (apiUrl != null) {
             try {
@@ -386,7 +376,6 @@ class MoviesApiProvider : MainAPI() {
                         val url = src.str("url") ?: continue
                         if (!url.contains(".m3u8")) continue
 
-                        // Xác minh m3u8 fetch được bằng headers đầy đủ
                         val ok = try {
                             val probe = app.get(
                                 url,
@@ -400,31 +389,19 @@ class MoviesApiProvider : MainAPI() {
                         }
 
                         if (ok) {
-                            // Thử M3u8Helper để tách các quality (nếu hỗ trợ headers)
-                            val links = try {
-                                M3u8Helper.generateM3u8(
+                            // Đẩy link M3U8 kèm headers để ExoPlayer tải được m3u8 + segment
+                            callback.invoke(
+                                newExtractorLink(
                                     source = name,
-                                    streamUrl = url,
-                                    referer = "$mainUrl/"
-                                )
-                            } catch (_: Exception) { emptyList() }
-
-                            if (links.isNotEmpty()) {
-                                links.forEach { callback(it) }
-                            } else {
-                                callback.invoke(
-                                    newExtractorLink(
-                                        source = name,
-                                        name   = name,
-                                        url    = url,
-                                        type   = ExtractorLinkType.M3U8
-                                    ) {
-                                        this.referer = "$mainUrl/"
-                                        this.quality = Qualities.Unknown.value
-                                        this.headers = streamHeaders
-                                    }
-                                )
-                            }
+                                    name   = name,
+                                    url    = url,
+                                    type   = ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = "$mainUrl/"
+                                    this.quality = Qualities.Unknown.value
+                                    this.headers = streamHeaders
+                                }
+                            )
                             found = true
                         } else {
                             DebugLog.error("m3u8-probe", "m3u8 không fetch được với headers hiện tại")
@@ -432,16 +409,17 @@ class MoviesApiProvider : MainAPI() {
                     }
                 }
 
-                // ---- Phụ đề đính kèm (sources[0].tracks) ----
+                // Phụ đề đính kèm
                 val tracks = sources?.firstOrNull()?.get("tracks")
                 if (tracks != null && tracks.isArray) {
                     for (t in tracks) {
-                        val fileNode = t.get("file")
-                        if (fileNode == null || fileNode.isNull) continue
-                        val file  = fileNode.asText()
-                        val label = t.str("label") ?: "Unknown"
-                        val lang  = t.str("language") ?: ""
-                        subtitleCallback.invoke(newSubtitleFile(lang, file, label))
+                        val fileNode = t.get("file") ?: continue
+                        if (fileNode.isNull) continue
+                        val file = fileNode.asText()
+                        if (file.isBlank()) continue
+                        val lang = t.str("language") ?: "unknown"
+                        // Dùng trực tiếp data-class để tránh khác biệt signature newSubtitleFile
+                        subtitleCallback.invoke(SubtitleFile(lang, file))
                     }
                 }
             } catch (e: Exception) {
@@ -451,12 +429,10 @@ class MoviesApiProvider : MainAPI() {
 
         if (found) return true
 
-        // ------------------------------------------------------------------
-        // 2) Fallback: WebView + tự bấm play, bắt request .m3u8
-        // ------------------------------------------------------------------
+        // 2) Fallback: WebView + tự bấm play, bắt .m3u8
         try {
             val resolver = WebViewResolver(
-                interceptUrl   = Regex(""".m3u8"""),
+                interceptUrl   = Regex("\\.m3u8"),
                 useOkhttp      = false,
                 script         = autoPlayScript,
                 scriptCallback = { },
