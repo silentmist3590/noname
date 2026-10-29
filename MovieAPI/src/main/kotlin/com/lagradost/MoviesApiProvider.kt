@@ -16,7 +16,11 @@ class MoviesApiProvider : MainAPI() {
 
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
-    private val tmdbKey = "e716f19ab4d25edc5247239a8f3494f8"
+
+    // TMDB API key (public key from a well-known open-source project).
+    // If posters stop showing, replace with your own free key from
+    // https://www.themoviedb.org/settings/api
+    private val tmdbKey = "4e44d9029b1270a757cddc766a1bcb63"
 
     private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\\z", RegexOption.IGNORE_CASE)
 
@@ -24,12 +28,20 @@ class MoviesApiProvider : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    // Working key captured from live WebView (2026-10-29). If it rotates,
-    // the WebView hook below will capture the new one automatically.
+    // Live vidora key (rotates on site). WebView hook captures new ones automatically.
     private val vidoraKeyFallback = "3a67e8866ae1d2bb9e81fe7f73315a56eb3bdf5e3e755c7554c8be6910aa6b13"
 
     @Volatile private var cachedKey: String? = null
     @Volatile private var cachedKeyAt: Long = 0L
+
+    // In-memory caches (survive across provider instances while app is running)
+    private val posterCache = HashMap<String, String?>()
+    private val backdropCache = HashMap<String, String?>()
+    private val subsCache = HashMap<String, List<Pair<String, String>>>()
+
+    // Limit TMDB lookups per page so list loads fast on first run.
+    // After first load, cache makes subsequent loads instant.
+    private val maxTmdbLookupsPerPage = 12
 
     private val apiBaseHeaders: Map<String, String> by lazy {
         mapOf(
@@ -147,68 +159,112 @@ class MoviesApiProvider : MainAPI() {
     private fun JsonNode.imdbId(): String? = str("imdb_id", "imdbid", "imdbId", "imdb")
     private fun JsonNode.title(): String? = str("title", "name", "original_title", "orig_title")
 
-    private suspend fun tmdbPoster(
+    // -------------------------------------------------- TMDB (poster + backdrop)
+
+    private suspend fun lookupTmdbPoster(
         tmdbid: String?, imdbId: String?, isTv: Boolean
-    ): Pair<String?, String?> {
-        try {
-            if (tmdbid != null) {
+    ): String? {
+        if (tmdbid != null) {
+            try {
                 val type = if (isTv) "tv" else "movie"
                 val info = app.get("https://api.themoviedb.org/3/$type/$tmdbid?api_key=$tmdbKey").text
-                if (info.isNotBlank()) {
+                DebugLog.log("tmdb", "GET $type/$tmdbid -> ${info.length}b: ${info.take(120)}")
+                if (info.startsWith("{")) {
                     val j = mapper.readTree(info)
                     val pp = j.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
                     val bp = j.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
-                    if (pp != null || bp != null) {
-                        return Pair(pp?.let { "$tmdbImg/w500$it" }, bp?.let { "$tmdbImg/w1280$it" })
-                    }
+                    val ck = (tmdbid).lowercase()
+                    posterCache[ck] = pp?.let { "$tmdbImg/w500$it" }
+                    backdropCache[ck] = bp?.let { "$tmdbImg/w1280$it" }
+                    return posterCache[ck]
+                } else {
+                    DebugLog.log("tmdb", "bad response (key may be invalid): ${info.take(200)}")
                 }
+            } catch (e: Exception) {
+                DebugLog.log("tmdb", "lookup $tmdbid failed: ${e.message}")
             }
-            if (imdbId != null && imdbId.startsWith("tt")) {
+        }
+        if (imdbId != null && imdbId.startsWith("tt")) {
+            try {
                 val find = app.get(
                     "https://api.themoviedb.org/3/find/$imdbId?api_key=$tmdbKey&external_source=imdb_id"
                 ).text
-                if (find.isNotBlank()) {
+                if (find.startsWith("{")) {
                     val j = mapper.readTree(find)
                     val arr = if (isTv) j.get("tv_results") else j.get("movie_results")
                     if (arr != null && arr.isArray && arr.size() > 0) {
                         val first = arr.get(0)
                         val pp = first.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
                         val bp = first.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
-                        return Pair(pp?.let { "$tmdbImg/w500$it" }, bp?.let { "$tmdbImg/w1280$it" })
+                        val ck = imdbId.lowercase()
+                        posterCache[ck] = pp?.let { "$tmdbImg/w500$it" }
+                        backdropCache[ck] = bp?.let { "$tmdbImg/w1280$it" }
+                        return posterCache[ck]
                     }
                 }
+            } catch (e: Exception) {
+                DebugLog.log("tmdb", "find $imdbId failed: ${e.message}")
             }
-        } catch (e: Exception) {
-            DebugLog.log("tmdb", "poster lookup failed: ${e.message}")
         }
-        return Pair(null, null)
+        return null
     }
 
-    private suspend fun JsonNode.toSearch(isTv: Boolean): SearchResponse? {
-        val id = mediaId() ?: return null
-        val title = title() ?: return null
-        var poster = img(findImage())
-        val year = (str("year") ?: str("release_date", "first_air_date", "released"))?.take(4)?.toIntOrNull()
-        if (poster == null) poster = tmdbPoster(tmdbId(), imdbId(), isTv).first
-        return if (isTv) {
-            newTvSeriesSearchResponse(title, "$mainUrl/tv/$id", TvType.TvSeries) {
-                this.posterUrl = poster
-                this.year = year
-            }
-        } else {
-            newMovieSearchResponse(title, "$mainUrl/movie/$id", TvType.Movie) {
-                this.posterUrl = poster
-                this.year = year
-            }
-        }
+    private suspend fun lookupTmdbBackdrop(
+        tmdbid: String?, imdbId: String?, isTv: Boolean
+    ): String? {
+        val ck = (tmdbid ?: imdbId ?: "").lowercase()
+        if (ck.isNotEmpty() && backdropCache.containsKey(ck)) return backdropCache[ck]
+        lookupTmdbPoster(tmdbid, imdbId, isTv)
+        return if (ck.isNotEmpty()) backdropCache[ck] else null
     }
+
+    // -------------------------------------------------- main page
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sep = if (request.data.contains("?")) "&" else "?"
         val url = "${request.data}${sep}page=$page&resultsPerPage=30"
         val isTv = request.data.contains("/discover/tv") || request.data.contains("type=tv")
         val raw = getJson(url)?.items().orEmpty()
-        val list = raw.mapNotNull { it.toSearch(isTv) }
+
+        val list = ArrayList<SearchResponse>(raw.size)
+        var lookups = 0
+
+        for (item in raw) {
+            val id = item.mediaId() ?: continue
+            val title = item.title() ?: continue
+
+            var poster = img(item.findImage())
+            val cacheKey = (item.tmdbId() ?: item.imdbId() ?: "").lowercase()
+
+            if (poster == null) {
+                poster = when {
+                    cacheKey.isNotEmpty() && posterCache.containsKey(cacheKey) -> posterCache[cacheKey]
+                    lookups < maxTmdbLookupsPerPage -> {
+                        lookups++
+                        lookupTmdbPoster(item.tmdbId(), item.imdbId(), isTv)
+                    }
+                    else -> null
+                }
+            }
+
+            val year = (item.str("year")
+                ?: item.str("release_date", "first_air_date", "released"))
+                ?.take(4)?.toIntOrNull()
+
+            val sr = if (isTv) {
+                newTvSeriesSearchResponse(title, "$mainUrl/tv/$id", TvType.TvSeries) {
+                    this.posterUrl = poster
+                    this.year = year
+                }
+            } else {
+                newMovieSearchResponse(title, "$mainUrl/movie/$id", TvType.Movie) {
+                    this.posterUrl = poster
+                    this.year = year
+                }
+            }
+            list.add(sr)
+        }
+
         return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
     }
 
@@ -216,11 +272,46 @@ class MoviesApiProvider : MainAPI() {
         if (query.length < 3) return emptyList()
         val q = URLEncoder.encode(query, "UTF-8")
         val movies = getJson("$mainUrl/api/discover/movies?query=$q&resultsPerPage=30")
-            ?.items().orEmpty().mapNotNull { it.toSearch(false) }
+            ?.items().orEmpty()
         val shows = getJson("$mainUrl/api/discover/tv?query=$q&resultsPerPage=30")
-            ?.items().orEmpty().mapNotNull { it.toSearch(true) }
-        return movies + shows
+            ?.items().orEmpty()
+
+        val out = ArrayList<SearchResponse>()
+        var lookups = 0
+        for ((items, isTv) in listOf(movies to false, shows to true)) {
+            for (item in items) {
+                val id = item.mediaId() ?: continue
+                val title = item.title() ?: continue
+                var poster = img(item.findImage())
+                val ck = (item.tmdbId() ?: item.imdbId() ?: "").lowercase()
+                if (poster == null) {
+                    poster = when {
+                        ck.isNotEmpty() && posterCache.containsKey(ck) -> posterCache[ck]
+                        lookups < maxTmdbLookupsPerPage -> {
+                            lookups++
+                            lookupTmdbPoster(item.tmdbId(), item.imdbId(), isTv)
+                        }
+                        else -> null
+                    }
+                }
+                val year = (item.str("year")
+                    ?: item.str("release_date", "first_air_date", "released"))
+                    ?.take(4)?.toIntOrNull()
+                out.add(
+                    if (isTv) newTvSeriesSearchResponse(title, "$mainUrl/tv/$id", TvType.TvSeries) {
+                        this.posterUrl = poster
+                        this.year = year
+                    } else newMovieSearchResponse(title, "$mainUrl/movie/$id", TvType.Movie) {
+                        this.posterUrl = poster
+                        this.year = year
+                    }
+                )
+            }
+        }
+        return out
     }
+
+    // -------------------------------------------------- load
 
     private fun mkEpisode(
         id: String, season: Int, episode: Int,
@@ -303,10 +394,19 @@ class MoviesApiProvider : MainAPI() {
             if (g.isArray) g.mapNotNull { if (it.isTextual) it.asText() else it.str("name", "title") }
             else g.asText().split(",").map { it.trim() }.filter { it.isNotEmpty() }
         }
-        if (poster == null || backdrop == null) {
-            val p = tmdbPoster(tmdbid, imdbId, isTv)
-            if (poster == null) poster = p.first
-            if (backdrop == null) backdrop = p.second
+
+        val cacheKey = (tmdbid ?: imdbId ?: "").lowercase()
+        if (poster == null) {
+            poster = when {
+                cacheKey.isNotEmpty() && posterCache.containsKey(cacheKey) -> posterCache[cacheKey]
+                else -> lookupTmdbPoster(tmdbid, imdbId, isTv)
+            }
+        }
+        if (backdrop == null) {
+            backdrop = when {
+                cacheKey.isNotEmpty() && backdropCache.containsKey(cacheKey) -> backdropCache[cacheKey]
+                else -> lookupTmdbBackdrop(tmdbid, imdbId, isTv)
+            }
         }
 
         return if (isTv) {
@@ -327,6 +427,86 @@ class MoviesApiProvider : MainAPI() {
                 this.plot = plot
                 this.tags = tagList
             }
+        }
+    }
+
+    // ================================================================
+    //          SUBTITLES (via /api/vidora/v1/subtitles/...)
+    // ================================================================
+
+    private suspend fun fetchSubtitles(
+        embed: String,
+        key: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val cached = subsCache[embed]
+        if (cached != null) {
+            DebugLog.log("subs", "cache hit: ${cached.size} subs")
+            cached.forEach { (lang, url) -> subtitleCallback.invoke(newSubtitleFile(url = url, lang = lang)) }
+            return
+        }
+
+        try {
+            val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return
+            val type = m.groupValues[1]
+            val id = m.groupValues[2]
+            val path = when {
+                type == "movie" -> "/api/vidora/v1/subtitles/movie/$id"
+                m.groupValues[3].isNotEmpty() ->
+                    "/api/vidora/v1/subtitles/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
+                else -> return
+            }
+            val headers = apiBaseHeaders.toMutableMap()
+            headers["x-player-key"] = key
+            val body = app.get("$mainUrl$path", headers = headers, referer = "$mainUrl/").text
+            DebugLog.log("subs", "GET $path -> ${body.length}b: ${body.take(500)}")
+            if (body.isBlank() || !body.trimStart().startsWith("{")) return
+
+            val json = mapper.readTree(body)
+            val result = ArrayList<Pair<String, String>>()
+
+            fun tryAdd(node: JsonNode?) {
+                if (node == null || node.isNull) return
+                if (node.isArray) {
+                    for (t in node) {
+                        if (!t.isObject) continue
+                        val file = t.str("file", "url", "src", "path") ?: continue
+                        if (file.isBlank()) continue
+                        val lang = t.str("language", "lang", "label", "name", "code") ?: "unknown"
+                        result.add(lang to file)
+                    }
+                } else if (node.isObject) {
+                    node.fieldNames().forEach { lang ->
+                        val v = node.get(lang) ?: return@forEach
+                        if (v.isTextual && v.asText().isNotBlank()) {
+                            result.add(lang to v.asText())
+                        } else if (v.isObject) {
+                            val file = v.str("file", "url", "src", "path") ?: return@forEach
+                            val label = v.str("label", "language", "name") ?: lang
+                            if (file.isNotBlank()) result.add(label to file)
+                        }
+                    }
+                }
+            }
+
+            // Try common envelope keys first, then the root itself
+            tryAdd(json.get("subtitles"))
+            tryAdd(json.get("tracks"))
+            tryAdd(json.get("data"))
+            tryAdd(json.get("subs"))
+            if (result.isEmpty()) tryAdd(json)
+
+            // Deduplicate by URL
+            val seen = HashSet<String>()
+            val deduped = result.filter { seen.add(it.second) }
+
+            subsCache[embed] = deduped
+            DebugLog.log("subs", "parsed ${deduped.size} subs")
+            deduped.forEach { (lang, url) ->
+                subtitleCallback.invoke(newSubtitleFile(url = url, lang = lang))
+            }
+        } catch (e: Exception) {
+            DebugLog.log("subs", "fetch failed: ${e.message}")
         }
     }
 
@@ -358,7 +538,6 @@ class MoviesApiProvider : MainAPI() {
         return vidoraKeyFallback
     }
 
-    /** Try the API with the given key. Returns true if at least one m3u8 was emitted. */
     private suspend fun tryApiCall(
         key: String,
         embed: String,
@@ -370,7 +549,7 @@ class MoviesApiProvider : MainAPI() {
             val headers = apiBaseHeaders.toMutableMap()
             headers["x-player-key"] = key
             val body = app.get(apiUrl, headers = headers, referer = "$mainUrl/").text
-            DebugLog.log("vidora", "GET $apiUrl (key=${key.take(8)}..) -> ${body.length}b: ${body.take(500)}")
+            DebugLog.log("vidora", "GET $apiUrl (key=${key.take(8)}..) -> ${body.length}b: ${body.take(400)}")
 
             if (!body.trimStart().startsWith("{")) return false
             val json = mapper.readTree(body)
@@ -399,9 +578,11 @@ class MoviesApiProvider : MainAPI() {
                     found = true
                 }
             }
-            val tracks = sources?.firstOrNull()?.get("tracks")
-            if (tracks != null && tracks.isArray) {
-                for (t in tracks) {
+
+            // Inline tracks from source (may be present in some responses)
+            val inlineTracks = sources?.firstOrNull()?.get("tracks")
+            if (inlineTracks != null && inlineTracks.isArray) {
+                for (t in inlineTracks) {
                     val fn = t.get("file") ?: continue
                     if (fn.isNull) continue
                     val f = fn.asText()
@@ -410,6 +591,10 @@ class MoviesApiProvider : MainAPI() {
                     subtitleCallback.invoke(newSubtitleFile(url = f, lang = lang))
                 }
             }
+
+            // Dedicated subtitles endpoint
+            if (found) fetchSubtitles(embed, key, subtitleCallback)
+
             found
         } catch (e: Exception) {
             DebugLog.log("vidora", "call failed: ${e.message}")
@@ -417,7 +602,6 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // Auto-play script that aggressively tries to start the player
     private val autoPlayScript = """
         (function(){
           var n = 0;
@@ -452,8 +636,6 @@ class MoviesApiProvider : MainAPI() {
         })();
     """.trimIndent()
 
-    // Hook script: captures x-player-key from the site's own fetch() calls.
-    // Returns JSON to scriptCallback. Once captured, key is cached by the plugin.
     private val hookScript = """
         (function(){
           if (window.__CS_KEY && window.__CS_KEY.length > 16) {
@@ -495,7 +677,6 @@ class MoviesApiProvider : MainAPI() {
     ): Boolean {
         DebugLog.log("links", "loadLinks data=$data")
 
-        // ---- FAST PATH: try current key directly ----
         val keyNow = currentKey()
         DebugLog.log("key", "fast path key: ${keyNow.take(8)}..")
         if (tryApiCall(keyNow, data, subtitleCallback, callback)) {
@@ -503,14 +684,11 @@ class MoviesApiProvider : MainAPI() {
             return true
         }
 
-        // ---- SLOW PATH: WebView to capture live key ----
         DebugLog.log("webview", "=== opening WebView to capture live key ===")
         var capturedKey: String? = null
 
         try {
             val resolver = WebViewResolver(
-                // Match the API call so WebView closes right after the site
-                // fires the request that carries x-player-key in its headers.
                 interceptUrl   = Regex("(?i)(/api/vidora/v1/(movie|tv)/|/api/vidora/v1/ice|workers\\.dev|\\.m3u8)"),
                 useOkhttp      = false,
                 script         = autoPlayScript + "\n" + hookScript,
@@ -533,7 +711,6 @@ class MoviesApiProvider : MainAPI() {
             val capturedUrl = resp.url
             DebugLog.log("webview", "captured: $capturedUrl")
 
-            // If WebView captured an m3u8 directly, emit it
             if (capturedUrl.contains(".m3u8")) {
                 DebugLog.log("webview", "using captured m3u8: $capturedUrl")
                 callback.invoke(
@@ -546,13 +723,14 @@ class MoviesApiProvider : MainAPI() {
                         this.headers = streamHeaders
                     }
                 )
+                // Still try to fetch subs with whatever key we have
+                if (capturedKey != null) fetchSubtitles(data, capturedKey!!, subtitleCallback)
                 return true
             }
         } catch (e: Exception) {
             DebugLog.log("webview", "error: ${e.message}")
         }
 
-        // ---- RETRY with captured key ----
         if (capturedKey != null) {
             DebugLog.log("key", "retrying API with captured key")
             if (tryApiCall(capturedKey!!, data, subtitleCallback, callback)) {
