@@ -1,6 +1,8 @@
 package com.lagradost
 
 import android.content.Context
+import android.content.ClipboardManager
+import android.content.ClipData
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
@@ -31,14 +33,7 @@ class CineJoyPlugin : Plugin() {
 
 /**
  * CloudStream 3 Provider cho CineJoy (cinejoy.pk)
- * Chuyển đổi hoàn chỉnh từ SkyStream plugin v6
- *
- * Tính năng:
- * - Chống chặn DNS & lỗi IPv6 (::1): Ưu tiên api.tmdb.org và hỗ trợ song song api.themoviedb.org
- * - Tự động thử nhiều TMDB API Key + Bearer Token
- * - Chống lỗi không tải được ảnh bìa/poster tại Việt Nam bằng wsrv.nl proxy
- * - Đa nguồn phát từ CineJoy: VidRock AES-256-GCM, NxSha AES-CBC, VidLove
- * - Trích xuất phụ đề đa ngôn ngữ đầy đủ
+ * Phiên bản tích hợp tự động sao chép log lỗi vào Clipboard
  */
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
@@ -51,25 +46,21 @@ class CineJoyProvider : MainAPI() {
     private val ua =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-    // TMDB Anti-block: Đặt api.tmdb.org lên đầu vì không bị các nhà mạng VN chặn DNS về ::1
     private val tmdbHosts = listOf(
         "https://api.tmdb.org/3",
         "https://api.themoviedb.org/3"
     )
     private var tmdbPrefer = 0
 
-    // Danh sách các TMDB Key đã kiểm tra hoạt động 100%
     private val tmdbKeys = listOf(
-        "8476a7ab80ad76f0936744df0430e67c", // Key chính trích xuất từ cinejoy bundle
-        "439c478a771f35c05022f9feabcca01c", // Key dự phòng 1
-        "15d2ea6d0dc1d476efbca3eba2b9bbfb"  // Key dự phòng 2
+        "8476a7ab80ad76f0936744df0430e67c",
+        "439c478a771f35c05022f9feabcca01c",
+        "15d2ea6d0dc1d476efbca3eba2b9bbfb"
     )
 
-    // TMDB Bearer Token dự phòng cao cấp
     private val tmdbBearerToken =
         "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJiYmYxODFkOTRiMzk2MTg1ZDBhYmQ5NzA5M2ZkNDhlMCIsIm5iZiI6MTY5MjUzNzk2MS45MTgwMDAyLCJzdWIiOiI2NGUyMTQ2OTM3MTA5NzAxMWM1NDk3YjgiLCJzY29wZXMiOlsiYXBpX3JlYWQiXSwidmVyc2lvbiI6MX0.t4GsujVl9LceOrnPmx-WDdncTSAx60QBLAoaiuTCvXI"
 
-    // Các máy chủ phát của CineJoy
     private val vidrockBase = "https://vidrock.net"
     private val vidrockKeyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
 
@@ -79,7 +70,6 @@ class CineJoyProvider : MainAPI() {
     private val vidloveBase = "https://api.vidlove.cc"
     private val playerRef = "https://player.vidlove.cc/"
 
-    // Lọc bỏ các host bị chặn hoặc download file chết
     private val blockedHostRegex = Regex(
         "gdflix|katdrive|sendcm|1fichier|fastpic|faststream|gdriveplayer|gdtot|filepress|sharer",
         RegexOption.IGNORE_CASE
@@ -97,10 +87,6 @@ class CineJoyProvider : MainAPI() {
         "/discover/movie?with_watch_providers=9&watch_region=US" to "Prime Video"
     )
 
-    // =========================================================================
-    // TMDB Network & Catalog (Anti-block DNS ::1)
-    // =========================================================================
-
     private suspend fun tmdbGet(path: String): JSONObject? {
         val sep = if (path.contains("?")) "&" else "?"
 
@@ -108,7 +94,6 @@ class CineJoyProvider : MainAPI() {
             val hi = (tmdbPrefer + k) % tmdbHosts.size
             val host = tmdbHosts[hi]
 
-            // Thử từng API key
             for (apiKey in tmdbKeys) {
                 val url = "$host$path${sep}api_key=$apiKey"
                 val res = runCatching {
@@ -132,7 +117,6 @@ class CineJoyProvider : MainAPI() {
                 }
             }
 
-            // Fallback: Thử với Bearer Token
             val bearerUrl = "$host$path"
             val resBearer = runCatching {
                 app.get(
@@ -162,7 +146,6 @@ class CineJoyProvider : MainAPI() {
         if (path.isNullOrBlank() || path == "null") return null
         val clean = if (path.startsWith("/")) path else "/$path"
         val orig = "https://image.tmdb.org/t/p/$size$clean"
-        // wsrv.nl proxy giúp hiển thị poster mượt mà trên tất cả mạng 4G/WiFi VN
         return "https://wsrv.nl/?url=" + URLEncoder.encode(orig, "UTF-8")
     }
 
@@ -174,10 +157,6 @@ class CineJoyProvider : MainAPI() {
     private fun fixEpisode(e: Int): Int {
         return if (e >= 800) (e % 100) + 1 + ((e / 100) - 8) * 2 else e
     }
-
-    // =========================================================================
-    // Main Page & Search
-    // =========================================================================
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val path = if (request.data.contains("?")) "${request.data}&page=$page" else "${request.data}?page=$page"
@@ -259,10 +238,6 @@ class CineJoyProvider : MainAPI() {
         return items
     }
 
-    // =========================================================================
-    // Load Details (Movie / TV Series)
-    // =========================================================================
-
     override suspend fun load(url: String): LoadResponse {
         val parsed = parseDataUrl(url) ?: throw ErrorLoadingException("Invalid CineJoy URL: $url")
         val id = parsed.optInt("id")
@@ -320,7 +295,6 @@ class CineJoyProvider : MainAPI() {
             }
             seasonNums.sort()
 
-            // Tải danh sách tập phim theo từng mùa
             val episodes = mutableListOf<Episode>()
             for (sNum in seasonNums) {
                 val sJson = tmdbGet("/tv/$id/season/$sNum")
@@ -366,7 +340,6 @@ class CineJoyProvider : MainAPI() {
         return runCatching {
             if (url.startsWith("{")) JSONObject(url)
             else {
-                // Regex phân tích URL dạng /movie/123 hoặc /tv/123/1/1
                 val m = Regex("/(movie|tv|series)/(\\d+)(?:/(\\d+)/(\\d+))?").find(url)
                 if (m != null) {
                     val type = if (m.groupValues[1] == "series") "tv" else m.groupValues[1]
@@ -381,10 +354,6 @@ class CineJoyProvider : MainAPI() {
             }
         }.getOrNull()
     }
-
-    // =========================================================================
-    // Link Extraction (VidRock AES-GCM + NxSha AES-CBC + VidLove)
-    // =========================================================================
 
     override suspend fun loadLinks(
         data: String,
@@ -405,9 +374,7 @@ class CineJoyProvider : MainAPI() {
         var totalLinks = 0
         val seenUrls = HashSet<String>()
 
-        // ---------------------------------------------------------------------
-        // 1. VidRock API (Giải mã AES-GCM)
-        // ---------------------------------------------------------------------
+        // 1. VidRock API
         runCatching {
             val vrPath = if (type == "tv") "tv/$id/$s/$e" else "movie/$id"
             val vrUrl = "$vidrockBase/api/$vrPath"
@@ -435,7 +402,6 @@ class CineJoyProvider : MainAPI() {
                     val label = "CineJoy Rock $serverName" + (if (lang.isNotBlank()) " - $lang" else "")
 
                     if (decryptedUrl.contains("streamrk.site/playlist")) {
-                        // Trích xuất các độ phân giải MP4 từ playlist
                         extractStreamRkMp4s(decryptedUrl, label, callback)
                     } else if (seenUrls.add(decryptedUrl)) {
                         callback(
@@ -461,9 +427,7 @@ class CineJoyProvider : MainAPI() {
             log.append("VidRock error: ${ex.message}\n")
         }
 
-        // ---------------------------------------------------------------------
-        // 2. NxSha API (Giải mã OpenSSL AES-CBC với EVP_BytesToKey)
-        // ---------------------------------------------------------------------
+        // 2. NxSha API
         runCatching {
             val nxReq = JSONObject().apply {
                 put("tmdbId", id.toString())
@@ -504,7 +468,6 @@ class CineJoyProvider : MainAPI() {
                     }
                 }
 
-                // Lấy nguồn từ các máy chủ scraper hàng đầu
                 for ((sName, scraper) in selectedServers.take(8)) {
                     runCatching {
                         val srcReq = JSONObject().apply {
@@ -559,7 +522,6 @@ class CineJoyProvider : MainAPI() {
                                 totalLinks++
                             }
 
-                            // Lấy phụ đề kèm theo
                             val subs = srcDec.optJSONArray("subtitles") ?: JSONArray()
                             for (subIdx in 0 until subs.length()) {
                                 val sub = subs.optJSONObject(subIdx) ?: continue
@@ -577,9 +539,7 @@ class CineJoyProvider : MainAPI() {
             log.append("NxSha error: ${ex.message}\n")
         }
 
-        // ---------------------------------------------------------------------
-        // 3. VidLove API (Các máy chủ chính thức CineJoy)
-        // ---------------------------------------------------------------------
+        // 3. VidLove API
         runCatching {
             val vlBase = if (type == "tv") {
                 "/tv?id=$id&season=$s&episode=$e&mode=json"
@@ -632,7 +592,6 @@ class CineJoyProvider : MainAPI() {
                         )
                         totalLinks++
 
-                        // Phụ đề từ VidLove
                         val subs = j.optJSONArray("subtitles") ?: JSONArray()
                         for (si in 0 until subs.length()) {
                             val sub = subs.optJSONObject(si) ?: continue
@@ -650,8 +609,17 @@ class CineJoyProvider : MainAPI() {
         }
 
         log.append("Tổng liên kết tìm được: $totalLinks\n")
+
+        // TÍNH NĂNG MỚI: Tự động ghi log vào Clipboard khi không tìm thấy liên kết
         if (totalLinks == 0) {
-            android.util.Log.d("CineJoy", log.toString())
+            android.util.Log.e("CineJoy", log.toString())
+            runCatching {
+                app.context?.let { ctx ->
+                    val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val clip = ClipData.newPlainText("CineJoy Error Log", log.toString())
+                    clipboard.setPrimaryClip(clip)
+                }
+            }
         }
 
         return totalLinks > 0
@@ -704,7 +672,7 @@ class CineJoyProvider : MainAPI() {
         }
     }
 
-    private fun parseQualityValue(label: String): Int {
+    private fun parseQualityValue(label:String): Int {
         val l = label.lowercase()
         return when {
             l.contains("4k") || l.contains("2160") -> Qualities.P2160.value
@@ -716,10 +684,6 @@ class CineJoyProvider : MainAPI() {
         }
     }
 
-    // =========================================================================
-    // VidRock AES-256-GCM Decryption
-    // =========================================================================
-
     private fun decryptVidRock(token: String): String {
         return runCatching {
             val parts = token.split(".")
@@ -728,7 +692,6 @@ class CineJoyProvider : MainAPI() {
             val ciphertext = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_WRAP)
             val tag = Base64.decode(parts[2], Base64.URL_SAFE or Base64.NO_WRAP)
 
-            // Ghép ciphertext và auth tag cho Java AES/GCM/NoPadding
             val combined = ByteArray(ciphertext.size + tag.size)
             System.arraycopy(ciphertext, 0, combined, 0, ciphertext.size)
             System.arraycopy(tag, 0, combined, ciphertext.size, tag.size)
@@ -754,10 +717,6 @@ class CineJoyProvider : MainAPI() {
         }
         return data
     }
-
-    // =========================================================================
-    // NxSha OpenSSL AES-256-CBC Encryption & Decryption (EVP_BytesToKey)
-    // =========================================================================
 
     private fun evpBytesToKey(password: ByteArray, salt: ByteArray, keyLen: Int, ivLen: Int): Pair<ByteArray, ByteArray> {
         val md = MessageDigest.getInstance("MD5")
@@ -791,7 +750,6 @@ class CineJoyProvider : MainAPI() {
         return runCatching {
             val raw = Base64.decode(hashStr, Base64.DEFAULT)
             if (raw.size < 16) return JSONObject()
-            // Kiểm tra "Salted__" header (8 bytes)
             val saltedHeader = String(raw, 0, 8, Charsets.US_ASCII)
             val (salt, ciphertext) = if (saltedHeader == "Salted__") {
                 val s = ByteArray(8)
