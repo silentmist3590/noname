@@ -5,9 +5,6 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
 
 class MoviesApiProvider : MainAPI() {
@@ -20,7 +17,7 @@ class MoviesApiProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
 
-    // TMDB public API key (used for poster/backdrop lookup)
+    // TMDB public API key (used for poster/backdrop fallback)
     private val tmdbKey = "e716f19ab4d25edc5247239a8f3494f8"
 
     private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\\z", RegexOption.IGNORE_CASE)
@@ -29,10 +26,10 @@ class MoviesApiProvider : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    // x-player-key used by the vidora API.
-    // This value rotates on the live site. If you get {"error":"Unauthorized"},
+    // x-player-key required by the vidora API.
+    // The value rotates on the live site. If you get {"error":"Unauthorized"},
     // open https://moviesapi.to/movie/1291595 in Chrome, F12 -> Network ->
-    // filter "vidora" -> copy request header "x-player-key" and paste below.
+    // filter "vidora" -> copy the request header "x-player-key" -> paste below.
     private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
 
     private val apiHeaders: Map<String, String> by lazy {
@@ -163,7 +160,6 @@ class MoviesApiProvider : MainAPI() {
         tmdbid: String?, imdbId: String?, isTv: Boolean
     ): Pair<String?, String?> {
         try {
-            // Preferred: use tmdbid directly (single call)
             if (tmdbid != null) {
                 val type = if (isTv) "tv" else "movie"
                 val info = app.get(
@@ -176,12 +172,13 @@ class MoviesApiProvider : MainAPI() {
                     val bp = j.get("backdrop_path")?.asText()
                         ?.takeIf { it != "null" && it.isNotBlank() }
                     if (pp != null || bp != null) {
-                        return (pp?.let { "$tmdbImg/w500$it" })
-                            to (bp?.let { "$tmdbImg/w1280$it" })
+                        return Pair(
+                            pp?.let { "$tmdbImg/w500$it" },
+                            bp?.let { "$tmdbImg/w1280$it" }
+                        )
                     }
                 }
             }
-            // Fallback: find by imdb_id
             if (imdbId != null && imdbId.startsWith("tt")) {
                 val find = app.get(
                     "https://api.themoviedb.org/3/find/$imdbId?api_key=$tmdbKey&external_source=imdb_id"
@@ -195,18 +192,20 @@ class MoviesApiProvider : MainAPI() {
                             ?.takeIf { it != "null" && it.isNotBlank() }
                         val bp = first.get("backdrop_path")?.asText()
                             ?.takeIf { it != "null" && it.isNotBlank() }
-                        return (pp?.let { "$tmdbImg/w500$it" })
-                            to (bp?.let { "$tmdbImg/w1280$it" })
+                        return Pair(
+                            pp?.let { "$tmdbImg/w500$it" },
+                            bp?.let { "$tmdbImg/w1280$it" }
+                        )
                     }
                 }
             }
         } catch (e: Exception) {
             DebugLog.log("tmdb", "poster lookup failed: ${e.message}")
         }
-        return null to null
+        return Pair(null, null)
     }
 
-    // -------------------------------------------------- list entry (suspend)
+    // -------------------------------------------------- list entry
 
     private suspend fun JsonNode.toSearch(isTv: Boolean): SearchResponse? {
         val id = mediaId() ?: return null
@@ -216,10 +215,9 @@ class MoviesApiProvider : MainAPI() {
         val year = (str("year") ?: str("release_date", "first_air_date", "released"))
             ?.take(4)?.toIntOrNull()
 
-        // List API returns no poster - fetch from TMDB
         if (poster == null) {
-            val (tp, _) = tmdbPoster(tmdbId(), imdbId(), isTv)
-            poster = tp
+            val pair = tmdbPoster(tmdbId(), imdbId(), isTv)
+            poster = pair.first
         }
 
         return if (isTv) {
@@ -243,12 +241,8 @@ class MoviesApiProvider : MainAPI() {
         val isTv = request.data.contains("/discover/tv") || request.data.contains("type=tv")
         val raw = getJson(url)?.items().orEmpty()
 
-        // Parallel poster lookup via TMDB for each item
-        val list: List<SearchResponse> = coroutineScope {
-            raw.map { item -> async { item.toSearch(isTv) } }
-                .awaitAll()
-                .filterNotNull()
-        }
+        // Sequential map (no kotlinx needed). Each item lookups TMDB if poster missing.
+        val list = raw.mapNotNull { it.toSearch(isTv) }
 
         if (raw.isEmpty()) {
             DebugLog.error("main", "Empty response from $url")
@@ -357,11 +351,10 @@ class MoviesApiProvider : MainAPI() {
             else g.asText().split(",").map { it.trim() }.filter { it.isNotEmpty() }
         }
 
-        // Fallback to TMDB for poster/backdrop if missing
         if (poster == null || backdrop == null) {
-            val (tp, tb) = tmdbPoster(tmdbid, imdbId, isTv)
-            if (poster == null) poster = tp
-            if (backdrop == null) backdrop = tb
+            val pair = tmdbPoster(tmdbid, imdbId, isTv)
+            if (poster == null) poster = pair.first
+            if (backdrop == null) backdrop = pair.second
         }
 
         return if (isTv) {
@@ -413,8 +406,8 @@ class MoviesApiProvider : MainAPI() {
               var bs = document.querySelectorAll('button, [role="button"], [data-play], media-play-button');
               bs.forEach(function(b){
                 var a = (b.getAttribute('aria-label') || '').toLowerCase();
-                var t = (b.textContent || '').trim().toLowerCase();
-                if (a.indexOf('play') >= 0 || t === 'play' || b.hasAttribute('data-play')) {
+                var x = (b.textContent || '').trim().toLowerCase();
+                if (a.indexOf('play') >= 0 || x === 'play' || b.hasAttribute('data-play')) {
                   try { b.click(); } catch (e) {}
                 }
               });
