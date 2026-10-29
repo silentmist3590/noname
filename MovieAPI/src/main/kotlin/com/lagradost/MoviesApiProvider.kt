@@ -8,11 +8,11 @@ import com.lagradost.cloudstream3.utils.*
 import java.net.URLEncoder
 
 /**
- * Plugin cho https://moviesapi.to
+ * Plugin for https://moviesapi.to
  *
- * - Danh sách/tìm kiếm: /api/discover/{movies|tv|views}
- * - Phát: trang embed gọi /api/vidora/v1/movie/{id} (cần header x-player-key)
- *   nếu API fail -> fallback WebView bắt request .m3u8.
+ * - List/search: /api/discover/{movies|tv|views}
+ * - Playback: embed page calls /api/vidora/v1/movie/{id} (requires x-player-key header)
+ *   If API fails -> fallback WebView to capture .m3u8 request.
  */
 class MoviesApiProvider : MainAPI() {
     override var mainUrl = "https://moviesapi.to"
@@ -24,18 +24,17 @@ class MoviesApiProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val tmdbImg = "https://image.tmdb.org/t/p"
 
-    // Không dùng raw-string vì "$" trước """ dễ gây lỗi ở Kotlin mới.
-    // Regex: .jpg | .jpeg | .png | .webp | .avif (kèm ?query tùy chọn) ở cuối URL
-    private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\$", RegexOption.IGNORE_CASE)
+    // Regex: .jpg | .jpeg | .png | .webp | .avif (with optional ?query at end)
+    private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\\z", RegexOption.IGNORE_CASE)
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    /** Key bắt buộc của API vidora (trích từ bundle JS của moviesapi.to). */
+    // Required key for the vidora API (extracted from moviesapi.to JS bundle)
     private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
 
-    /** Header cho API JSON (discover + vidora). Không có "*\/*" để tránh parser weirdness. */
+    // Headers for JSON API (discover + vidora)
     private val apiHeaders: Map<String, String> by lazy {
         mapOf(
             "User-Agent"      to userAgent,
@@ -47,7 +46,7 @@ class MoviesApiProvider : MainAPI() {
         )
     }
 
-    /** Header cho CDN workers.dev — m3u8 + segment. */
+    // Headers for CDN workers.dev - m3u8 + segment
     private val streamHeaders: Map<String, String> by lazy {
         mapOf(
             "User-Agent"      to userAgent,
@@ -58,16 +57,16 @@ class MoviesApiProvider : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
-        "$mainUrl/api/discover/views?type=movie&views=day" to "Trending Movies (Today)",
-        "$mainUrl/api/discover/views?type=tv&views=day" to "Trending TV (Today)",
-        "$mainUrl/api/discover/views?type=movie&views=week" to "Trending Movies (Week)",
+        "$mainUrl/api/discover/views?type=movie&views=day" to "Trending Movies Today",
+        "$mainUrl/api/discover/views?type=tv&views=day" to "Trending TV Today",
+        "$mainUrl/api/discover/views?type=movie&views=week" to "Trending Movies Week",
         "$mainUrl/api/discover/movies?ordering=created_at&direction=desc" to "Newly Added Movies",
         "$mainUrl/api/discover/tv?ordering=last_upload_date&direction=desc" to "Recently Updated TV",
         "$mainUrl/api/discover/movies?ordering=views&direction=desc" to "Most Viewed Movies",
         "$mainUrl/api/discover/tv?ordering=views&direction=desc" to "Most Viewed TV",
     )
 
-    // ------------------------------------------------------------------ helpers
+    // ---------------------------------------------------------------- helpers
 
     private suspend fun getJson(url: String, referer: String? = "$mainUrl/"): JsonNode? = try {
         val text = app.get(
@@ -83,7 +82,7 @@ class MoviesApiProvider : MainAPI() {
         DebugLog.log("http", "GET $url -> ${text.length}b: ${text.take(500)}")
         mapper.readTree(text)
     } catch (e: Exception) {
-        DebugLog.error("http", "GET $url thất bại", e)
+        DebugLog.error("http", "GET $url failed", e)
         null
     }
 
@@ -170,7 +169,7 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // ------------------------------------------------------------------ main page / search
+    // ---------------------------------------------------------------- main page / search
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sep = if (request.data.contains("?")) "&" else "?"
@@ -180,11 +179,11 @@ class MoviesApiProvider : MainAPI() {
         val list = raw.mapNotNull { it.toSearch(isTv) }
 
         if (raw.isEmpty()) {
-            DebugLog.error("main", "Không đọc được danh sách từ $url")
+            DebugLog.error("main", "Cannot read list from $url")
         } else if (list.isEmpty()) {
-            DebugLog.error("main", "Có ${raw.size} item nhưng thiếu tmdb_id/imdb_id. Item đầu: ${raw.first()}")
+            DebugLog.error("main", "Got ${raw.size} items but no tmdb_id/imdb_id. First: ${raw.first()}")
         } else if (list.all { it.posterUrl == null }) {
-            DebugLog.error("main", "Không tìm thấy poster. Item đầu: ${raw.first()}")
+            DebugLog.error("main", "No poster found. First: ${raw.first()}")
         }
         return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
     }
@@ -199,7 +198,7 @@ class MoviesApiProvider : MainAPI() {
         return movies + shows
     }
 
-    // ------------------------------------------------------------------ load
+    // ---------------------------------------------------------------- load
 
     private fun mkEpisode(
         id: String, season: Int, episode: Int,
@@ -254,7 +253,7 @@ class MoviesApiProvider : MainAPI() {
                 }
             }
         }
-        if (eps.isEmpty()) DebugLog.error("load", "Không dựng được danh sách tập cho id=$id (imdb=$imdbId)")
+        if (eps.isEmpty()) DebugLog.error("load", "Cannot build episodes for id=$id (imdb=$imdbId)")
         return eps.sortedWith(compareBy({ it.season }, { it.episode }))
     }
 
@@ -272,7 +271,7 @@ class MoviesApiProvider : MainAPI() {
         }
         val endpoint = if (isTv) "tv" else "movies"
         val node = getJson("$mainUrl/api/discover/$endpoint?$param=$id")?.items()?.firstOrNull()
-        if (node == null) DebugLog.error("load", "Không có dữ liệu chi tiết cho $endpoint $param=$id")
+        if (node == null) DebugLog.error("load", "No detail data for $endpoint $param=$id")
 
         val title = node?.str("title", "name", "original_title") ?: id
         val poster = img(node?.findImage())
@@ -306,7 +305,7 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // ------------------------------------------------------------------ links
+    // ---------------------------------------------------------------- links
 
     private fun vidoraUrl(embed: String): String? {
         val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return null
@@ -320,7 +319,7 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // Raw-string JS không có dấu " để tránh xung đột delimiter.
+    // JS for WebView auto-play. No double-quote characters inside, to avoid escaping issues.
     private val autoPlayScript = """
         (function(){
           var n = 0;
@@ -350,7 +349,7 @@ class MoviesApiProvider : MainAPI() {
         DebugLog.log("links", "loadLinks data=$data")
         var found = false
 
-        // 1) Gọi API vidora (BẮT BUỘC có x-player-key)
+        // Step 1: call vidora API (requires x-player-key)
         val apiUrl = vidoraUrl(data)
         if (apiUrl != null) {
             try {
@@ -366,7 +365,7 @@ class MoviesApiProvider : MainAPI() {
                 if (json.get("result")?.asBoolean() != true) {
                     DebugLog.error(
                         "vidora",
-                        "result != true (kiểm tra x-player-key). Body: ${body.take(300)}"
+                        "result != true (check x-player-key). Body: ${body.take(300)}"
                     )
                 }
 
@@ -384,12 +383,11 @@ class MoviesApiProvider : MainAPI() {
                             ).text
                             probe.trimStart().startsWith("#EXTM3U")
                         } catch (e: Exception) {
-                            DebugLog.error("m3u8-probe", "probe fail: ${e.message}")
+                            DebugLog.error("m3u8-probe", "probe failed: ${e.message}")
                             false
                         }
 
                         if (ok) {
-                            // Đẩy link M3U8 kèm headers để ExoPlayer tải được m3u8 + segment
                             callback.invoke(
                                 newExtractorLink(
                                     source = name,
@@ -404,12 +402,12 @@ class MoviesApiProvider : MainAPI() {
                             )
                             found = true
                         } else {
-                            DebugLog.error("m3u8-probe", "m3u8 không fetch được với headers hiện tại")
+                            DebugLog.error("m3u8-probe", "m3u8 not fetchable with current headers")
                         }
                     }
                 }
 
-                // Phụ đề đính kèm
+                // Subtitles from sources[0].tracks
                 val tracks = sources?.firstOrNull()?.get("tracks")
                 if (tracks != null && tracks.isArray) {
                     for (t in tracks) {
@@ -418,8 +416,14 @@ class MoviesApiProvider : MainAPI() {
                         val file = fileNode.asText()
                         if (file.isBlank()) continue
                         val lang = t.str("language") ?: "unknown"
-                        // Dùng trực tiếp data-class để tránh khác biệt signature newSubtitleFile
-                        subtitleCallback.invoke(SubtitleFile(lang, file))
+                        val label = t.str("label") ?: ""
+                        subtitleCallback.invoke(
+                            newSubtitleFile(
+                                url  = file,
+                                lang = lang,
+                                name = label.ifBlank { lang }
+                            )
+                        )
                     }
                 }
             } catch (e: Exception) {
@@ -429,7 +433,7 @@ class MoviesApiProvider : MainAPI() {
 
         if (found) return true
 
-        // 2) Fallback: WebView + tự bấm play, bắt .m3u8
+        // Step 2: fallback WebView to capture .m3u8
         try {
             val resolver = WebViewResolver(
                 interceptUrl   = Regex("\\.m3u8"),
@@ -439,7 +443,7 @@ class MoviesApiProvider : MainAPI() {
                 timeout        = 25_000L
             )
             val stream = app.get(data, referer = "$mainUrl/", interceptor = resolver).url
-            DebugLog.log("webview", "kết quả: $stream")
+            DebugLog.log("webview", "result: $stream")
             if (stream.contains(".m3u8")) {
                 callback.invoke(
                     newExtractorLink(
@@ -456,11 +460,11 @@ class MoviesApiProvider : MainAPI() {
                 found = true
             }
         } catch (e: Exception) {
-            DebugLog.log("webview", "lỗi: $e")
+            DebugLog.log("webview", "error: $e")
         }
 
         if (!found) {
-            DebugLog.error("links", "Không tìm thấy link phát cho $data")
+            DebugLog.error("links", "No playable link found for $data")
         }
         return found
     }
