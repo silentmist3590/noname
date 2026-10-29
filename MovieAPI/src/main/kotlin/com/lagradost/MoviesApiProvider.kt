@@ -24,18 +24,20 @@ class MoviesApiProvider : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    // x-player-key (fallback); if unauthorized -> the hook mode in loadLinks
-    // will dump the real value to logcat under tag [HOOK].
-    private val vidoraKey = "e716f19ab4d25edc5247239a8f3494f8"
+    // Fallback key. If it rotates, scrapeKeyFromBundle() finds the current one.
+    private val vidoraKeyFallback = "e716f19ab4d25edc5247239a8f3494f8"
 
-    private val apiHeaders: Map<String, String> by lazy {
+    // Key cache
+    @Volatile private var cachedKey: String? = null
+    @Volatile private var cachedKeyAt: Long = 0L
+
+    private val apiBaseHeaders: Map<String, String> by lazy {
         mapOf(
             "User-Agent"      to userAgent,
-            "Accept"          to "application/json",
+            "Accept"          to "application/json, text/plain, */*",
             "Accept-Language" to "en-US,en;q=0.9",
             "Origin"          to mainUrl,
             "Referer"         to "$mainUrl/",
-            "x-player-key"    to vidoraKey,
         )
     }
 
@@ -329,7 +331,97 @@ class MoviesApiProvider : MainAPI() {
     }
 
     // ================================================================
-    //                          HOOK MODE
+    //          KEY SCRAPING  (tự động lấy x-player-key hiện tại)
+    // ================================================================
+
+    private suspend fun getCurrentVidoraKey(): String {
+        val now = System.currentTimeMillis()
+        cachedKey?.let { if (now - cachedKeyAt < 3600_000L) return it }
+
+        val scraped = scrapeKeyFromBundle()
+        if (scraped != null && scraped.length >= 16) {
+            DebugLog.log("key", "scraped OK: $scraped")
+            cachedKey = scraped
+            cachedKeyAt = now
+            return scraped
+        }
+        DebugLog.log("key", "scrape failed - using fallback")
+        return vidoraKeyFallback
+    }
+
+    private suspend fun scrapeKeyFromBundle(): String? {
+        // Step 1: fetch home page HTML
+        val html = try {
+            app.get("$mainUrl/", referer = "$mainUrl/").text
+        } catch (e: Exception) {
+            DebugLog.log("key", "fetch home failed: ${e.message}")
+            return null
+        }
+        if (html.isBlank()) return null
+
+        // Step 2: find script srcs
+        val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""")
+            .findAll(html)
+            .map { it.groupValues[1] }
+            .toList()
+
+        // Step 3: also look for modulepreload / dynamic import hints
+        val moreSrcs = Regex("""["'](/?assets/[A-Za-z0-9_\-]+\.js)["']""")
+            .findAll(html)
+            .map { it.groupValues[1] }
+            .toList()
+
+        val allSrcs = (scriptSrcs + moreSrcs).distinct()
+        DebugLog.log("key", "found ${allSrcs.size} JS: ${allSrcs.take(6)}")
+
+        // Step 4: fetch each JS, search for the key
+        for (raw in allSrcs) {
+            val url = when {
+                raw.startsWith("http") -> raw
+                raw.startsWith("/")    -> "$mainUrl$raw"
+                else                   -> "$mainUrl/$raw"
+            }
+            try {
+                val js = app.get(url, referer = "$mainUrl/").text
+                if (js.isBlank()) continue
+                DebugLog.log("key", "loaded $url (${js.length}b)")
+
+                // Pattern A: x-player-key:"literal"
+                Regex("""["']x-player-key["']\s*:\s*["'`]([^"'`]{8,})["'`]""")
+                    .find(js)?.let { return it.groupValues[1] }
+
+                // Pattern B: x-player-key:varName
+                Regex("""["']x-player-key["']\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)""")
+                    .find(js)?.let { m ->
+                        val vn = Regex.escape(m.groupValues[1])
+                        Regex("""(?:var|let|const)\s+$vn\s*=\s*["'`]([^"'`]{8,})["'`]""")
+                            .find(js)?.let { return it.groupValues[1] }
+                    }
+
+                // Pattern C: PLAYER_KEY:"literal" or X-PLAYER-KEY:"literal"
+                Regex("""(?:PLAYER_KEY|X_PLAYER_KEY|playerKey|player_key)["']?\s*[:=]\s*["'`]([^"'`]{8,})["'`]""")
+                    .find(js)?.let { return it.groupValues[1] }
+
+                // Pattern D: any 32-hex string used in an Authorization-ish context
+                if (js.contains("vidora") || js.contains("x-player-key")) {
+                    Regex("""["'`]([a-f0-9]{24,64})["'`]""")
+                        .findAll(js)
+                        .map { it.groupValues[1] }
+                        .forEach { candidate ->
+                            if (candidate != tmdbKey && candidate.length == 32) {
+                                DebugLog.log("key", "candidate from $url: $candidate")
+                            }
+                        }
+                }
+            } catch (e: Exception) {
+                DebugLog.log("key", "fetch $url failed: ${e.message}")
+            }
+        }
+        return null
+    }
+
+    // ================================================================
+    //                          LOAD LINKS
     // ================================================================
 
     private fun vidoraUrl(embed: String): String? {
@@ -344,7 +436,7 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // Aggressive auto-play. Fires every second for 30s.
+    // Auto-play script
     private val autoPlayScript = """
         (function(){
           var n = 0;
@@ -357,9 +449,8 @@ class MoviesApiProvider : MainAPI() {
                 if (pr && pr.catch) pr.catch(function(){});
               });
               var sel = 'media-play-button, [data-part="play-button"], [data-play], ' +
-                        '.play-button, .vjs-big-play-button, .jw-icon-playback, .plyr__control--overlaid, ' +
-                        'button[aria-label*="Play"], button[aria-label*="play"], ' +
-                        'button[title*="Play"], button[title*="play"]';
+                        '.play-button, .vjs-big-play-button, .jw-icon-playback, ' +
+                        '.plyr__control--overlaid, button[aria-label*="lay"]';
               document.querySelectorAll(sel).forEach(function(b){
                 try { b.click(); } catch (e) {}
               });
@@ -368,145 +459,110 @@ class MoviesApiProvider : MainAPI() {
                 var r = player.getBoundingClientRect();
                 var x = r.left + r.width / 2;
                 var y = r.top + r.height / 2;
-                ['mousedown','mouseup','click'].forEach(function(type){
+                ['pointerdown','pointerup','click'].forEach(function(type){
                   try {
                     player.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, clientX: x, clientY: y}));
                   } catch (e) {}
                 });
               }
             } catch (e) {}
-            if (n > 30) clearInterval(t);
+            if (n > 25) clearInterval(t);
           }, 1000);
         })();
     """.trimIndent()
 
-    // Hook fetch/XHR + scan globals + watch DOM for x-player-key, X-Stream-Auth,
-    // and .m3u8 URLs. Every finding is emitted via console.error('[HOOK] ...').
-    // CloudStream forwards WebView console messages to logcat.
-    private val hookScript = """
+    // Hook script that RETURNS accumulated state to scriptCallback
+    // (CloudStream WebViewResolver picks up the return value)
+    private val hookScriptTemplate = """
         (function(){
-          function emit(tag, data) {
+          if (!window.__CS_HOOK) window.__CS_HOOK = {fetch: [], xhr: [], keys: [], storage: []};
+          var H = window.__CS_HOOK;
+          function add(tag, data) {
             try {
-              console.error('[HOOK][' + tag + '] ' + JSON.stringify(data));
-            } catch (e) {
-              try { console.error('[HOOK][' + tag + '] (unserializable)'); } catch (e2) {}
-            }
+              H[tag].push(data);
+              if (H[tag].length > 8) H[tag].shift();
+            } catch (e) {}
           }
           function matchUrl(u) {
             return /vidora|m3u8|hls|workers\.dev|\/api\//i.test(u || '');
           }
 
-          // --- Hook fetch ---
-          try {
-            var origFetch = window.fetch;
-            if (origFetch) {
-              window.fetch = function(input, init) {
-                try {
-                  var u = typeof input === 'string' ? input : (input && input.url || '');
-                  if (matchUrl(u)) {
-                    var hdrs = {};
-                    if (init && init.headers) {
-                      if (typeof init.headers.forEach === 'function') {
-                        init.headers.forEach(function(v, k){ hdrs[k] = v; });
-                      } else if (typeof init.headers === 'object') {
-                        hdrs = init.headers;
+          if (!window.__CS_HOOK_DONE) {
+            window.__CS_HOOK_DONE = true;
+
+            // Hook fetch
+            try {
+              var of_ = window.fetch;
+              if (of_) {
+                window.fetch = function(input, init) {
+                  try {
+                    var u = typeof input === 'string' ? input : (input && input.url || '');
+                    if (matchUrl(u)) {
+                      var hd = {};
+                      if (init && init.headers) {
+                        if (typeof init.headers.forEach === 'function') {
+                          init.headers.forEach(function(v, k){ hd[k] = v; });
+                        } else if (typeof init.headers === 'object') {
+                          hd = Object.assign({}, init.headers);
+                        }
                       }
+                      add('fetch', {url: u, method: (init && init.method) || 'GET', h: hd});
                     }
-                    emit('FETCH', {url: u, method: (init && init.method) || 'GET', headers: hdrs});
-                  }
+                  } catch (e) {}
+                  return of_.apply(this, arguments);
+                };
+              }
+            } catch (e) {}
+
+            // Hook XHR
+            try {
+              var p = XMLHttpRequest.prototype;
+              var oO = p.open, oS = p.setRequestHeader, oN = p.send;
+              p.open = function(m, u){ try { this.__u = u; this.__h = {}; this.__m = m; } catch (e) {} return oO.apply(this, arguments); };
+              p.setRequestHeader = function(k, v){ try { if (this.__h) this.__h[k] = v; } catch (e) {} return oS.apply(this, arguments); };
+              p.send = function(b){
+                try {
+                  if (matchUrl(this.__u)) add('xhr', {url: this.__u, m: this.__m, h: this.__h || {}});
                 } catch (e) {}
-                return origFetch.apply(this, arguments);
+                return oN.apply(this, arguments);
               };
-            }
-          } catch (e) { emit('FETCH_ERR', {m: String(e)}); }
+            } catch (e) {}
 
-          // --- Hook XHR ---
-          try {
-            var proto = XMLHttpRequest.prototype;
-            var oOpen = proto.open;
-            var oSet  = proto.setRequestHeader;
-            var oSend = proto.send;
-            proto.open = function(m, u){
-              try { this.__u = u; this.__h = {}; this.__m = m; } catch (e) {}
-              return oOpen.apply(this, arguments);
-            };
-            proto.setRequestHeader = function(k, v){
-              try { if (this.__h) this.__h[k] = v; } catch (e) {}
-              return oSet.apply(this, arguments);
-            };
-            proto.send = function(body){
-              try {
-                if (matchUrl(this.__u)) {
-                  emit('XHR', {url: this.__u, method: this.__m, headers: this.__h || {}});
-                }
-              } catch (e) {}
-              return oSend.apply(this, arguments);
-            };
-          } catch (e) { emit('XHR_ERR', {m: String(e)}); }
-
-          // --- Dump localStorage / sessionStorage keys that look auth-ish ---
-          try {
-            function scanStorage(name, store) {
-              try {
+            // Storage scan
+            try {
+              function scan(store, name) {
                 for (var i = 0; i < store.length; i++) {
                   var k = store.key(i);
                   if (/key|token|auth|player|stream/i.test(k || '')) {
-                    emit('STORAGE', {store: name, key: k, value: String(store.getItem(k)).slice(0, 200)});
+                    add('storage', {s: name, k: k, v: String(store.getItem(k)).slice(0, 80)});
                   }
                 }
-              } catch (e) {}
-            }
-            scanStorage('local',   window.localStorage);
-            scanStorage('session', window.sessionStorage);
-          } catch (e) {}
+              }
+              scan(window.localStorage, 'L');
+              scan(window.sessionStorage, 'S');
+            } catch (e) {}
 
-          // --- Scan inline scripts for literal x-player-key ---
-          try {
-            Array.from(document.scripts || []).forEach(function(s){
-              try {
-                var txt = s.textContent || '';
-                if (txt) {
-                  var m = txt.match(/x-player-key['"]?\s*[:=]\s*['"]([^'"]{8,})['"]/i);
-                  if (m) emit('KEY_LITERAL', {key: m[1], where: s.src || 'inline'});
-                  var m2 = txt.match(/x-stream-auth['"]?\s*[:=]\s*['"]([^'"]{8,})['"]/i);
-                  if (m2) emit('STREAM_AUTH_LITERAL', {value: m2[1], where: s.src || 'inline'});
-                }
-                if (s.src && /index.*\.js|main.*\.js|app.*\.js/i.test(s.src)) {
-                  emit('SCRIPT_SRC', {src: s.src});
-                }
-              } catch (e) {}
-            });
-          } catch (e) {}
+            // PROBE: call vidora API from page context using KEY placeholder
+            // If placeholder works, we immediately know real network behavior.
+            try {
+              var k = '__PLAYER_KEY__';
+              if (k && k.length > 8 && k !== '__PLAYER_KEY__') {
+                fetch('/api/vidora/v1/movie/1', {headers: {'x-player-key': k}})
+                  .then(function(r){ return r.text(); })
+                  .then(function(t){ add('keys', {probe: 'ok', status: 'auth-check', body: t.slice(0, 200)}); })
+                  .catch(function(e){ add('keys', {probe: 'fail', err: String(e)}); });
+              }
+            } catch (e) {}
+          }
 
-          // --- Watch DOM for video src changes ---
-          try {
-            var obs = new MutationObserver(function(){
-              document.querySelectorAll('video, source').forEach(function(el){
-                var src = el.src || el.currentSrc || '';
-                if (src && /m3u8|blob:/i.test(src)) emit('VIDEO_SRC', {tag: el.tagName, src: src});
-              });
-            });
-            if (document.body) {
-              obs.observe(document.body, {childList: true, subtree: true, attributes: true, attributeFilter: ['src']});
-            }
-          } catch (e) {}
-
-          console.error('[HOOK] READY');
-          return 'HOOK_READY';
+          return JSON.stringify({
+            f: H.fetch.slice(-3),
+            x: H.xhr.slice(-3),
+            k: H.keys.slice(-3),
+            s: H.storage.slice(-3)
+          });
         })();
     """.trimIndent()
-
-    // Read cookies set in WebView's CookieManager for moviesapi.to (reflection so
-    // it compiles even if android.webkit is not directly importable).
-    private fun readWebViewCookies(): String = try {
-        val cls = Class.forName("android.webkit.CookieManager")
-        val inst = cls.getMethod("getInstance").invoke(null)
-        val get = cls.getMethod("getCookie", String::class.java)
-        get.invoke(inst, mainUrl) as? String ?: ""
-    } catch (e: Exception) {
-        DebugLog.log("cookies", "read failed: ${e.message}")
-        ""
-    }
 
     override suspend fun loadLinks(
         data: String,
@@ -517,113 +573,105 @@ class MoviesApiProvider : MainAPI() {
         DebugLog.log("links", "loadLinks data=$data")
         var found = false
 
-        // ==================================================================
-        // STEP 1: Open WebView with hook script.
-        //   - Sets cookies in CookieManager
-        //   - Dumps real headers to logcat under [HOOK]
-        //   - Aggressively clicks play to trigger .m3u8 loading
-        //   - Captures the .m3u8 URL via interceptUrl if it appears
-        // ==================================================================
-        DebugLog.log("webview", "=== STEP 1: hook mode ===")
-        var capturedUrl: String? = null
+        // -------- STEP 1: scrape current key + call API directly --------
+        val currentKey = getCurrentVidoraKey()
+        DebugLog.log("key", "using key: $currentKey")
+
+        val apiUrl = vidoraUrl(data)
+        if (apiUrl != null) {
+            try {
+                val headers = apiBaseHeaders.toMutableMap()
+                headers["x-player-key"] = currentKey
+                val body = app.get(apiUrl, headers = headers, referer = "$mainUrl/").text
+                DebugLog.log("vidora", "GET $apiUrl -> ${body.length}b: ${body.take(700)}")
+
+                if (body.trimStart().startsWith("{")) {
+                    val json = mapper.readTree(body)
+                    if (json.get("result")?.asBoolean() == true) {
+                        val sources = json.get("sources")
+                        if (sources != null && sources.isArray) {
+                            for (src in sources) {
+                                val u = src.str("url") ?: continue
+                                if (!u.contains(".m3u8")) continue
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = name, name = name, url = u,
+                                        type = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = "$mainUrl/"
+                                        this.quality = Qualities.Unknown.value
+                                        this.headers = streamHeaders
+                                    }
+                                )
+                                found = true
+                            }
+                        }
+                        val tracks = sources?.firstOrNull()?.get("tracks")
+                        if (tracks != null && tracks.isArray) {
+                            for (t in tracks) {
+                                val fn = t.get("file") ?: continue
+                                if (fn.isNull) continue
+                                val f = fn.asText()
+                                if (f.isBlank()) continue
+                                val lang = t.str("language") ?: "unknown"
+                                subtitleCallback.invoke(newSubtitleFile(url = f, lang = lang))
+                            }
+                        }
+                        if (found) return true
+                    } else {
+                        val err = json.get("error")?.asText() ?: "unknown"
+                        DebugLog.error("vidora", "auth failed ($err) with key=$currentKey")
+                    }
+                }
+            } catch (e: Exception) {
+                DebugLog.error("vidora", "API error", e)
+            }
+        }
+
+        // -------- STEP 2: WebView hook (returns data via scriptCallback) --------
+        DebugLog.log("webview", "=== WebView hook mode ===")
+
+        // Inject currentKey into the probe
+        val hookScript = hookScriptTemplate.replace("__PLAYER_KEY__", currentKey)
+
         try {
             val resolver = WebViewResolver(
-                interceptUrl   = Regex("(?i)(\\.m3u8|/hls2/|workers\\.dev|/master)"),
+                interceptUrl   = Regex("(?i)(\\.m3u8|/hls2/|workers\\.dev|/master|/cdn/)"),
                 useOkhttp      = false,
                 script         = autoPlayScript + "\n" + hookScript,
                 scriptCallback = { result ->
-                    DebugLog.log("webview-script", "callback=$result")
+                    if (!result.isNullOrBlank() && result.length > 4) {
+                        DebugLog.log("hook", "state=$result")
+                    }
                 },
                 timeout        = 30_000L
             )
             val resp = app.get(data, referer = "$mainUrl/", interceptor = resolver)
-            capturedUrl = resp.url
-            DebugLog.log("webview", "captured URL: $capturedUrl")
+            val capturedUrl = resp.url
+            DebugLog.log("webview", "captured: $capturedUrl")
+
+            if (capturedUrl.contains(".m3u8")) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = name, name = name, url = capturedUrl,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                        this.headers = streamHeaders
+                    }
+                )
+                found = true
+            }
         } catch (e: Exception) {
             DebugLog.log("webview", "error: ${e.message}")
-        }
-
-        // Read cookies that WebView set
-        val cookies = readWebViewCookies()
-        DebugLog.log("cookies", "len=${cookies.length} sample=${cookies.take(300)}")
-
-        // ==================================================================
-        // STEP 2: Retry vidora API with cookies (the "Unauthorized" often
-        //         means the API needs a session cookie, not just the key).
-        // ==================================================================
-        val apiUrl = vidoraUrl(data)
-        if (apiUrl != null) {
-            try {
-                val headers = apiHeaders.toMutableMap()
-                if (cookies.isNotEmpty()) headers["Cookie"] = cookies
-                val body = app.get(apiUrl, headers = headers, referer = "$mainUrl/").text
-                DebugLog.log("vidora", "retry $apiUrl -> ${body.length}b: ${body.take(600)}")
-
-                val json = mapper.readTree(body)
-                if (json.get("result")?.asBoolean() == true) {
-                    val sources = json.get("sources")
-                    if (sources != null && sources.isArray) {
-                        for (src in sources) {
-                            val u = src.str("url") ?: continue
-                            if (!u.contains(".m3u8")) continue
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = name, name = name, url = u,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.referer = "$mainUrl/"
-                                    this.quality = Qualities.Unknown.value
-                                    this.headers = streamHeaders
-                                }
-                            )
-                            found = true
-                        }
-                    }
-                    val tracks = sources?.firstOrNull()?.get("tracks")
-                    if (tracks != null && tracks.isArray) {
-                        for (t in tracks) {
-                            val fn = t.get("file") ?: continue
-                            if (fn.isNull) continue
-                            val f = fn.asText()
-                            if (f.isBlank()) continue
-                            val lang = t.str("language") ?: "unknown"
-                            subtitleCallback.invoke(newSubtitleFile(url = f, lang = lang))
-                        }
-                    }
-                } else {
-                    val err = json.get("error")?.asText() ?: "unknown"
-                    DebugLog.error("vidora", "still unauthorized ($err). See [HOOK] lines in logcat — copy the real x-player-key from there.")
-                }
-            } catch (e: Exception) {
-                DebugLog.error("vidora", "retry error", e)
-            }
-        }
-
-        if (found) return true
-
-        // ==================================================================
-        // STEP 3: Use whatever URL WebView captured (if it was an m3u8)
-        // ==================================================================
-        if (capturedUrl != null && capturedUrl!!.contains(".m3u8")) {
-            DebugLog.log("webview", "using captured m3u8: $capturedUrl")
-            callback.invoke(
-                newExtractorLink(
-                    source = name, name = name, url = capturedUrl!!,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
-                    this.headers = streamHeaders
-                }
-            )
-            found = true
         }
 
         if (!found) {
             DebugLog.error(
                 "links",
-                "No link for $data. In logcat, look for lines starting with '[HOOK]' — " +
-                "they contain the real x-player-key / X-Stream-Auth header + the cookies."
+                "No link. Check [key] log lines to see which key was used " +
+                "and [hook] to see WebView-captured headers."
             )
         }
         return found
