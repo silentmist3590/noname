@@ -469,6 +469,7 @@ class CineFreakProvider : MainAPI() {
 
     private fun playScript(api: String, ep: String, siteKey: String): String = """
 (function(){
+ if (String(location.hostname).indexOf('cinefreak') < 0) return;
  if (window.__cfgo) return; window.__cfgo = 1;
  var API = __API__, EP = __EP__, KEY = __KEY__, trace = [], t0 = Date.now(), finished = false;
  function T(s){ trace.push(((Date.now()-t0)/1000).toFixed(1)+'s '+s); }
@@ -525,6 +526,7 @@ class CineFreakProvider : MainAPI() {
  function brief(x){ return x.status + ' ' + JSON.stringify(x.j || x.raw).slice(0, 160); }
  async function main(){
    try {
+     T('origin ' + location.origin);
      var ts = null;
      var x = await post('play'); T('play ' + brief(x));
      if (x.status === 401 && x.j && x.j.need === 'ts') {
