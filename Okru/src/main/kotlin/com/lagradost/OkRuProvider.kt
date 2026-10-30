@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
+import java.net.URLEncoder
 
 class OkRuProvider : MainAPI() {
     override var mainUrl = "https://ok.ru"
@@ -15,29 +16,29 @@ class OkRuProvider : MainAPI() {
     override val hasQuickSearch = true
     override val hasMainPage = true
 
-    /**
-     * Trang chủ của plugin — hiển thị danh sách video gợi ý để người dùng
-     * có thể chọn OkRu làm nguồn cung cấp chính trên màn hình Home.
-     *
-     * Vì ok.ru không có API công khai cho "video mới nhất" mà không cần đăng nhập,
-     * ta dùng trang tìm kiếm với một số từ khóa phổ biến để tạo các mục gợi ý.
-     */
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val pages = mutableListOf<HomePageList>()
+    private val userAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-        // Một số query mặc định để tạo các mục trên trang chủ
-        val defaultQueries = listOf(
+    // =====================================================================
+    // TRANG CHỦ
+    // =====================================================================
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        val queries = listOf(
             "phim" to "Phim",
             "nhạc" to "Nhạc",
             "hài" to "Hài",
-            "trailer" to "Trailer"
+            "trailer" to "Trailer",
+            "hoạt hình" to "Hoạt hình"
         )
 
-        for ((query, label) in defaultQueries) {
+        val pages = mutableListOf<HomePageList>()
+
+        for ((query, label) in queries) {
             try {
-                val items = searchInternal(query)
-                if (items.isNotEmpty()) {
-                    pages.add(newHomePageList(label, items))
+                val results = searchInternal(query, page = 1)
+                if (results.isNotEmpty()) {
+                    pages.add(newHomePageList(label, results))
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -47,68 +48,127 @@ class OkRuProvider : MainAPI() {
         return if (pages.isEmpty()) null else newHomePageResponse(pages)
     }
 
+    // =====================================================================
+    // TÌM KIẾM
+    // =====================================================================
+
     override suspend fun search(query: String): List<SearchResponse>? {
-        return searchInternal(query)
+        return searchInternal(query, page = 1)
     }
 
-    /**
-     * Hàm dùng chung cho cả search và getMainPage
-     */
-    private suspend fun searchInternal(query: String): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-        val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
-        val searchUrl = "$mainUrl/search/video?st.query=$encodedQuery"
+    private suspend fun searchInternal(query: String, page: Int = 1): List<SearchResponse> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
 
-        val document = try {
-            app.get(
-                searchUrl,
-                headers = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-                    "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
-                )
-            ).document
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return results
+        // Thử nhiều URL — ok.ru đã thay đổi cấu trúc search nhiều lần
+        val searchUrls = listOf(
+            "$mainUrl/search/video?st.query=$encoded&st.page=$page",
+            "$mainUrl/search?st.query=$encoded&st.mode=Video&st.page=$page",
+            "$mainUrl/video/search?st.query=$encoded&st.page=$page"
+        )
+
+        var document: org.jsoup.nodes.Document? = null
+        for (url in searchUrls) {
+            try {
+                val doc = app.get(
+                    url,
+                    headers = mapOf(
+                        "User-Agent" to userAgent,
+                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
+                    )
+                ).document
+                if (doc.select("a[href*=/video/]").isNotEmpty()) {
+                    document = doc
+                    break
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
 
-        // Selector cho kết quả tìm kiếm video của ok.ru
-        // Nếu ok.ru thay đổi giao diện, cần cập nhật các selector này
-        val cards = document.select("div.video-card, div.video-card_v2, a.video-card_lk, div[data-video]")
+        if (document == null) return emptyList()
 
-        cards.forEach { element ->
-            val linkEl = if (element.tagName() == "a") element
-                         else element.selectFirst("a.video-card_lk, a[href*=/video/]")
-                         ?: element.selectFirst("a")
+        val results = mutableListOf<SearchResponse>()
+        val seenUrls = mutableSetOf<String>()
 
-            val href = linkEl?.attr("href") ?: return@forEach
-            if (!href.contains("/video/")) return@forEach
+        // Duyệt qua tất cả các thẻ <a> có href chứa /video/{số}
+        document.select("a[href]").forEach { anchor ->
+            val href = anchor.attr("href").trim()
+            val match = Regex("""^/video/(\d+)""").find(href) ?: return@forEach
+            val videoId = match.groupValues[1]
 
-            val title = linkEl.text().trim().ifEmpty {
-                element.selectFirst("div.video-card_n, div.video-card__title, span.video-card_n")?.text()?.trim()
-                    ?: return@forEach
+            if (!seenUrls.add(videoId)) return@forEach
+
+            // Lấy tiêu đề: ưu tiên data-* attribute, sau đó text, sau đó title
+            val title = anchor.attr("data-video-title").trim().ifEmpty {
+                anchor.attr("title").trim()
+            }.ifEmpty {
+                anchor.text().trim()
+            }.ifEmpty {
+                // Thử tìm thẻ con bên trong
+                anchor.selectFirst("div.video-card_n, span.video-card_n, div.video-card__title")
+                    ?.text()?.trim() ?: ""
             }
 
-            val poster = element.selectFirst("img")?.attr("src")
-                ?: element.selectFirst("img")?.attr("data-src")
+            if (title.isBlank()) return@forEach
+
+            // Thumbnail
+            val poster = anchor.selectFirst("img")?.let { img ->
+                img.attr("src").ifEmpty { img.attr("data-src") }
+            }?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+
+            val fullUrl = "$mainUrl/video/$videoId"
 
             results.add(
-                newMovieSearchResponse(title, fixUrl(href)) {
+                newMovieSearchResponse(title, fullUrl, TvType.Movie) {
                     this.posterUrl = poster
                 }
             )
         }
 
-        // Loại bỏ trùng lặp theo URL
-        return results.distinctBy { it.url }
+        return results
     }
+
+    // =====================================================================
+    // LOAD CHI TIẾT
+    // =====================================================================
 
     override suspend fun load(url: String): LoadResponse? {
         val videoId = extractVideoId(url) ?: return null
-        return newMovieLoadResponse("Video $videoId", url, TvType.Movie, url) {
-            this.posterUrl = null
+
+        // Thử lấy metadata để hiển thị tiêu đề/poster đẹp hơn
+        var title = "Video $videoId"
+        var poster: String? = null
+
+        try {
+            val apiUrl = "$mainUrl/dk?cmd=videoPlayerMetadata&mid=$videoId"
+            val raw = app.get(
+                apiUrl,
+                headers = mapOf(
+                    "Referer" to "$mainUrl/videoembed/$videoId",
+                    "User-Agent" to userAgent
+                )
+            ).text
+
+            val jsonStr = extractJson(raw)
+            if (jsonStr != null) {
+                val json = JSONObject(jsonStr)
+                val meta = json.optJSONObject("movie")
+                title = meta?.optString("title")?.ifBlank { null } ?: title
+                poster = meta?.optString("poster")?.ifBlank { null }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        return newMovieLoadResponse(title, url, TvType.Movie, videoId) {
+            this.posterUrl = poster
         }
     }
+
+    // =====================================================================
+    // LẤY LINK STREAM — dùng videoPlayerMetadata (unofficial)
+    // =====================================================================
 
     override suspend fun loadLinks(
         data: String,
@@ -116,15 +176,20 @@ class OkRuProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val videoId = extractVideoId(data) ?: return false
-        val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
+        // data có thể là URL đầy đủ hoặc chỉ là videoId
+        val videoId = if (data.matches(Regex("""\d+"""))) data else extractVideoId(data)
+        if (videoId.isNullOrBlank()) return false
 
-        val response = try {
+        val apiUrl = "$mainUrl/dk?cmd=videoPlayerMetadata&mid=$videoId"
+
+        val rawResponse = try {
             app.get(
                 apiUrl,
                 headers = mapOf(
-                    "Referer" to "https://ok.ru/videoembed/$videoId",
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                    "Referer" to "$mainUrl/videoembed/$videoId",
+                    "User-Agent" to userAgent,
+                    "Accept" to "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With" to "XMLHttpRequest"
                 )
             ).text
         } catch (e: Exception) {
@@ -132,56 +197,109 @@ class OkRuProvider : MainAPI() {
             return false
         }
 
-        val jsonString = extractJsonFromResponse(response) ?: return false
+        val jsonString = extractJson(rawResponse) ?: return false
 
         try {
             val json = JSONObject(jsonString)
-            val videos = json.optJSONArray("videos") ?: return false
+            val videos = json.optJSONArray("videos")
+
+            if (videos == null || videos.length() == 0) {
+                // Fallback: thử lấy từ "hls" hoặc "live" nếu có
+                val hls = json.optString("hls").ifBlank { null }
+                if (!hls.isNullOrBlank()) {
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = hls,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "$mainUrl/videoembed/$videoId"
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    return true
+                }
+                return false
+            }
 
             for (i in 0 until videos.length()) {
-                val video = videos.getJSONObject(i)
-                val videoUrl = video.optString("url")
-                val videoName = video.optString("name")
+                val v = videos.optJSONObject(i) ?: continue
+                val url = v.optString("url").ifBlank { null } ?: continue
+                val label = v.optString("name", "")
 
-                if (videoUrl.isNullOrEmpty()) continue
-
-                val quality = when {
-                    videoName.contains("mobile", true) -> Qualities.Unknown.value
-                    videoName.contains("lowest", true) -> Qualities.P240.value
-                    videoName.contains("low", true) -> Qualities.P360.value
-                    videoName.contains("sd", true) -> Qualities.P480.value
-                    videoName.contains("hd", true) -> Qualities.P720.value
-                    videoName.contains("full", true) -> Qualities.P1080.value
-                    else -> Qualities.Unknown.value
-                }
+                val quality = mapQuality(label)
+                val type = if (url.contains(".m3u8", ignoreCase = true))
+                    ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
 
                 callback(
                     newExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = videoUrl,
-                        type = ExtractorLinkType.VIDEO
+                        source = name,
+                        name = name,
+                        url = url,
+                        type = type
                     ) {
                         this.quality = quality
-                        this.referer = "https://ok.ru/videoembed/$videoId"
+                        this.referer = "$mainUrl/videoembed/$videoId"
                     }
                 )
             }
+
             return true
         } catch (e: Exception) {
             e.printStackTrace()
         }
+
         return false
+    }
+
+    // =====================================================================
+    // HELPERS
+    // =====================================================================
+
+    private fun mapQuality(label: String): Int = when {
+        label.contains("mobile", true) -> Qualities.P144.value
+        label.contains("lowest", true) -> Qualities.P240.value
+        label.equals("low", true) -> Qualities.P360.value
+        label.contains("sd", true) -> Qualities.P480.value
+        label.contains("hd", true) -> Qualities.P720.value
+        label.contains("full", true) -> Qualities.P1080.value
+        label.contains("quad", true) || label.contains("4k", true) -> Qualities.P2160.value
+        else -> Qualities.Unknown.value
     }
 
     private fun extractVideoId(url: String): String? {
         return Regex("""/video/(\d+)""").find(url)?.groupValues?.get(1)
     }
 
-    private fun extractJsonFromResponse(response: String): String? {
-        val start = response.indexOf('{')
-        val end = response.lastIndexOf('}')
+    /**
+     * ok.ru trả về nhiều dạng:
+     *   1. JSON thuần: {"videos": [...]}
+     *   2. JSONP: callbackFunc({"videos": [...]})
+     *   3. Có prefix rác: someCallback({...});
+     *
+     * Hàm này tìm cặp ngoặc nhọn ngoài cùng để lấy JSON hợp lệ.
+     */
+    private fun extractJson(response: String): String? {
+        val trimmed = response.trim()
+
+        // Thử parse trực tiếp trước
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            return trimmed
+        }
+
+        val start = trimmed.indexOf('{')
+        val end = trimmed.lastIndexOf('}')
         if (start == -1 || end == -1 || start >= end) return null
-        return response.substring(start, end + 1)
+
+        val candidate = trimmed.substring(start, end + 1)
+
+        // Kiểm tra candidate có parse được không
+        return try {
+            JSONObject(candidate)
+            candidate
+        } catch (e: Exception) {
+            null
+        }
     }
 }
