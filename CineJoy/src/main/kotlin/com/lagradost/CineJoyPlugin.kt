@@ -29,17 +29,14 @@ class CineJoyProvider : MainAPI() {
 
     private val mapper = jacksonObjectMapper()
 
-    // TMDB keys from CineJoy's own JS bundle
     private val tmdbKey = "8476a7ab80ad76f0936744df0430e67c"
     private val tmdbFallbackKey = "439c478a771f35c05022f9feabcca01c"
     private val tmdbBase = "https://api.themoviedb.org/3"
     private val tmdbImg = "https://image.tmdb.org/t/p"
 
-    // VidLove aggregator
     private val vidloveBase = "https://api.vidlove.cc"
     private val vidloveReferer = "https://player.vidlove.cc/"
 
-    // VidRock aggregator (AES-GCM)
     private val vidrockBase = "https://vidrock.net"
     private val vidrockKeyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
 
@@ -73,7 +70,6 @@ class CineJoyProvider : MainAPI() {
                 if (!useFallback) tmdbGet(path, true) else null
             } else {
                 val node = mapper.readTree(text)
-                // If TMDB returns error, try fallback
                 if (node.get("status_code") != null && !useFallback) tmdbGet(path, true)
                 else node
             }
@@ -97,6 +93,13 @@ class CineJoyProvider : MainAPI() {
         return if (r.get("first_air_date") != null || r.get("name") != null) "tv" else "movie"
     }
 
+    /** Convert TMDB 0-10 double to CloudStream Score object. */
+    private fun scoreFrom10(r: JsonNode): Score? {
+        val v = r.get("vote_average")?.asDouble() ?: return null
+        if (v <= 0) return null
+        return Score.from10(v)
+    }
+
     private fun tmdbToSearch(r: JsonNode): SearchResponse? {
         val id = r.get("id")?.asInt() ?: return null
         val type = mediaTypeOf(r)
@@ -104,7 +107,7 @@ class CineJoyProvider : MainAPI() {
         val url = """{"type":"$type","id":$id}"""
         val posterUrl = poster(r.s("poster_path"))
         val year = yearOf(r.s("release_date") ?: r.s("first_air_date"))
-        val score = r.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+        val score = scoreFrom10(r)
 
         return if (type == "tv") {
             newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
@@ -146,7 +149,7 @@ class CineJoyProvider : MainAPI() {
     }
 
     // ========================================================================
-    // LOAD (detail)
+    // LOAD
     // ========================================================================
     private data class ParsedUrl(val type: String, val id: Int, val s: Int, val e: Int)
 
@@ -174,7 +177,7 @@ class CineJoyProvider : MainAPI() {
             val backdrop = poster(d.s("backdrop_path"), "w780")
             val description = d.s("overview")
             val year = yearOf(d.s("release_date"))
-            val score = d.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+            val score = scoreFrom10(d)
             val runtime = d.get("runtime")?.asInt()?.takeIf { it > 0 }
             val tags = d.get("genres")?.mapNotNull { it.s("name") }
 
@@ -194,7 +197,7 @@ class CineJoyProvider : MainAPI() {
             val backdrop = poster(d.s("backdrop_path"), "w780")
             val description = d.s("overview")
             val year = yearOf(d.s("first_air_date"))
-            val score = d.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+            val score = scoreFrom10(d)
             val tags = d.get("genres")?.mapNotNull { it.s("name") }
 
             val episodes = mutableListOf<Episode>()
@@ -218,7 +221,7 @@ class CineJoyProvider : MainAPI() {
                                 this.episode = fixed
                                 this.posterUrl = poster(ep.s("still_path"))
                                 this.description = ep.s("overview")
-                                this.rating = ep.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+                                this.score = scoreFrom10(ep)
                             })
                         }
                     } else {
@@ -375,7 +378,7 @@ class CineJoyProvider : MainAPI() {
     }
 
     // ========================================================================
-    // LOAD LINKS — combines all sources
+    // LOAD LINKS
     // ========================================================================
     override suspend fun loadLinks(
         data: String,
@@ -386,7 +389,6 @@ class CineJoyProvider : MainAPI() {
         val p = parseUrl(data) ?: return false
         var found = false
 
-        // VidLove: 7 variants mapped to CineJoy server names
         val vlVariants = listOf(
             "" to "Nebula",
             "&sources=warden" to "Solara",
@@ -415,7 +417,6 @@ class CineJoyProvider : MainAPI() {
             found = true
         }
 
-        // VidRock
         val vr = vidrockStreams(p.type, p.id, p.s, p.e)
         for (s in vr) {
             callback.invoke(
