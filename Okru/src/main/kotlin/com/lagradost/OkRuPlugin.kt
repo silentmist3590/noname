@@ -1,4 +1,4 @@
-package com.example.okru
+package com.lagradost.okru
 
 import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
