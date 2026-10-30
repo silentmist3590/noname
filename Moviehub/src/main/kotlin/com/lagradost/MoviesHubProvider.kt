@@ -350,6 +350,40 @@ class MoviesHubProvider : MainAPI() {
         return x.startsWith("{") || x.startsWith("[")
     }
 
+    /** Wrapper {d, n?, v?}: thử nhiều cách dựng khóa, nhận kết quả đầu tiên giải ra JSON. */
+    private fun decryptWrapper(prov: String, j: JsonNode, nonce: String): JsonNode? {
+        val d = j.get("d").asText()
+        val n = j.str("n")
+        HubLog.log(
+            "vn",
+            "$prov wrapper keys=${j.fieldNames().asSequence().toList()} v=${j.str("v")} n=$n dLen=${d.length}"
+        )
+        val raw = try {
+            Base64.decode(d, Base64.URL_SAFE)
+        } catch (e: Exception) {
+            HubLog.log("vn", "$prov: base64 lỗi: $e")
+            return null
+        }
+        val materials = listOfNotNull(
+            n?.let { "$it|$vnSecret" },   // cách của plugin gốc
+            "$nonce|$vnSecret",           // nonce mình đã gửi
+            vnSecret,
+            n?.let { "$it$vnSecret" }
+        )
+        for (km in materials) {
+            val t = vnDecryptRaw(raw, km)
+            if (looksJson(t)) {
+                try {
+                    return mapper.readTree(t)
+                } catch (e: Exception) {
+                    // thử khóa kế tiếp
+                }
+            }
+        }
+        HubLog.log("vn", "$prov: không giải mã được (secret/khóa có thể đã đổi), rawLen=${raw.size}")
+        return null
+    }
+
     private suspend fun vnFetch(provPath: String, path: String): JsonNode? {
         val nonce = vnNonce()
         val url = "$vnApi/$provPath$path?_n=$nonce"
@@ -391,8 +425,7 @@ class MoviesHubProvider : MainAPI() {
 
             val j = mapper.readTree(text) ?: return null
             val out: JsonNode? = when {
-                j.get("v")?.asInt() == 2 && j.get("d")?.isTextual == true ->
-                    vnDecryptV2(j.get("d").asText(), j.str("n") ?: "")?.let { mapper.readTree(it) }
+                j.get("d")?.isTextual == true -> decryptWrapper(provPath, j, nonce)
                 j.get("encrypted")?.asBoolean() == true && j.get("data")?.isTextual == true ->
                     mapper.readTree(vnDecode(j.get("data").asText()))
                 else -> j
