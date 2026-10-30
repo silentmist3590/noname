@@ -11,4 +11,5 @@ include(":CineHD")
 include(":Phim321")
 include(":CineJoy")
 include(":MovieAPI")
+include(":Hicine")
 rootProject.name = "CloudstreamPlugins"
