@@ -2,7 +2,7 @@ plugins {
     kotlin("android")
 }
 
-version = 1 // Tăng số này mỗi khi bạn cập nhật plugin
+version = 2 // Tăng số này mỗi khi bạn cập nhật plugin
 
 cloudstream {
     language = "vi" // hoặc "ru" tùy theo ngôn ngữ chính bạn muốn
