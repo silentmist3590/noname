@@ -1,14 +1,13 @@
-// Version của plugin (số nguyên Int)
-version = 1
-
-android {
-    namespace = "com.lagradost"
+plugins {
+    kotlin("android")
 }
 
 cloudstream {
-    description = "CineHD - Stream Movies & Series from cinehd.vc (VidRock GCM, Nxsha Nitro, VidLove)"
-    authors = listOf("CineHD")
-    status = 1 // 1: Hoạt động (Ok)
-    tvTypes = listOf("Movie", "TvSeries")
     language = "en"
+    version = 2
+    description = "CineHD (cinehd.vc) - Movies & TV Series with Vietsub, 1080p Original Audio & Fast HLS Servers"
+    authors = listOf("TJ-Plugins")
+    status = 1
+    tvTypes = listOf("Movie", "TvSeries")
+    iconUrl = "https://cinehd.vc/favicon.ico"
 }
