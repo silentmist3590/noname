@@ -1,4 +1,4 @@
-package com.example.okru
+package com.lagradost.okru
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
