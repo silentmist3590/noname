@@ -14,24 +14,41 @@ class MoviesApiProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    // ──────────────────────────────────────────────────────────────────────
+    // CONFIG
+    // ──────────────────────────────────────────────────────────────────────
     private val mapper = jacksonObjectMapper()
+    private fun log(tag: String, msg: String) = println("[MovieAPI][$tag] $msg")
+    private fun logErr(tag: String, msg: String, e: Throwable? = null) {
+        println("[MovieAPI][$tag][ERR] $msg${if (e != null) " | ${e.message}" else ""}")
+    }
 
-    // TMDB keys - both are live as of 2026-10. Primary + automatic fallback.
+    // TMDB keys (from live CineJoy bundle 2026-10)
     private val tmdbKey = "8476a7ab80ad76f0936744df0430e67c"
     private val tmdbFallbackKey = "439c478a771f35c05022f9feabcca01c"
 
-    private val tmdbApiDomains = listOf(
-        "https://api.themoviedb.org",
-        "https://api.tmdb.org",
+    // OMDb (optional - leave empty to disable)
+    // Register free: https://www.omdbapi.com/apikey.aspx
+    private val omdbApiKey = ""
+
+    // Image proxy - Cloudflare-backed, works in VN
+    private val imgProxy = "https://wsrv.nl/?url="
+
+    // TMDB direct domains
+    private val tmdbDirectDomains = listOf(
+        "https://api.tmdb.org",           // old official - usually works
+        "https://api.themoviedb.org",     // new official - often DNS-blocked in VN
         "https://tmdb.demojameson.de5.net",
         "https://daili.smdhb.com",
-        "https://vidora-tmdb.wwmm.date"
+        "https://vidora-tmdb.wwmm.date",
     )
 
-    private val tmdbImgDomains = listOf(
-        "https://image.tmdb.org",
-        "https://imagetmdb.com",
-        "https://nl.imagetmdb.com"
+    // CORS proxies - format functions
+    private val tmdbCorsProxies: List<(String) -> String> = listOf(
+        { url -> "https://cors.eu.org/$url" },                                           // direct append
+        { url -> "https://api.codetabs.com/v1/proxy/?quest=${URLEncoder.encode(url, "UTF-8")}" },
+        { url -> "https://api.allorigins.win/raw?url=${URLEncoder.encode(url, "UTF-8")}" },
+        { url -> "https://cinejoytv.fun/relay?url=${URLEncoder.encode(url, "UTF-8")}" },
     )
 
     private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\\z", RegexOption.IGNORE_CASE)
@@ -49,8 +66,6 @@ class MoviesApiProvider : MainAPI() {
     private val backdropCache = HashMap<String, String?>()
     private val subsCache = HashMap<String, List<Pair<String, String>>>()
 
-    // Fetch poster for every title on the page (30 per page typical).
-    // Cache makes repeat loads instant after first fetch.
     private val maxTmdbLookupsPerPage = 30
 
     private val apiBaseHeaders: Map<String, String> by lazy {
@@ -82,8 +97,9 @@ class MoviesApiProvider : MainAPI() {
         "$mainUrl/api/discover/tv?ordering=views&direction=desc" to "Most Viewed TV",
     )
 
-    // ---------------------------------------------------------------- helpers
-
+    // ========================================================================
+    // HTTP helpers
+    // ========================================================================
     private suspend fun getJson(url: String, referer: String? = "$mainUrl/"): JsonNode? = try {
         val text = app.get(
             url,
@@ -94,10 +110,10 @@ class MoviesApiProvider : MainAPI() {
             ),
             referer = referer
         ).text
-        DebugLog.log("http", "GET $url -> ${text.length}b: ${text.take(300)}")
+        log("http", "GET $url -> ${text.length}b")
         if (text.isBlank()) null else mapper.readTree(text)
     } catch (e: Exception) {
-        DebugLog.error("http", "GET $url failed", e)
+        logErr("http", "GET $url failed", e)
         null
     }
 
@@ -154,12 +170,22 @@ class MoviesApiProvider : MainAPI() {
         return null
     }
 
+    /**
+     * Wrap image URL through wsrv.nl proxy (Cloudflare-backed) so it loads in VN
+     * where image.tmdb.org is DNS-blocked.
+     */
+    private fun proxyImg(originalUrl: String): String =
+        "$imgProxy${URLEncoder.encode(originalUrl, "UTF-8")}"
+
     private fun resolveImg(path: String?, size: String = "w500"): String? {
         if (path.isNullOrBlank()) return null
-        if (path.startsWith("http")) return path
-        if (path.startsWith("//")) return "https:$path"
-        if (path.startsWith("/")) return "${tmdbImgDomains.first()}/t/p/$size$path"
-        return "$mainUrl/$path"
+        val original = when {
+            path.startsWith("http") -> path
+            path.startsWith("//") -> "https:$path"
+            path.startsWith("/") -> "https://image.tmdb.org/t/p/$size$path"
+            else -> "$mainUrl/$path"
+        }
+        return proxyImg(original)
     }
 
     private fun JsonNode.mediaId(): String? =
@@ -169,54 +195,84 @@ class MoviesApiProvider : MainAPI() {
     private fun JsonNode.imdbId(): String? = str("imdb_id", "imdbid", "imdbId", "imdb")
     private fun JsonNode.title(): String? = str("title", "name", "original_title", "orig_title")
 
-    // -------------------------------------------------- TMDB multi-key + multi-domain
+    // ========================================================================
+    // TMDB — multi-domain + CORS proxy + OMDb fallback
+    // ========================================================================
 
-    /**
-     * Try each TMDB API domain with the given key.
-     * If the domain returns status_code == 7 (invalid key), retry with fallback key.
-     * If all official domains fail, proxies that inject their own key are tried.
-     */
+    /** TMDB call: tries direct domains, then CORS proxies, then fallback key. */
     private suspend fun tmdbGet(path: String, useFallback: Boolean = false): JsonNode? {
         val key = if (useFallback) tmdbFallbackKey else tmdbKey
         val sep = if (path.contains("?")) "&" else "?"
+        val fullPath = "$path${sep}api_key=$key"
 
-        for (base in tmdbApiDomains) {
+        // ---- Strategy 1: direct domains ----
+        for (base in tmdbDirectDomains) {
             try {
-                val url = "$base$path${sep}api_key=$key"
                 val text = app.get(
-                    url,
+                    "$base$fullPath",
                     headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
                     referer = null
                 ).text
                 if (text.isBlank() || !text.trimStart().startsWith("{")) {
-                    DebugLog.log("tmdb", "$base (key=${key.take(6)}..) -> non-JSON")
+                    log("tmdb", "$base -> non-JSON")
                     continue
                 }
                 val j = mapper.readTree(text)
                 val status = j.get("status_code")?.asInt()
                 if (status != null && status != 0) {
-                    DebugLog.log("tmdb", "$base (key=${key.take(6)}..) -> status $status")
-                    // 7 = Invalid API key. Try fallback key, same or next domain.
-                    if (!useFallback && (status == 7 || status == 3)) {
-                        return tmdbGet(path, true)
-                    }
+                    log("tmdb", "$base -> status $status")
+                    if (!useFallback && (status == 7 || status == 3)) return tmdbGet(path, true)
                     continue
                 }
-                DebugLog.log("tmdb", "$base (key=${key.take(6)}..) -> OK")
+                log("tmdb", "$base -> OK")
                 return j
             } catch (e: Exception) {
-                DebugLog.log("tmdb", "$base failed: ${e.message}")
+                log("tmdb", "$base -> ${e.message}")
             }
         }
 
-        // All domains failed with current key. If we weren't on fallback yet, try it.
+        // ---- Strategy 2: CORS proxies (bypass DNS blocking) ----
+        val targetUrl = "https://api.themoviedb.org/3$fullPath"
+        for (buildProxy in tmdbCorsProxies) {
+            try {
+                val proxied = buildProxy(targetUrl)
+                val text = app.get(
+                    proxied,
+                    headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
+                    referer = null
+                ).text
+                if (text.isBlank() || !text.trimStart().startsWith("{")) {
+                    log("tmdb-cors", "non-JSON: ${text.take(60)}")
+                    continue
+                }
+                val j = mapper.readTree(text)
+                val status = j.get("status_code")?.asInt()
+                if (status != null && status != 0) {
+                    log("tmdb-cors", "status $status")
+                    continue
+                }
+                log("tmdb-cors", "OK via ${proxied.take(40)}...")
+                return j
+            } catch (e: Exception) {
+                log("tmdb-cors", "failed: ${e.message}")
+            }
+        }
+
         if (!useFallback) return tmdbGet(path, true)
         return null
+    }
+
+    /** OMDb fallback - only by imdb_id, only if key configured. */
+    private fun omdbPoster(imdbId: String?): String? {
+        if (imdbId.isNullOrBlank() || !imdbId.startsWith("tt")) return null
+        if (omdbApiKey.isBlank() || omdbApiKey == "YOUR_OMDB_API_KEY") return null
+        return "https://img.omdbapi.com/?apikey=$omdbApiKey&i=$imdbId"
     }
 
     private suspend fun lookupTmdbPoster(
         tmdbid: String?, imdbId: String?, isTv: Boolean
     ): String? {
+        // 1. TMDB by tmdb_id
         if (tmdbid != null) {
             val type = if (isTv) "tv" else "movie"
             val j = tmdbGet("/3/$type/$tmdbid")
@@ -224,13 +280,13 @@ class MoviesApiProvider : MainAPI() {
                 val pp = j.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
                 val bp = j.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
                 val ck = tmdbid.lowercase()
-                posterCache[ck] = resolveImg(pp, "w500")
-                backdropCache[ck] = resolveImg(bp, "w1280")
-                if (posterCache[ck] != null || backdropCache[ck] != null) {
-                    return posterCache[ck]
-                }
+                if (pp != null) posterCache[ck] = resolveImg(pp, "w500")
+                if (bp != null) backdropCache[ck] = resolveImg(bp, "w1280")
+                if (posterCache[ck] != null) return posterCache[ck]
             }
         }
+
+        // 2. TMDB by imdb_id
         if (imdbId != null && imdbId.startsWith("tt")) {
             val j = tmdbGet("/3/find/$imdbId?external_source=imdb_id")
             if (j != null) {
@@ -240,11 +296,18 @@ class MoviesApiProvider : MainAPI() {
                     val pp = first.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
                     val bp = first.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
                     val ck = imdbId.lowercase()
-                    posterCache[ck] = resolveImg(pp, "w500")
-                    backdropCache[ck] = resolveImg(bp, "w1280")
-                    return posterCache[ck]
+                    if (pp != null) posterCache[ck] = resolveImg(pp, "w500")
+                    if (bp != null) backdropCache[ck] = resolveImg(bp, "w1280")
+                    if (posterCache[ck] != null) return posterCache[ck]
                 }
             }
+        }
+
+        // 3. OMDb fallback (no TMDB needed)
+        val omdb = omdbPoster(imdbId)
+        if (omdb != null) {
+            log("omdb", "fallback for $imdbId -> $omdb")
+            return omdb
         }
         return null
     }
@@ -258,8 +321,9 @@ class MoviesApiProvider : MainAPI() {
         return if (ck.isNotEmpty()) backdropCache[ck] else null
     }
 
-    // -------------------------------------------------- main page
-
+    // ========================================================================
+    // MAIN PAGE
+    // ========================================================================
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sep = if (request.data.contains("?")) "&" else "?"
         val url = "${request.data}${sep}page=$page&resultsPerPage=30"
@@ -351,8 +415,9 @@ class MoviesApiProvider : MainAPI() {
         return out
     }
 
-    // -------------------------------------------------- load
-
+    // ========================================================================
+    // LOAD
+    // ========================================================================
     private fun mkEpisode(
         id: String, season: Int, episode: Int,
         name: String? = null, desc: String? = null, poster: String? = null
@@ -470,38 +535,29 @@ class MoviesApiProvider : MainAPI() {
         }
     }
 
-    // ================================================================
-    //          SUBTITLES
-    // ================================================================
-
-    private suspend fun fetchSubtitles(
-        embed: String,
-        key: String,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ) {
+    // ========================================================================
+    // SUBTITLES
+    // ========================================================================
+    private suspend fun fetchSubtitles(embed: String, key: String, subtitleCallback: (SubtitleFile) -> Unit) {
         val cached = subsCache[embed]
         if (cached != null) {
-            DebugLog.log("subs", "cache hit: ${cached.size} subs")
+            log("subs", "cache hit: ${cached.size} subs")
             cached.forEach { (lang, url) -> subtitleCallback.invoke(newSubtitleFile(url = url, lang = lang)) }
             return
         }
-
         try {
             val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return
             val type = m.groupValues[1]
             val id = m.groupValues[2]
             val path = when {
                 type == "movie" -> "/api/vidora/v1/subtitles/movie/$id"
-                m.groupValues[3].isNotEmpty() ->
-                    "/api/vidora/v1/subtitles/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
+                m.groupValues[3].isNotEmpty() -> "/api/vidora/v1/subtitles/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
                 else -> return
             }
             val headers = apiBaseHeaders.toMutableMap()
             headers["x-player-key"] = key
             val body = app.get("$mainUrl$path", headers = headers, referer = "$mainUrl/").text
-            DebugLog.log("subs", "GET $path -> ${body.length}b: ${body.take(500)}")
             if (body.isBlank() || !body.trimStart().startsWith("{")) return
-
             val json = mapper.readTree(body)
             val result = ArrayList<Pair<String, String>>()
 
@@ -528,38 +584,30 @@ class MoviesApiProvider : MainAPI() {
                     }
                 }
             }
-
-            tryAdd(json.get("subtitles"))
-            tryAdd(json.get("tracks"))
-            tryAdd(json.get("data"))
-            tryAdd(json.get("subs"))
+            tryAdd(json.get("subtitles")); tryAdd(json.get("tracks"))
+            tryAdd(json.get("data")); tryAdd(json.get("subs"))
             if (result.isEmpty()) tryAdd(json)
 
             val seen = HashSet<String>()
             val deduped = result.filter { seen.add(it.second) }
-
             subsCache[embed] = deduped
-            DebugLog.log("subs", "parsed ${deduped.size} subs")
-            deduped.forEach { (lang, url) ->
-                subtitleCallback.invoke(newSubtitleFile(url = url, lang = lang))
-            }
+            log("subs", "parsed ${deduped.size} subs")
+            deduped.forEach { (lang, url) -> subtitleCallback.invoke(newSubtitleFile(url = url, lang = lang)) }
         } catch (e: Exception) {
-            DebugLog.log("subs", "fetch failed: ${e.message}")
+            logErr("subs", "fetch failed", e)
         }
     }
 
-    // ================================================================
-    //                          LOAD LINKS
-    // ================================================================
-
+    // ========================================================================
+    // LOAD LINKS
+    // ========================================================================
     private fun vidoraUrl(embed: String): String? {
         val m = Regex("""/(movie|tv)/([^/?#]+)(?:/(\d+)/(\d+))?""").find(embed) ?: return null
         val type = m.groupValues[1]
         val id = m.groupValues[2]
         return when {
             type == "movie" -> "$mainUrl/api/vidora/v1/movie/$id"
-            m.groupValues[3].isNotEmpty() ->
-                "$mainUrl/api/vidora/v1/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
+            m.groupValues[3].isNotEmpty() -> "$mainUrl/api/vidora/v1/tv/$id/${m.groupValues[3]}/${m.groupValues[4]}"
             else -> null
         }
     }
@@ -567,7 +615,7 @@ class MoviesApiProvider : MainAPI() {
     private fun cacheKey(key: String) {
         cachedKey = key
         cachedKeyAt = System.currentTimeMillis()
-        DebugLog.log("key", "cached for 1h: $key")
+        log("key", "cached for 1h: $key")
     }
 
     private fun currentKey(): String {
@@ -577,8 +625,7 @@ class MoviesApiProvider : MainAPI() {
     }
 
     private suspend fun tryApiCall(
-        key: String,
-        embed: String,
+        key: String, embed: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -587,36 +634,27 @@ class MoviesApiProvider : MainAPI() {
             val headers = apiBaseHeaders.toMutableMap()
             headers["x-player-key"] = key
             val body = app.get(apiUrl, headers = headers, referer = "$mainUrl/").text
-            DebugLog.log("vidora", "GET $apiUrl (key=${key.take(8)}..) -> ${body.length}b: ${body.take(400)}")
-
+            log("vidora", "GET $apiUrl (key=${key.take(8)}..) -> ${body.length}b")
             if (!body.trimStart().startsWith("{")) return false
             val json = mapper.readTree(body)
             if (json.get("result")?.asBoolean() != true) {
-                val err = json.get("error")?.asText() ?: "unknown"
-                DebugLog.log("vidora", "auth failed: $err")
+                log("vidora", "auth failed: ${json.get("error")?.asText()}")
                 return false
             }
-
             var found = false
             val sources = json.get("sources")
             if (sources != null && sources.isArray) {
                 for (src in sources) {
                     val url = src.str("url") ?: continue
                     if (!url.contains(".m3u8")) continue
-                    callback.invoke(
-                        newExtractorLink(
-                            source = name, name = name, url = url,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "$mainUrl/"
-                            this.quality = Qualities.Unknown.value
-                            this.headers = streamHeaders
-                        }
-                    )
+                    callback.invoke(newExtractorLink(name, name, url, ExtractorLinkType.M3U8) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                        this.headers = streamHeaders
+                    })
                     found = true
                 }
             }
-
             val inlineTracks = sources?.firstOrNull()?.get("tracks")
             if (inlineTracks != null && inlineTracks.isArray) {
                 for (t in inlineTracks) {
@@ -628,12 +666,10 @@ class MoviesApiProvider : MainAPI() {
                     subtitleCallback.invoke(newSubtitleFile(url = f, lang = lang))
                 }
             }
-
             if (found) fetchSubtitles(embed, key, subtitleCallback)
-
             found
         } catch (e: Exception) {
-            DebugLog.log("vidora", "call failed: ${e.message}")
+            logErr("vidora", "call failed", e)
             false
         }
     }
@@ -649,23 +685,8 @@ class MoviesApiProvider : MainAPI() {
                 var pr = el.play();
                 if (pr && pr.catch) pr.catch(function(){});
               });
-              var sel = 'media-play-button, [data-part="play-button"], [data-play], ' +
-                        '.play-button, .vjs-big-play-button, .jw-icon-playback, ' +
-                        '.plyr__control--overlaid, button[aria-label*="lay"]';
-              document.querySelectorAll(sel).forEach(function(b){
-                try { b.click(); } catch (e) {}
-              });
-              var p = document.querySelector('media-player, #player, .player, [class*="player"]');
-              if (p && n > 1) {
-                var r = p.getBoundingClientRect();
-                var x = r.left + r.width / 2;
-                var y = r.top + r.height / 2;
-                ['pointerdown','pointerup','click'].forEach(function(type){
-                  try {
-                    p.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, clientX: x, clientY: y}));
-                  } catch (e) {}
-                });
-              }
+              var sel = 'media-play-button, [data-part="play-button"], [data-play], .play-button, .vjs-big-play-button, button[aria-label*="lay"]';
+              document.querySelectorAll(sel).forEach(function(b){ try { b.click(); } catch (e) {} });
             } catch (e) {}
             if (n > 25) clearInterval(t);
           }, 1000);
@@ -674,9 +695,7 @@ class MoviesApiProvider : MainAPI() {
 
     private val hookScript = """
         (function(){
-          if (window.__CS_KEY && window.__CS_KEY.length > 16) {
-            return JSON.stringify({key: window.__CS_KEY});
-          }
+          if (window.__CS_KEY && window.__CS_KEY.length > 16) return JSON.stringify({key: window.__CS_KEY});
           if (!window.__CS_HOOKED) {
             window.__CS_HOOKED = true;
             try {
@@ -706,75 +725,61 @@ class MoviesApiProvider : MainAPI() {
     """.trimIndent()
 
     override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
+        data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        DebugLog.log("links", "loadLinks data=$data")
+        log("links", "loadLinks data=$data")
 
         val keyNow = currentKey()
-        DebugLog.log("key", "fast path key: ${keyNow.take(8)}..")
         if (tryApiCall(keyNow, data, subtitleCallback, callback)) {
-            DebugLog.log("key", "fast path OK")
+            log("links", "fast path OK")
             return true
         }
 
-        DebugLog.log("webview", "=== opening WebView to capture live key ===")
+        log("links", "fallback to WebView")
         var capturedKey: String? = null
-
         try {
             val resolver = WebViewResolver(
-                interceptUrl   = Regex("(?i)(/api/vidora/v1/(movie|tv)/|/api/vidora/v1/ice|workers\\.dev|\\.m3u8)"),
-                useOkhttp      = false,
-                script         = autoPlayScript + "\n" + hookScript,
+                interceptUrl = Regex("(?i)(/api/vidora/v1/(movie|tv)/|/api/vidora/v1/ice|workers\\.dev|\\.m3u8)"),
+                useOkhttp = false,
+                script = autoPlayScript + "\n" + hookScript,
                 scriptCallback = { result ->
                     if (!result.isNullOrBlank() && capturedKey == null) {
                         try {
                             val j = mapper.readTree(result)
                             val k = j.get("key")?.asText()
                             if (k != null && k.length > 16) {
-                                DebugLog.log("key", "captured live key: $k")
                                 capturedKey = k
                                 cacheKey(k)
                             }
                         } catch (_: Exception) { }
                     }
                 },
-                timeout        = 20_000L
+                timeout = 20_000L
             )
             val resp = app.get(data, referer = "$mainUrl/", interceptor = resolver)
-            val capturedUrl = resp.url
-            DebugLog.log("webview", "captured: $capturedUrl")
-
-            if (capturedUrl.contains(".m3u8")) {
-                DebugLog.log("webview", "using captured m3u8: $capturedUrl")
-                callback.invoke(
-                    newExtractorLink(
-                        source = name, name = name, url = capturedUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.Unknown.value
-                        this.headers = streamHeaders
-                    }
-                )
+            if (resp.url.contains(".m3u8")) {
+                callback.invoke(newExtractorLink(name, name, resp.url, ExtractorLinkType.M3U8) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = streamHeaders
+                })
                 if (capturedKey != null) fetchSubtitles(data, capturedKey!!, subtitleCallback)
                 return true
             }
         } catch (e: Exception) {
-            DebugLog.log("webview", "error: ${e.message}")
+            logErr("webview", "error", e)
         }
 
         if (capturedKey != null) {
-            DebugLog.log("key", "retrying API with captured key")
             if (tryApiCall(capturedKey!!, data, subtitleCallback, callback)) {
-                DebugLog.log("key", "retry OK - key saved for next 1h")
+                log("links", "retry with captured key OK")
                 return true
             }
         }
 
-        DebugLog.error("links", "No playable link for $data")
+        logErr("links", "no playable link for $data")
         return false
     }
 }
