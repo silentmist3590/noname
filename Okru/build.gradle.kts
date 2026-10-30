@@ -1,7 +1,7 @@
 cloudstream {
     language = "vi"
     description = "Xem video trực tiếp từ ok.ru trên CloudStream."
-    authors = listOf("TênThậtCủaBạn")  // ← SỬA placeholder này
+    authors = listOf("noname")  // ← SỬA placeholder này
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
