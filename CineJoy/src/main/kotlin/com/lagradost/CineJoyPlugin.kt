@@ -1,150 +1,18 @@
 package com.lagradost
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
-import android.os.Build
-import android.widget.Toast
-import com.fasterxml.jackson.annotation.JsonProperty
-import com.fasterxml.jackson.databind.ObjectMapper
+import android.util.Base64
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.net.URLEncoder
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
-// ============================================================================
-// DEBUG HELPER — buffer log + auto-copy clipboard khi lỗi
-// Dùng println (không dùng DebugLog vì đã bị remove ở CloudStream 4.x)
-// ============================================================================
-object CineJoyDebug {
-    private const val MAX_LINES = 200
-    private const val RATE_LIMIT_MS = 3000L
-    private const val TAG = "cinejoy"
-
-    private val buffer = mutableListOf<String>()
-    private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
-
-    @Volatile private var lastCopyAt = 0L
-
-    @Synchronized
-    fun log(step: String, msg: String) {
-        val line = "${fmt.format(Date())} [$step] $msg"
-        buffer.add(line)
-        if (buffer.size > MAX_LINES) buffer.removeAt(0)
-        println("[$TAG] $msg")
-    }
-
-    @Synchronized
-    fun logError(step: String, msg: String, e: Throwable? = null) {
-        val detail = if (e != null) "$msg | ${e::class.simpleName}: ${e.message}" else msg
-        val line = "${fmt.format(Date())} [$step][ERROR] $detail"
-        buffer.add(line)
-        if (buffer.size > MAX_LINES) buffer.removeAt(0)
-        println("[$TAG][ERROR] $detail")
-        e?.printStackTrace()
-    }
-
-    @Synchronized
-    fun clear() {
-        buffer.clear()
-    }
-
-    @Synchronized
-    fun snapshot(): String = buffer.joinToString("\n")
-
-    @Synchronized
-    fun dumpToClipboard(auto: Boolean = false, reason: String = "") {
-        val now = System.currentTimeMillis()
-        if (auto && now - lastCopyAt < RATE_LIMIT_MS) return
-        lastCopyAt = now
-
-        try {
-            val ctx = getContext() ?: run {
-                println("[$TAG] dumpToClipboard: no context")
-                return
-            }
-
-            val header = buildString {
-                appendLine("=== CineJoy Debug${if (auto) " (AUTO-COPIED ON ERROR)" else ""} ===")
-                if (reason.isNotBlank()) appendLine("Reason: $reason")
-                appendLine("Time:   ${Date()}")
-                appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}")
-                appendLine("App:    CloudStream")
-                appendLine("Plugin: CineJoy v7")
-                appendLine("Lines:  ${buffer.size}")
-                appendLine("--- log ---")
-            }
-
-            val fullText = header + buffer.joinToString("\n")
-
-            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("CineJoy Debug", fullText))
-
-            Toast.makeText(
-                ctx,
-                if (auto) "⚠ CineJoy error — log copied, please share"
-                else "CineJoy log copied (${buffer.size} lines)",
-                Toast.LENGTH_LONG
-            ).show()
-
-            println("[$TAG] dumpToClipboard OK (${buffer.size} lines, auto=$auto)")
-        } catch (e: Throwable) {
-            println("[$TAG] dumpToClipboard failed: ${e.message}")
-        }
-    }
-
-    /** Lấy Context qua reflection — thử nhiều API của CloudStream. */
-    private fun getContext(): Context? {
-        // 1) App.getAppContext()
-        try {
-            val cls = Class.forName("com.lagradost.cloudstream3.App")
-            val m = cls.getMethod("getAppContext")
-            (m.invoke(null) as? Context)?.let { return it }
-        } catch (_: Throwable) {}
-
-        // 2) App.appContext (field)
-        try {
-            val cls = Class.forName("com.lagradost.cloudstream3.App")
-            val f = cls.getDeclaredField("appContext")
-            f.isAccessible = true
-            (f.get(null) as? Context)?.let { return it }
-        } catch (_: Throwable) {}
-
-        // 3) CommonActivity.activity (field)
-        try {
-            val cls = Class.forName("com.lagradost.cloudstream3.CommonActivity")
-            val f = cls.getDeclaredField("activity")
-            f.isAccessible = true
-            (f.get(null) as? Context)?.let { return it }
-        } catch (_: Throwable) {}
-
-        // 4) CommonActivity.getActivity()
-        try {
-            val cls = Class.forName("com.lagradost.cloudstream3.CommonActivity")
-            val m = cls.getMethod("getActivity")
-            (m.invoke(null) as? Context)?.let { return it }
-        } catch (_: Throwable) {}
-
-        // 5) Plugin context (được giữ bởi Plugin.load)
-        try {
-            val cls = Class.forName("com.lagradost.cloudstream3.plugins.Plugin")
-            val f = cls.getDeclaredField("context")
-            f.isAccessible = true
-            (f.get(null) as? Context)?.let { return it }
-        } catch (_: Throwable) {}
-
-        return null
-    }
-}
-
-// ============================================================================
-// PLUGIN ENTRY POINT
-// ============================================================================
 @CloudstreamPlugin
 class CineJoyPlugin : Plugin() {
     override fun load(context: Context) {
@@ -152,359 +20,418 @@ class CineJoyPlugin : Plugin() {
     }
 }
 
-// ============================================================================
-// PROVIDER
-// ============================================================================
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
     override var name = "CineJoy"
-    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"
     override val hasMainPage = true
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    private val apiInfo = "https://api.wing.st/info?tmdb="
-    private val mapper = ObjectMapper()
+    private val mapper = jacksonObjectMapper()
 
-    private val baseHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer"    to "$mainUrl/",
-        "Origin"     to mainUrl,
-    )
+    // TMDB keys from CineJoy's own JS bundle
+    private val tmdbKey = "8476a7ab80ad76f0936744df0430e67c"
+    private val tmdbFallbackKey = "439c478a771f35c05022f9feabcca01c"
+    private val tmdbBase = "https://api.themoviedb.org/3"
+    private val tmdbImg = "https://image.tmdb.org/t/p"
 
-    data class CineJoyResponse(
-        @JsonProperty("code") val code: Int?,
-        @JsonProperty("message") val message: String?,
-        @JsonProperty("url") val url: String?,
-        @JsonProperty("status") val status: Boolean?,
-    )
+    // VidLove aggregator
+    private val vidloveBase = "https://api.vidlove.cc"
+    private val vidloveReferer = "https://player.vidlove.cc/"
+
+    // VidRock aggregator (AES-GCM)
+    private val vidrockBase = "https://vidrock.net"
+    private val vidrockKeyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
+
+    private val userAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     override val mainPage = mainPageOf(
-        "$mainUrl/movies" to "Movies",
-        "$mainUrl/series" to "TV Series",
+        "/trending/movie/week" to "Trending Movies",
+        "/trending/tv/week" to "Trending Series",
+        "/movie/popular" to "Popular Movies",
+        "/movie/top_rated" to "Top Rated Movies",
+        "/tv/popular" to "Popular Series",
+        "/tv/top_rated" to "Top Rated Series",
+        "/movie/now_playing" to "In Theaters",
     )
 
     // ========================================================================
-    // MAIN PAGE
+    // TMDB
     // ========================================================================
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        CineJoyDebug.clear()
-        CineJoyDebug.log("getMainPage", "category=${request.name} page=$page")
-
-        val url = if (request.data.contains("{page}")) {
-            request.data.replace("{page}", page.toString())
-        } else {
-            val sep = if (request.data.contains("?")) "&" else "?"
-            "${request.data}${sep}page=$page"
-        }
-        CineJoyDebug.log("getMainPage", "url=$url")
-
-        try {
-            val doc = app.get(url, headers = baseHeaders, referer = "$mainUrl/").document
-            CineJoyDebug.log("getMainPage", "html.size=${doc.outerHtml().length}")
-
-            val items = doc.select("a[href*='/watch/'], a[href*='/movie/'], a[href*='/series/']")
-                .mapNotNull { it.parent() }
-                .distinct()
-                .ifEmpty { doc.select("div.mediaCard, div.item-movie, div.movie-item") }
-
-            CineJoyDebug.log("getMainPage", "found ${items.size} raw items")
-
-            val list = items.mapNotNull { it.toSearchResult() }
-            CineJoyDebug.log("getMainPage", "parsed ${list.size} items")
-
-            if (list.isEmpty() && items.isNotEmpty()) {
-                CineJoyDebug.logError(
-                    "getMainPage",
-                    "selector matched ${items.size} nodes but 0 parsed. First HTML: " +
-                    items.first().outerHtml().take(400)
-                )
-            }
-
-            return newHomePageResponse(request.name, list)
-        } catch (e: Exception) {
-            CineJoyDebug.logError("getMainPage", "exception", e)
-            CineJoyDebug.dumpToClipboard(auto = true, reason = "getMainPage exception")
-            return newHomePageResponse(request.name, emptyList())
-        }
-    }
-
-    // ========================================================================
-    // SEARCH
-    // ========================================================================
-    override suspend fun search(query: String): List<SearchResponse> {
-        // Manual dump trigger — gõ "!log" trong search
-        if (query.trim().equals("!log", ignoreCase = true)) {
-            CineJoyDebug.dumpToClipboard(auto = false)
-            return emptyList()
-        }
-
-        CineJoyDebug.clear()
-        CineJoyDebug.log("search", "query=$query")
-
-        val url = "$mainUrl/movies?search=${java.net.URLEncoder.encode(query, "UTF-8")}"
-        CineJoyDebug.log("search", "url=$url")
-
+    private suspend fun tmdbGet(path: String, useFallback: Boolean = false): JsonNode? {
+        val sep = if (path.contains("?")) "&" else "?"
+        val key = if (useFallback) tmdbFallbackKey else tmdbKey
+        val url = "$tmdbBase$path${sep}api_key=$key"
         return try {
-            val doc = app.get(url, headers = baseHeaders, referer = "$mainUrl/").document
-            val items = doc.select("a[href*='/watch/'], a[href*='/movie/'], a[href*='/series/']")
-                .mapNotNull { it.parent() }
-                .distinct()
-            val list = items.mapNotNull { it.toSearchResult() }
-            CineJoyDebug.log("search", "found ${list.size} results")
-            list
+            val text = app.get(
+                url,
+                headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json")
+            ).text
+            if (text.isBlank()) {
+                if (!useFallback) tmdbGet(path, true) else null
+            } else {
+                val node = mapper.readTree(text)
+                // If TMDB returns error, try fallback
+                if (node.get("status_code") != null && !useFallback) tmdbGet(path, true)
+                else node
+            }
         } catch (e: Exception) {
-            CineJoyDebug.logError("search", "exception", e)
-            CineJoyDebug.dumpToClipboard(auto = true, reason = "search exception")
-            emptyList()
+            if (!useFallback) tmdbGet(path, true) else null
         }
     }
 
-    private fun Element.toSearchResult(): SearchResponse? {
-        val linkEl = this.selectFirst("a[href*='/watch/']")
-            ?: this.selectFirst("a[href*='/movie/']")
-            ?: this.selectFirst("a[href*='/series/']")
-            ?: this.selectFirst("a")
-            ?: return null
+    private fun JsonNode.s(k: String): String? =
+        get(k)?.takeIf { !it.isNull && !it.isContainerNode }?.asText()?.takeIf { it.isNotBlank() }
 
-        val href = linkEl.attr("href").takeIf { it.isNotBlank() } ?: return null
-        val fullUrl = fixUrl(href)
+    private fun poster(path: String?, size: String = "w500"): String? =
+        if (path != null) "$tmdbImg/$size$path" else null
 
-        val title = linkEl.attr("title").takeIf { it.isNotBlank() }
-            ?: this.selectFirst("h3, .title, .name")?.text()
-            ?: linkEl.text().takeIf { it.isNotBlank() }
-            ?: return null
+    private fun yearOf(date: String?): Int? =
+        if (date == null || date.length < 4) null else date.take(4).toIntOrNull()
 
-        val imgTag = this.selectFirst("img")
-        val rawPoster = imgTag?.attr("data-src")?.takeIf { it.isNotBlank() }
-            ?: imgTag?.attr("src")?.takeIf { it.isNotBlank() }
-            ?: ""
-        val posterUrl = if (rawPoster.isNotBlank()) fixUrl(rawPoster) else null
+    private fun mediaTypeOf(r: JsonNode): String {
+        val mt = r.s("media_type")
+        if (mt == "movie" || mt == "tv") return mt
+        return if (r.get("first_air_date") != null || r.get("name") != null) "tv" else "movie"
+    }
 
-        return newMovieSearchResponse(title, fullUrl, TvType.Movie) {
-            this.posterUrl = posterUrl
+    private fun tmdbToSearch(r: JsonNode): SearchResponse? {
+        val id = r.get("id")?.asInt() ?: return null
+        val type = mediaTypeOf(r)
+        val title = r.s("title") ?: r.s("name") ?: return null
+        val url = """{"type":"$type","id":$id}"""
+        val posterUrl = poster(r.s("poster_path"))
+        val year = yearOf(r.s("release_date") ?: r.s("first_air_date"))
+        val score = r.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+
+        return if (type == "tv") {
+            newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
+                this.posterUrl = posterUrl
+                this.year = year
+                this.score = score
+            }
+        } else {
+            newMovieSearchResponse(title, url, TvType.Movie) {
+                this.posterUrl = posterUrl
+                this.year = year
+                this.score = score
+            }
         }
     }
 
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val items = mutableListOf<SearchResponse>()
+        val json = tmdbGet("${request.data}?page=$page")
+        val results = json?.get("results")
+        if (results != null && results.isArray) {
+            for (r in results) tmdbToSearch(r)?.let { items.add(it) }
+        }
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        if (query.isBlank()) return emptyList()
+        val q = URLEncoder.encode(query, "UTF-8")
+        val json = tmdbGet("/search/multi?query=$q&page=1&include_adult=false")
+        val results = json?.get("results") ?: return emptyList()
+        val out = mutableListOf<SearchResponse>()
+        for (r in results) {
+            val mt = r.s("media_type")
+            if (mt != "movie" && mt != "tv") continue
+            tmdbToSearch(r)?.let { out.add(it) }
+        }
+        return out
+    }
+
     // ========================================================================
-    // LOAD
+    // LOAD (detail)
     // ========================================================================
+    private data class ParsedUrl(val type: String, val id: Int, val s: Int, val e: Int)
+
+    private fun parseUrl(url: String): ParsedUrl? {
+        return try {
+            val json = mapper.readTree(url)
+            val type = json.s("type") ?: return null
+            val id = json.get("id")?.asInt() ?: return null
+            val s = json.get("s")?.asInt() ?: 1
+            val e = json.get("e")?.asInt() ?: 1
+            ParsedUrl(type, id, s, e)
+        } catch (e: Exception) { null }
+    }
+
+    private fun fixEpisode(e: Int): Int =
+        if (e >= 800) (e % 100) + 1 + ((e / 100) - 8) * 2 else e
+
     override suspend fun load(url: String): LoadResponse? {
-        CineJoyDebug.clear()
-        CineJoyDebug.log("load", "url=$url")
+        val p = parseUrl(url) ?: return null
 
-        try {
-            val tmdbId = Regex("""/(?:movie|tv)/(\d+)""").find(url)?.groupValues?.get(1)
-            CineJoyDebug.log("load", "tmdbId=$tmdbId")
+        return if (p.type == "movie") {
+            val d = tmdbGet("/movie/${p.id}") ?: return null
+            val title = d.s("title") ?: "Unknown"
+            val posterUrl = poster(d.s("poster_path"))
+            val backdrop = poster(d.s("backdrop_path"), "w780")
+            val description = d.s("overview")
+            val year = yearOf(d.s("release_date"))
+            val score = d.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+            val runtime = d.get("runtime")?.asInt()?.takeIf { it > 0 }
+            val tags = d.get("genres")?.mapNotNull { it.s("name") }
 
-            if (tmdbId != null) {
-                val infoUrl = "$apiInfo$tmdbId"
-                CineJoyDebug.log("load", "info URL=$infoUrl")
+            newMovieLoadResponse(title, url, TvType.Movie, """{"type":"movie","id":${p.id}}""") {
+                this.posterUrl = posterUrl
+                this.backgroundPosterUrl = backdrop
+                this.year = year
+                this.plot = description
+                this.score = score
+                this.duration = runtime
+                this.tags = tags
+            }
+        } else {
+            val d = tmdbGet("/tv/${p.id}") ?: return null
+            val title = d.s("name") ?: "Unknown"
+            val posterUrl = poster(d.s("poster_path"))
+            val backdrop = poster(d.s("backdrop_path"), "w780")
+            val description = d.s("overview")
+            val year = yearOf(d.s("first_air_date"))
+            val score = d.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+            val tags = d.get("genres")?.mapNotNull { it.s("name") }
 
-                val infoText = try {
-                    app.get(infoUrl, headers = baseHeaders).text
-                } catch (e: Exception) {
-                    CineJoyDebug.logError("load", "info fetch failed", e)
-                    null
-                }
+            val episodes = mutableListOf<Episode>()
+            val seasons = d.get("seasons")
+            if (seasons != null && seasons.isArray) {
+                for (s in seasons) {
+                    val sn = s.get("season_number")?.asInt() ?: continue
+                    if (sn <= 0) continue
+                    val epCount = s.get("episode_count")?.asInt() ?: 0
+                    if (epCount <= 0) continue
 
-                if (infoText != null) {
-                    CineJoyDebug.log("load", "info response: ${infoText.take(300)}")
-
-                    if (infoText.startsWith("{")) {
-                        try {
-                            val json = mapper.readTree(infoText)
-                            val title = json.get("title")?.asText() ?: json.get("name")?.asText()
-                            val posterPath = json.get("poster_path")?.asText()
-                            val backdropPath = json.get("backdrop_path")?.asText()
-                            val overview = json.get("overview")?.asText()
-
-                            if (title != null) {
-                                val poster = posterPath?.takeIf { it != "null" }
-                                    ?.let { "https://image.tmdb.org/t/p/w500$it" }
-                                val backdrop = backdropPath?.takeIf { it != "null" }
-                                    ?.let { "https://image.tmdb.org/t/p/w1280$it" }
-                                val isTv = url.contains("/watch/tv/")
-
-                                CineJoyDebug.log("load", "title=$title isTv=$isTv")
-
-                                return if (isTv) {
-                                    val episodes = try {
-                                        app.get(url, headers = baseHeaders).document
-                                            .select("a[href*='/watch/tv/']")
-                                            .mapIndexedNotNull { idx, el ->
-                                                val ep = el.attr("href")
-                                                if (ep.isBlank()) return@mapIndexedNotNull null
-                                                newEpisode(fixUrl(ep)) {
-                                                    this.name = el.text()
-                                                        .takeIf { it.isNotBlank() } ?: "Episode ${idx + 1}"
-                                                    this.episode = idx + 1
-                                                }
-                                            }
-                                    } catch (e: Exception) {
-                                        CineJoyDebug.logError("load", "episodes scrape failed", e)
-                                        emptyList()
-                                    }
-
-                                    CineJoyDebug.log("load", "tv episodes=${episodes.size}")
-                                    newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                                        this.posterUrl = poster
-                                        this.backgroundPosterUrl = backdrop
-                                        this.plot = overview
-                                    }
-                                } else {
-                                    newMovieLoadResponse(title, url, TvType.Movie, url) {
-                                        this.posterUrl = poster
-                                        this.backgroundPosterUrl = backdrop
-                                        this.plot = overview
-                                    }
-                                }
-                            } else {
-                                CineJoyDebug.logError("load", "info response OK but no title")
-                            }
-                        } catch (e: Exception) {
-                            CineJoyDebug.logError("load", "info JSON parse failed", e)
+                    val seasonJson = tmdbGet("/tv/${p.id}/season/$sn")
+                    val eps = seasonJson?.get("episodes")
+                    if (eps != null && eps.isArray) {
+                        for (ep in eps) {
+                            val en = ep.get("episode_number")?.asInt() ?: continue
+                            val fixed = fixEpisode(en)
+                            episodes.add(newEpisode("""{"type":"tv","id":${p.id},"s":$sn,"e":$fixed}""") {
+                                this.name = ep.s("name") ?: "S${sn}E$fixed"
+                                this.season = sn
+                                this.episode = fixed
+                                this.posterUrl = poster(ep.s("still_path"))
+                                this.description = ep.s("overview")
+                                this.rating = ep.get("vote_average")?.asDouble()?.takeIf { it > 0 }?.let { (it * 10).toInt() }
+                            })
                         }
                     } else {
-                        CineJoyDebug.logError("load", "info not JSON: ${infoText.take(200)}")
+                        for (en in 1..epCount) {
+                            episodes.add(newEpisode("""{"type":"tv","id":${p.id},"s":$sn,"e":$en}""") {
+                                this.name = "S${sn}E$en"
+                                this.season = sn
+                                this.episode = en
+                            })
+                        }
                     }
                 }
             }
 
-            CineJoyDebug.log("load", "fallback to scrape")
-            return scrapeLoad(url)
-        } catch (e: Exception) {
-            CineJoyDebug.logError("load", "outer exception", e)
-            CineJoyDebug.dumpToClipboard(auto = true, reason = "load exception")
-            return null
+            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = posterUrl
+                this.backgroundPosterUrl = backdrop
+                this.year = year
+                this.plot = description
+                this.score = score
+                this.tags = tags
+            }
         }
     }
 
-    private suspend fun scrapeLoad(url: String): LoadResponse? {
+    // ========================================================================
+    // VIDLOVE
+    // ========================================================================
+    private data class StreamResult(
+        val url: String,
+        val label: String,
+        val subs: List<Pair<String, String>> = emptyList(),
+    )
+
+    private suspend fun vidloveStream(
+        type: String, id: Int, season: Int, episode: Int, suffix: String
+    ): StreamResult? {
+        val path = if (type == "tv") {
+            "/tv?id=$id&season=$season&episode=$episode&mode=json$suffix"
+        } else {
+            "/movie?id=$id&mode=json$suffix"
+        }
         return try {
-            val doc = app.get(url, headers = baseHeaders, referer = "$mainUrl/").document
-            val title = doc.selectFirst("h1, .movie-title, .title")?.text() ?: "Unknown"
-            val description = doc.selectFirst(".description, .overview, .plot")?.text()
-            val posterSrc = doc.selectFirst("img.poster, .poster img, .mediaCard img")?.attr("src") ?: ""
-            val poster = if (posterSrc.isNotBlank()) fixUrl(posterSrc) else null
+            val text = app.get(
+                "$vidloveBase$path",
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to vidloveReferer,
+                    "Accept" to "application/json",
+                )
+            ).text
+            if (text.isBlank()) return null
+            val json = mapper.readTree(text)
+            val src = json.get("source") ?: return null
+            val url = src.s("url") ?: return null
+            if (!url.startsWith("http")) return null
 
-            val episodes = doc.select("a[href*='/watch/']")
-                .mapIndexedNotNull { idx, el ->
-                    val href = el.attr("href")
-                    if (href.isBlank()) return@mapIndexedNotNull null
-                    newEpisode(fixUrl(href)) {
-                        this.name = el.text().takeIf { it.isNotBlank() } ?: "Tap ${idx + 1}"
-                        this.episode = idx + 1
-                    }
-                }
+            val manifest = src.s("manifest")
+            val quality = parseQuality(manifest)
 
-            CineJoyDebug.log("scrapeLoad", "title=$title episodes=${episodes.size}")
-
-            if (episodes.isNotEmpty()) {
-                newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                    this.plot = description
-                    this.posterUrl = poster
-                }
-            } else {
-                newMovieLoadResponse(title, url, TvType.Movie, url) {
-                    this.plot = description
-                    this.posterUrl = poster
+            val subs = mutableListOf<Pair<String, String>>()
+            val subsArr = json.get("subtitles")
+            if (subsArr != null && subsArr.isArray) {
+                for (sub in subsArr) {
+                    val file = sub.s("file") ?: sub.s("url") ?: continue
+                    val lang = sub.s("language") ?: sub.s("label") ?: "en"
+                    subs.add(lang to file)
                 }
             }
+            StreamResult(url, quality, subs)
+        } catch (e: Exception) { null }
+    }
+
+    private fun parseQuality(manifest: String?): String {
+        if (manifest == null) return "Auto"
+        val regex = Regex("RESOLUTION=(\\d+)x(\\d+)")
+        var maxH = 0
+        for (m in regex.findAll(manifest)) {
+            val h = m.groupValues[2].toIntOrNull() ?: continue
+            if (h > maxH) maxH = h
+        }
+        return when {
+            maxH >= 2160 -> "2160p"
+            maxH >= 1080 -> "1080p"
+            maxH >= 720 -> "720p"
+            maxH >= 480 -> "480p"
+            maxH > 0 -> "${maxH}p"
+            else -> "Auto"
+        }
+    }
+
+    // ========================================================================
+    // VIDROCK (AES-GCM)
+    // ========================================================================
+    private fun hexToBytes(hex: String): ByteArray =
+        ByteArray(hex.length / 2) { i ->
+            ((hex[i * 2].digitToInt(16) shl 4) or hex[i * 2 + 1].digitToInt(16)).toByte()
+        }
+
+    private fun b64UrlToStd(s: String): String {
+        var r = s.replace('-', '+').replace('_', '/')
+        while (r.length % 4 != 0) r += "="
+        return r
+    }
+
+    private fun vidrockDecrypt(token: String): String? {
+        return try {
+            val std = b64UrlToStd(token)
+            if (std.length < 20) return null
+            val ivB64 = std.substring(0, 16)
+            val dataB64 = std.substring(16)
+
+            val iv = Base64.decode(ivB64, Base64.DEFAULT)
+            val data = Base64.decode(dataB64, Base64.DEFAULT)
+            val key = hexToBytes(vidrockKeyHex)
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            val spec = GCMParameterSpec(128, iv)
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), spec)
+            String(cipher.doFinal(data), Charsets.UTF_8)
         } catch (e: Exception) {
-            CineJoyDebug.logError("scrapeLoad", "exception", e)
-            CineJoyDebug.dumpToClipboard(auto = true, reason = "scrapeLoad exception")
             null
         }
     }
 
+    private suspend fun vidrockStreams(
+        type: String, id: Int, season: Int, episode: Int
+    ): List<StreamResult> {
+        val path = if (type == "tv") "tv/$id/$season/$episode" else "movie/$id"
+        return try {
+            val text = app.get(
+                "$vidrockBase/api/$path",
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to "$vidrockBase/",
+                    "Accept" to "application/json",
+                )
+            ).text
+            if (text.isBlank()) return emptyList()
+            val json = mapper.readTree(text)
+            val out = mutableListOf<StreamResult>()
+            json.fieldNames().forEach { name ->
+                val s = json.get(name) ?: return@forEach
+                if (!s.isObject) return@forEach
+                val enc = s.s("url") ?: return@forEach
+                val dec = vidrockDecrypt(enc) ?: return@forEach
+                if (!dec.startsWith("http")) return@forEach
+                val lang = s.s("language") ?: ""
+                val label = name + (if (lang.isNotBlank()) " ($lang)" else "")
+                out.add(StreamResult(dec, label))
+            }
+            out
+        } catch (e: Exception) { emptyList() }
+    }
+
     // ========================================================================
-    // LOAD LINKS — không clear buffer (giữ context từ load)
+    // LOAD LINKS — combines all sources
     // ========================================================================
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        CineJoyDebug.log("loadLinks", "start data=$data")
+        val p = parseUrl(data) ?: return false
+        var found = false
 
-        // Attempt 1: direct API (site may return JSON)
-        try {
-            val resp = app.get(data, headers = baseHeaders, referer = "$mainUrl/")
-            CineJoyDebug.log("loadLinks", "direct response: ${resp.text.take(300)}")
-
-            if (resp.text.trimStart().startsWith("{")) {
-                val api = resp.parsedSafe<CineJoyResponse>()
-                if (api != null && api.code != 2004 && !api.url.isNullOrBlank()) {
-                    CineJoyDebug.log("loadLinks", "direct API returned url=${api.url}")
-                    callback.invoke(
-                        newExtractorLink(name, name, api.url,
-                            if (api.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = "$mainUrl/"
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                    return true
+        // VidLove: 7 variants mapped to CineJoy server names
+        val vlVariants = listOf(
+            "" to "Nebula",
+            "&sources=warden" to "Solara",
+            "&sources=moviebox" to "Lisbon 4K",
+            "&sources=vidapi" to "Athens",
+            "&sources=moviebox2" to "MovieBox 2",
+            "&sources=cinefreak" to "PEKKA",
+            "&sources=ipcloud" to "IPCloud",
+        )
+        for ((suffix, label) in vlVariants) {
+            val s = vidloveStream(p.type, p.id, p.s, p.e, suffix) ?: continue
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = "CineJoy $label - ${s.label}",
+                    url = s.url,
+                    type = if (s.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                ) {
+                    this.referer = vidloveReferer
+                    this.quality = Qualities.Unknown.value
                 }
-                CineJoyDebug.log("loadLinks", "direct API unusable (code=${api?.code})")
-            }
-        } catch (e: Exception) {
-            CineJoyDebug.logError("loadLinks", "direct attempt exception", e)
-        }
-
-        // Attempt 2: WebView capture
-        CineJoyDebug.log("loadLinks", "fallback to WebView")
-        try {
-            val resolver = WebViewResolver(
-                interceptUrl = Regex("""(?i)(\.m3u8|/hls/|workers\.dev|/stream/)"""),
-                useOkhttp = false,
-                script = """
-                    (function(){
-                      var n = 0;
-                      var t = setInterval(function(){
-                        n++;
-                        try {
-                          document.querySelectorAll('video, audio').forEach(function(el){
-                            el.muted = true;
-                            var p = el.play();
-                            if (p && p.catch) p.catch(function(){});
-                          });
-                          document.querySelectorAll('button, [data-play]').forEach(function(b){
-                            try { b.click(); } catch (e) {}
-                          });
-                        } catch (e) {}
-                        if (n > 25) clearInterval(t);
-                      }, 1000);
-                    })();
-                """.trimIndent(),
-                scriptCallback = { },
-                timeout = 30_000L
             )
-
-            val response = app.get(data, headers = baseHeaders, referer = "$mainUrl/", interceptor = resolver)
-            val streamUrl = response.url
-            CineJoyDebug.log("loadLinks", "WebView captured: $streamUrl")
-
-            if (streamUrl.contains(".m3u8")) {
-                callback.invoke(
-                    newExtractorLink(name, name, streamUrl, ExtractorLinkType.M3U8) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.Unknown.value
-                        this.headers = baseHeaders
-                    }
-                )
-                CineJoyDebug.log("loadLinks", "SUCCESS via WebView")
-                return true
+            for ((lang, subUrl) in s.subs) {
+                subtitleCallback.invoke(newSubtitleFile(url = subUrl, lang = lang))
             }
-            CineJoyDebug.logError("loadLinks", "WebView did not capture m3u8")
-        } catch (e: Exception) {
-            CineJoyDebug.logError("loadLinks", "WebView exception", e)
+            found = true
         }
 
-        CineJoyDebug.logError("loadLinks", "FAILED — no links found")
-        CineJoyDebug.dumpToClipboard(auto = true, reason = "loadLinks found no playable link")
-        return false
+        // VidRock
+        val vr = vidrockStreams(p.type, p.id, p.s, p.e)
+        for (s in vr) {
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = "CineJoy ${s.label}",
+                    url = s.url,
+                    type = if (s.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                ) {
+                    this.referer = "$vidrockBase/"
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            found = true
+        }
+
+        return found
     }
 }
