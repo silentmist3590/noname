@@ -1,5 +1,5 @@
 cloudstream {
-    version = 13
+    version = 14
     language = "en"
     description = "CineJoy (cinejoy.to) - Movies & TV series"
     authors = listOf("TJ-Plugins")
