@@ -52,7 +52,7 @@ class CineFreakProvider : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val indexApi = "https://search.yagaverse.net/api/search"
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    private val version = 15
+    private val version = 17
     private val defaultTsKey = "0x4AAAAAAFUUpvP7IaTI_12V"
 
     // ───────────────────────── log + clipboard ─────────────────────────
@@ -647,8 +647,9 @@ class CineFreakProvider : MainAPI() {
         label: String,
         quality: Int,
         headers: Map<String, String>,
-        callback: (ExtractorLink) -> Unit
-    ) {
+        callback: (ExtractorLink) -> Unit,
+        fixedHeaders: Map<String, String>? = null
+    ): Map<String, String> {
         val type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
         val origin = runCatching { URI(referer).let { "${it.scheme}://${it.host}" } }.getOrDefault(mainUrl)
         d.log("LINK $label type=$type len=${url.length} url=${url.take(110)}...")
@@ -662,9 +663,11 @@ class CineFreakProvider : MainAPI() {
             "cinefreak" to (mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl, "User-Agent" to userAgent) + ck),
             "không-referer-không-cookie" to mapOf("User-Agent" to userAgent)
         )
-        var chosen: Map<String, String>? = null
-        for ((tag, h) in variants) {
-            if (probe(d, tag, url, h)) { chosen = h; d.log("   -> dùng header kiểu '$tag'"); break }
+        var chosen: Map<String, String>? = fixedHeaders
+        if (chosen == null) {
+            for ((tag, h) in variants) {
+                if (probe(d, tag, url, h)) { chosen = h; d.log("   -> dùng header kiểu '$tag'"); break }
+            }
         }
         if (chosen == null) {
             d.log("   -> không kiểu nào probe được, vẫn phát với header gốc")
@@ -678,6 +681,7 @@ class CineFreakProvider : MainAPI() {
                 this.headers = use
             }
         )
+        return use
     }
 
     /** Lấy name=value từ các header Set-Cookie của một phản hồi. */
@@ -758,30 +762,57 @@ class CineFreakProvider : MainAPI() {
                 return false
             }
 
-            val resolutionNodes = root.path("resolutions")
-            var quality = 0
-            for (i in 0 until resolutionNodes.size()) {
-                val item = resolutionNodes[i]
-                if (item.path("url").asText() == videoUrl) {
-                    quality = firstInt(item.path("quality").asText("")) ?: 0
-                    break
-                }
-            }
+            val cookieHeader = jar.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            val baseHeaders = mapOf("Referer" to url, "User-Agent" to userAgent) +
+                (if (cookieHeader.isNotEmpty()) mapOf("Cookie" to cookieHeader) else emptyMap())
+
+            // ── phụ đề ──
             val subtitles = root.path("subtitleTracks")
+            d.log("C1) subtitleTracks=${subtitles.toString().replace(Regex("\"url\":\"([^\"]{0,70})[^\"]*\""), "\"url\":\"$1...\"").take(500)}")
+            val subHeaders = baseHeaders
+            val seenSub = HashSet<String>()
             for (i in 0 until subtitles.size()) {
                 val item = subtitles[i]
-                val subtitleUrl = absolute(item.path("url").asText(""), url)
-                if (subtitleUrl.isNotBlank()) {
-                    subtitleCallback(SubtitleFile(item.path("language").asText("en"), subtitleUrl))
+                val subUrl = absolute(item.path("url").asText(""), url)
+                if (subUrl.isBlank() || !seenSub.add(subUrl)) continue
+                val code = item.path("language").asText("").ifBlank { item.path("lang").asText("") }
+                val label = item.path("label").asText("").ifBlank {
+                    java.util.Locale.getAvailableLocales().firstOrNull { l ->
+                        runCatching { l.isO3Language.equals(code, true) }.getOrDefault(false) || l.language.equals(code, true)
+                    }?.displayLanguage?.takeIf { it.isNotBlank() } ?: code.ifBlank { "Subtitle" }
+                }
+                runCatching {
+                    subtitleCallback(newSubtitleFile(label, subUrl) { this.headers = subHeaders })
+                }.onFailure {
+                    d.err("newSubtitleFile", it)
+                    runCatching { subtitleCallback(SubtitleFile(label, subUrl)) }
+                }
+                d.log("C1) phụ đề: $label -> ${subUrl.take(90)}")
+            }
+
+            // ── tất cả độ phân giải ──
+            val list = ArrayList<Pair<String, Int>>() // url, quality
+            val resolutionNodes = root.path("resolutions")
+            for (i in 0 until resolutionNodes.size()) {
+                val item = resolutionNodes[i]
+                val u = absolute(item.path("url").asText(""), url)
+                if (u.isNotBlank() && list.none { it.first == u }) {
+                    list.add(u to (firstInt(item.path("quality").asText("")) ?: 0))
                 }
             }
-            val cookieHeader = jar.entries.joinToString("; ") { "${it.key}=${it.value}" }
-            emit(
-                d, videoUrl, url, "Vidzer${if (quality > 0) " ${quality}p" else ""}", quality,
-                mapOf("Referer" to url, "User-Agent" to userAgent) +
-                    (if (cookieHeader.isNotEmpty()) mapOf("Cookie" to cookieHeader) else emptyMap()),
-                callback
-            )
+            if (list.none { it.first == videoUrl }) list.add(0, videoUrl to 0)
+            list.sortByDescending { it.second }
+            d.log("C1) ${list.size} độ phân giải: ${list.map { it.second }}")
+
+            val hevcSet = HashSet<String>()
+            root.path("hevc").forEach { hevcSet.add(it.asText("")) }
+            var quality = 0
+            var chosenHeaders: Map<String, String>? = null
+            for ((u, q) in list) {
+                if (quality == 0) quality = q
+                val label = "Vidzer${if (q > 0) " ${q}p" else ""}${if (u in hevcSet) " HEVC" else ""}"
+                chosenHeaders = emit(d, u, url, label, q, baseHeaders, callback, chosenHeaders)
+            }
             d.log("C1) OK quality=$quality url=${videoUrl.take(120)}")
             return true
         } catch (e: Throwable) {
