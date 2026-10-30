@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
+import java.util.zip.GZIPInputStream
 import java.util.Date
 import java.util.Locale
 import javax.crypto.Cipher
@@ -316,25 +317,42 @@ class MoviesHubProvider : MainAPI() {
     }
 
     /**
-     * response v2: {v:2, n, d}; d = base64url(iv[12] | ciphertext | tag[16]),
-     * key = SHA-256("<n>|" + secret). GCM = CTR bắt đầu từ counter 2 (bỏ qua kiểm tra tag).
+     * Giải mã AES-256-GCM (bỏ qua kiểm tra tag): raw = iv[12] | ciphertext | tag[16],
+     * key = SHA-256(keyMaterial). GCM = CTR bắt đầu từ counter 2.
      */
-    private fun vnDecryptV2(d: String, n: String): String {
-        val raw = Base64.decode(d, Base64.URL_SAFE)
-        val iv = raw.copyOfRange(0, 12)
-        val ct = raw.copyOfRange(12, raw.size - 16)
-        val key = MessageDigest.getInstance("SHA-256").digest("$n|$vnSecret".toByteArray(Charsets.UTF_8))
-        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-        cipher.init(
-            Cipher.DECRYPT_MODE,
-            SecretKeySpec(key, "AES"),
-            IvParameterSpec(iv + byteArrayOf(0, 0, 0, 2))
-        )
-        return String(cipher.doFinal(ct), Charsets.UTF_8)
+    private fun vnDecryptRaw(raw: ByteArray, keyMaterial: String): String? {
+        return try {
+            if (raw.size < 29) return null
+            val iv = raw.copyOfRange(0, 12)
+            val ct = raw.copyOfRange(12, raw.size - 16)
+            val key = MessageDigest.getInstance("SHA-256").digest(keyMaterial.toByteArray(Charsets.UTF_8))
+            val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                IvParameterSpec(iv + byteArrayOf(0, 0, 0, 2))
+            )
+            String(cipher.doFinal(ct), Charsets.UTF_8)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** response v2: {v:2, n, d}; d = base64url(iv | ct | tag), key = SHA-256("<n>|" + secret) */
+    private fun vnDecryptV2(d: String, n: String): String? =
+        vnDecryptRaw(Base64.decode(d, Base64.URL_SAFE), "$n|$vnSecret")
+
+    private fun hex(b: ByteArray, n: Int = 40): String =
+        b.take(n).joinToString("") { "%02x".format(it) }
+
+    private fun looksJson(t: String?): Boolean {
+        val x = t?.trimStart('\uFEFF', ' ', '\n', '\r', '\t') ?: return false
+        return x.startsWith("{") || x.startsWith("[")
     }
 
     private suspend fun vnFetch(provPath: String, path: String): JsonNode? {
-        val url = "$vnApi/$provPath$path?_n=${vnNonce()}"
+        val nonce = vnNonce()
+        val url = "$vnApi/$provPath$path?_n=$nonce"
         return try {
             val res = app.get(
                 url,
@@ -349,10 +367,32 @@ class MoviesHubProvider : MainAPI() {
                 HubLog.log("vn", "$provPath HTTP ${res.code}")
                 return null
             }
-            val j = mapper.readTree(res.text) ?: return null
+            // đọc byte thô: response có thể là nhị phân, không được đọc bằng text
+            var data = res.body.bytes()
+            HubLog.log(
+                "vn",
+                "$provPath HTTP ${res.code} type=${res.headers["content-type"]} enc=${res.headers["content-encoding"]} " +
+                    "len=${data.size} head=${hex(data)}"
+            )
+            if (data.size > 2 && data[0] == 0x1f.toByte() && data[1] == 0x8b.toByte()) {
+                data = GZIPInputStream(data.inputStream()).readBytes()
+            }
+
+            var text: String? = String(data, Charsets.UTF_8)
+            if (!looksJson(text)) {
+                // Thử: body nhị phân thô = iv|ct|tag, khóa từ nonce mình đã gửi
+                text = vnDecryptRaw(data, "$nonce|$vnSecret")
+                if (looksJson(text)) HubLog.log("vn", "$provPath: giải mã nhị phân bằng nonce thành công")
+            }
+            if (!looksJson(text)) {
+                HubLog.log("vn", "$provPath: không nhận ra định dạng response")
+                return null
+            }
+
+            val j = mapper.readTree(text) ?: return null
             val out: JsonNode? = when {
                 j.get("v")?.asInt() == 2 && j.get("d")?.isTextual == true ->
-                    mapper.readTree(vnDecryptV2(j.get("d").asText(), j.str("n") ?: ""))
+                    vnDecryptV2(j.get("d").asText(), j.str("n") ?: "")?.let { mapper.readTree(it) }
                 j.get("encrypted")?.asBoolean() == true && j.get("data")?.isTextual == true ->
                     mapper.readTree(vnDecode(j.get("data").asText()))
                 else -> j
