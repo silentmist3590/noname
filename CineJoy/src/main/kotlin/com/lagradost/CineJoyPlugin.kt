@@ -12,20 +12,23 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import org.json.JSONObject
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 // ============================================================================
-// LOG BUFFER + AUTO-COPY CLIPBOARD
+// LOG + CLIPBOARD
 // ============================================================================
 object CJLog {
-    private const val MAX_LINES = 300
-    private const val RATE_LIMIT_MS = 2000L
+    private const val MAX_LINES = 350
+    private const val RATE_LIMIT_MS = 1500L
 
     private val buffer = mutableListOf<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
@@ -33,7 +36,20 @@ object CJLog {
     @Volatile private var lastCopyAt = 0L
     @Volatile private var ctx: Context? = null
 
-    fun attachContext(c: Context) { ctx = c.applicationContext }
+    fun attachContext(c: Context) {
+        ctx = c.applicationContext
+        println("[CineJoy][clipboard] ctx attached=${ctx != null}")
+    }
+
+    private fun getCtx(): Context? {
+        ctx?.let { return it }
+        // Fallback: reflection on App.getAppContext()
+        return try {
+            val c = Class.forName("com.lagradost.cloudstream3.App")
+                .getMethod("getAppContext").invoke(null) as? Context
+            c?.applicationContext
+        } catch (_: Throwable) { null }
+    }
 
     @Synchronized fun clear() { buffer.clear() }
 
@@ -56,17 +72,17 @@ object CJLog {
 
     @Synchronized
     fun copyToClipboard(reason: String, force: Boolean = false) {
-        val c = ctx ?: run {
-            println("[CineJoy][clipboard][ERR] no context attached")
+        println("[CineJoy][clipboard] called reason=$reason force=$force hasCtx=${getCtx() != null} lines=${buffer.size}")
+        val c = getCtx() ?: run {
+            println("[CineJoy][clipboard][ERR] no context")
             return
         }
         val now = System.currentTimeMillis()
         if (!force && now - lastCopyAt < RATE_LIMIT_MS) {
-            println("[CineJoy][clipboard] rate limited")
+            println("[CineJoy][clipboard] rate limited (${now - lastCopyAt}ms < ${RATE_LIMIT_MS}ms)")
             return
         }
         lastCopyAt = now
-
         try {
             val header = buildString {
                 appendLine("=== CineJoy Debug Log ===")
@@ -81,13 +97,8 @@ object CJLog {
             val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("CineJoy log", fullText))
 
-            Toast.makeText(
-                c,
-                "⚠ CineJoy log copied (${buffer.size} lines) — paste into chat",
-                Toast.LENGTH_LONG
-            ).show()
-
-            println("[CineJoy][clipboard] copied ${buffer.size} lines (reason: $reason)")
+            Toast.makeText(c, "⚠ CineJoy log copied (${buffer.size} lines) — paste in chat", Toast.LENGTH_LONG).show()
+            println("[CineJoy][clipboard] SUCCESS copied ${buffer.size} lines")
         } catch (e: Throwable) {
             println("[CineJoy][clipboard][ERR] failed: ${e.message}")
         }
@@ -95,7 +106,7 @@ object CJLog {
 }
 
 // ============================================================================
-// PLUGIN ENTRY
+// PLUGIN
 // ============================================================================
 @CloudstreamPlugin
 class CineJoyPlugin : Plugin() {
@@ -105,9 +116,6 @@ class CineJoyPlugin : Plugin() {
     }
 }
 
-// ============================================================================
-// PROVIDER
-// ============================================================================
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
     override var name = "CineJoy"
@@ -117,9 +125,9 @@ class CineJoyProvider : MainAPI() {
 
     private val mapper = jacksonObjectMapper()
 
+    // ── Config ──
     private val tmdbKey = "8476a7ab80ad76f0936744df0430e67c"
     private val tmdbFallbackKey = "439c478a771f35c05022f9feabcca01c"
-
     private val imgProxy = "https://wsrv.nl/?url="
 
     private val tmdbDirectDomains = listOf(
@@ -130,17 +138,43 @@ class CineJoyProvider : MainAPI() {
         "https://vidora-tmdb.wwmm.date",
     )
 
-    private val corsProxies: List<(String) -> String> = listOf(
+    private val tmdbProxies: List<(String) -> String> = listOf(
         { url -> "https://cinejoytv.fun/relay?url=${URLEncoder.encode(url, "UTF-8")}" },
-        { url -> "https://cors.eu.org/$url" },
         { url -> "https://api.codetabs.com/v1/proxy/?quest=${URLEncoder.encode(url, "UTF-8")}" },
         { url -> "https://api.allorigins.win/raw?url=${URLEncoder.encode(url, "UTF-8")}" },
+        { url -> "https://cors.eu.org/$url" },
+        { url -> "https://corsproxy.io/?url=${URLEncoder.encode(url, "UTF-8")}" },
+    )
+
+    private val apiProxies: List<(String) -> String> = listOf(
+        { url -> "https://api.codetabs.com/v1/proxy/?quest=${URLEncoder.encode(url, "UTF-8")}" },
+        { url -> "https://api.allorigins.win/raw?url=${URLEncoder.encode(url, "UTF-8")}" },
+        { url -> "https://cors.eu.org/$url" },
+        { url -> "https://corsproxy.io/?url=${URLEncoder.encode(url, "UTF-8")}" },
     )
 
     private val vidloveBase = "https://api.vidlove.cc"
     private val vidloveReferer = "https://player.vidlove.cc/"
     private val vidrockBase = "https://vidrock.net"
     private val vidrockKeyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
+
+    // NxSha aggregator
+    private val nxBase = "https://nxsha.space"
+    private val nxPass = "f4488ab4da401203d23baa129fc546153898162524635d6776826d0c867ccaa3"
+    private val nxProviders = setOf(
+        "rive-citadel", "mhbox", "awsind", "nitro", "watchout", "castle",
+        "vidapi", "hdhub4u", "stvv", "holly", "bkl-blast", "rive-primevids",
+        "streamflix", "rive-flowcast", "rive-quasar", "ophm", "rive-guru",
+    )
+    private val nxPreferred = listOf("nitro", "mhbox", "vidapi", "rive-guru", "rive-citadel", "castle")
+    private val nxPretty = mapOf(
+        "nitro" to "Nitro", "mhbox" to "MhPly", "rive-citadel" to "Citadel",
+        "awsind" to "AwsPly", "watchout" to "Watchout", "castle" to "CastVid",
+        "vidapi" to "VidPi", "hdhub4u" to "HDHub", "stvv" to "Stvvid",
+        "holly" to "Lolly", "bkl-blast" to "MbBlast", "rive-primevids" to "Prvibd",
+        "streamflix" to "StremFx", "rive-flowcast" to "River", "rive-quasar" to "Kutti",
+        "ophm" to "Ophm", "rive-guru" to "Gbru",
+    )
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -156,89 +190,83 @@ class CineJoyProvider : MainAPI() {
         "/movie/now_playing" to "In Theaters",
     )
 
-    // ========================================================================
-    // GENERIC CORS FETCH (used by TMDB, VidLove, VidRock)
-    // ========================================================================
-    private suspend fun corsFetch(url: String, referer: String?, tag: String): String? {
-        // Strategy 1: direct
-        try {
-            val headers = mutableMapOf(
-                "User-Agent" to userAgent,
-                "Accept" to "application/json, text/plain, */*",
-            )
-            if (referer != null) headers["Referer"] = referer
-            val text = app.get(url, headers = headers, referer = referer).text
-            if (text.isNotBlank()) {
-                CJLog.log(tag, "direct OK (${text.length}b)")
-                return text
+    // ================================================================
+    // GENERIC FETCH WITH PROXY FALLBACK
+    // ================================================================
+    private suspend fun fetchWithFallback(
+        url: String,
+        tag: String,
+        proxyList: List<(String) -> String>,
+    ): String? {
+        suspend fun tryGet(u: String): String? = try {
+            val text = app.get(
+                u,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "application/json, text/plain, */*",
+                    "Accept-Language" to "en-US,en;q=0.9",
+                )
+            ).text
+            if (text.isBlank()) null
+            else {
+                val t = text.trimStart()
+                if (t.startsWith("<") || t.startsWith("Forbidden") || t.startsWith("Access Denied") || t.startsWith("Not Found")) null
+                else text
             }
         } catch (e: Exception) {
-            CJLog.log(tag, "direct fail: ${e.message}")
+            CJLog.log(tag, "tryGet fail: ${e.message}")
+            null
         }
 
-        // Strategy 2: CORS proxies
-        for ((i, buildProxy) in corsProxies.withIndex()) {
-            try {
-                val text = app.get(
-                    buildProxy(url),
-                    headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json, text/plain, */*"),
-                ).text
-                if (text.isNotBlank()) {
-                    CJLog.log(tag, "proxy#$i OK (${text.length}b)")
-                    return text
-                }
-            } catch (e: Exception) {
-                CJLog.log(tag, "proxy#$i fail: ${e.message}")
+        tryGet(url)?.let { CJLog.log(tag, "direct OK (${it.length}b)"); return it }
+        for ((i, build) in proxyList.withIndex()) {
+            tryGet(build(url))?.let {
+                CJLog.log(tag, "proxy#$i OK (${it.length}b)")
+                return it
             }
         }
-        CJLog.logErr(tag, "ALL SOURCES FAILED for ${url.take(100)}")
+        CJLog.logErr(tag, "ALL FAILED for ${url.take(80)}")
         return null
     }
 
-    // ========================================================================
+    // ================================================================
     // TMDB
-    // ========================================================================
+    // ================================================================
     private suspend fun tmdbGet(path: String, useFallback: Boolean = false): JsonNode? {
         val key = if (useFallback) tmdbFallbackKey else tmdbKey
-        val normalizedPath = when {
-            path.startsWith("/3/") || path.startsWith("/3?") -> path
-            else -> "/3$path"
-        }
-        val sep = if (normalizedPath.contains("?")) "&" else "?"
-        val fullPath = "$normalizedPath${sep}api_key=$key"
+        val normalized = if (path.startsWith("/3/") || path.startsWith("/3?")) path else "/3$path"
+        val sep = if (normalized.contains("?")) "&" else "?"
+        val full = "$normalized${sep}api_key=$key"
 
-        // Direct domains
         for (base in tmdbDirectDomains) {
             try {
                 val text = app.get(
-                    "$base$fullPath",
+                    "$base$full",
                     headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
-                    referer = null
                 ).text
                 if (text.isBlank() || !text.trimStart().startsWith("{")) continue
                 val j = mapper.readTree(text)
-                val status = j.get("status_code")?.asInt()
-                if (status != null && status != 0) {
-                    if (!useFallback && (status == 7 || status == 3)) return tmdbGet(path, true)
+                val st = j.get("status_code")?.asInt()
+                if (st != null && st != 0) {
+                    if (!useFallback && (st == 7 || st == 3)) return tmdbGet(path, true)
                     continue
                 }
                 return j
             } catch (_: Exception) { }
         }
 
-        // CORS
-        val targetUrl = "https://api.themoviedb.org$fullPath"
-        for (buildProxy in corsProxies) {
+        val target = "https://api.themoviedb.org$full"
+        for ((i, build) in tmdbProxies.withIndex()) {
             try {
                 val text = app.get(
-                    buildProxy(targetUrl),
+                    build(target),
                     headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
-                    referer = null
                 ).text
                 if (text.isBlank() || !text.trimStart().startsWith("{")) continue
                 val j = mapper.readTree(text)
-                val status = j.get("status_code")?.asInt()
-                if (status != null && status != 0) continue
+                val st = j.get("status_code")?.asInt()
+                if (st != null && st != 0) continue
+                CJLog.log("tmdb-proxy", "proxy#$i OK")
                 return j
             } catch (_: Exception) { }
         }
@@ -251,47 +279,38 @@ class CineJoyProvider : MainAPI() {
     private fun JsonNode.s(k: String): String? =
         get(k)?.takeIf { !it.isNull && !it.isContainerNode }?.asText()?.takeIf { it.isNotBlank() }
 
-    private fun proxyImg(originalUrl: String): String =
-        "$imgProxy${URLEncoder.encode(originalUrl, "UTF-8")}"
-
+    private fun proxyImg(u: String): String = "$imgProxy${URLEncoder.encode(u, "UTF-8")}"
     private fun poster(path: String?, size: String = "w500"): String? =
         if (path != null) proxyImg("https://image.tmdb.org/t/p/$size$path") else null
 
-    private fun yearOf(date: String?): Int? =
-        if (date == null || date.length < 4) null else date.take(4).toIntOrNull()
+    private fun yearOf(d: String?): Int? = if (d == null || d.length < 4) null else d.take(4).toIntOrNull()
 
-    private fun mediaTypeOf(r: JsonNode): String {
+    private fun mediaType(r: JsonNode): String {
         val mt = r.s("media_type")
         if (mt == "movie" || mt == "tv") return mt
         return if (r.get("first_air_date") != null || r.get("name") != null) "tv" else "movie"
     }
 
-    private fun scoreFrom10(r: JsonNode): Score? {
+    private fun score10(r: JsonNode): Score? {
         val v = r.get("vote_average")?.asDouble() ?: return null
-        if (v <= 0) return null
-        return Score.from10(v)
+        return if (v <= 0) null else Score.from10(v)
     }
 
     private fun tmdbToSearch(r: JsonNode): SearchResponse? {
         val id = r.get("id")?.asInt() ?: return null
-        val type = mediaTypeOf(r)
+        val type = mediaType(r)
         val title = r.s("title") ?: r.s("name") ?: return null
         val url = """{"type":"$type","id":$id}"""
         val posterUrl = poster(r.s("poster_path"))
         val year = yearOf(r.s("release_date") ?: r.s("first_air_date"))
-        val score = scoreFrom10(r)
-
+        val score = score10(r)
         return if (type == "tv") {
             newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
-                this.posterUrl = posterUrl
-                this.year = year
-                this.score = score
+                this.posterUrl = posterUrl; this.year = year; this.score = score
             }
         } else {
             newMovieSearchResponse(title, url, TvType.Movie) {
-                this.posterUrl = posterUrl
-                this.year = year
-                this.score = score
+                this.posterUrl = posterUrl; this.year = year; this.score = score
             }
         }
     }
@@ -300,59 +319,47 @@ class CineJoyProvider : MainAPI() {
         CJLog.clear()
         val items = mutableListOf<SearchResponse>()
         val json = tmdbGet("${request.data}?page=$page")
-        val results = json?.get("results")
-        if (results != null && results.isArray) {
-            for (r in results) tmdbToSearch(r)?.let { items.add(it) }
-        }
+        json?.get("results")?.let { if (it.isArray) for (r in it) tmdbToSearch(r)?.let { s -> items.add(s) } }
         CJLog.log("main", "${request.name}: ${items.size} items")
-
         if (items.isEmpty()) {
-            CJLog.logErr("main", "EMPTY RESULT for ${request.name}")
-            CJLog.copyToClipboard("getMainPage empty for ${request.name}")
+            CJLog.logErr("main", "EMPTY ${request.name}")
+            CJLog.copyToClipboard("getMainPage empty ${request.name}", force = true)
         }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Manual trigger
         if (query.trim().equals("!log", ignoreCase = true)) {
-            CJLog.copyToClipboard("manual trigger via search", force = true)
+            CJLog.copyToClipboard("manual trigger", force = true)
             return emptyList()
         }
-
         CJLog.clear()
         if (query.isBlank()) return emptyList()
         val q = URLEncoder.encode(query, "UTF-8")
-        val json = tmdbGet("/search/multi?query=$q&page=1&include_adult=false")
-        val results = json?.get("results") ?: return emptyList()
+        val json = tmdbGet("/search/multi?query=$q&page=1&include_adult=false") ?: return emptyList()
+        val results = json.get("results") ?: return emptyList()
         val out = mutableListOf<SearchResponse>()
-        for (r in results) {
-            val mt = r.s("media_type")
-            if (mt != "movie" && mt != "tv") continue
+        if (results.isArray) for (r in results) {
+            if (r.s("media_type") !in listOf("movie", "tv")) continue
             tmdbToSearch(r)?.let { out.add(it) }
         }
         CJLog.log("search", "query=$query: ${out.size} items")
         return out
     }
 
-    // ========================================================================
+    // ================================================================
     // LOAD
-    // ========================================================================
+    // ================================================================
     private data class ParsedUrl(val type: String, val id: Int, val s: Int, val e: Int)
 
-    private fun parseUrl(url: String): ParsedUrl? {
-        return try {
-            val json = mapper.readTree(url)
-            val type = json.s("type") ?: return null
-            val id = json.get("id")?.asInt() ?: return null
-            val s = json.get("s")?.asInt() ?: 1
-            val e = json.get("e")?.asInt() ?: 1
-            ParsedUrl(type, id, s, e)
-        } catch (e: Exception) { null }
-    }
+    private fun parseUrl(url: String): ParsedUrl? = try {
+        val j = mapper.readTree(url)
+        val type = j.s("type") ?: return null
+        val id = j.get("id")?.asInt() ?: return null
+        ParsedUrl(type, id, j.get("s")?.asInt() ?: 1, j.get("e")?.asInt() ?: 1)
+    } catch (_: Exception) { null }
 
-    private fun fixEpisode(e: Int): Int =
-        if (e >= 800) (e % 100) + 1 + ((e / 100) - 8) * 2 else e
+    private fun fixEp(e: Int): Int = if (e >= 800) (e % 100) + 1 + ((e / 100) - 8) * 2 else e
 
     override suspend fun load(url: String): LoadResponse? {
         CJLog.clear()
@@ -361,269 +368,298 @@ class CineJoyProvider : MainAPI() {
 
         return if (p.type == "movie") {
             val d = tmdbGet("/movie/${p.id}") ?: return null
-            val title = d.s("title") ?: "Unknown"
-            val posterUrl = poster(d.s("poster_path"))
-            val backdrop = poster(d.s("backdrop_path"), "w780")
-            val description = d.s("overview")
-            val year = yearOf(d.s("release_date"))
-            val score = scoreFrom10(d)
-            val runtime = d.get("runtime")?.asInt()?.takeIf { it > 0 }
-            val tags = d.get("genres")?.mapNotNull { it.s("name") }
-
-            newMovieLoadResponse(title, url, TvType.Movie, """{"type":"movie","id":${p.id}}""") {
-                this.posterUrl = posterUrl
-                this.backgroundPosterUrl = backdrop
-                this.year = year
-                this.plot = description
-                this.score = score
-                this.duration = runtime
-                this.tags = tags
+            newMovieLoadResponse(d.s("title") ?: "Unknown", url, TvType.Movie, """{"type":"movie","id":${p.id}}""") {
+                this.posterUrl = poster(d.s("poster_path"))
+                this.backgroundPosterUrl = poster(d.s("backdrop_path"), "w780")
+                this.year = yearOf(d.s("release_date"))
+                this.plot = d.s("overview")
+                this.score = score10(d)
+                this.duration = d.get("runtime")?.asInt()?.takeIf { it > 0 }
+                this.tags = d.get("genres")?.mapNotNull { it.s("name") }
             }
         } else {
             val d = tmdbGet("/tv/${p.id}") ?: return null
-            val title = d.s("name") ?: "Unknown"
-            val posterUrl = poster(d.s("poster_path"))
-            val backdrop = poster(d.s("backdrop_path"), "w780")
-            val description = d.s("overview")
-            val year = yearOf(d.s("first_air_date"))
-            val score = scoreFrom10(d)
-            val tags = d.get("genres")?.mapNotNull { it.s("name") }
-
             val episodes = mutableListOf<Episode>()
-            val seasons = d.get("seasons")
-            if (seasons != null && seasons.isArray) {
-                for (s in seasons) {
+            d.get("seasons")?.let { seasons ->
+                if (seasons.isArray) for (s in seasons) {
                     val sn = s.get("season_number")?.asInt() ?: continue
                     if (sn <= 0) continue
-                    val epCount = s.get("episode_count")?.asInt() ?: 0
-                    if (epCount <= 0) continue
-                    val seasonJson = tmdbGet("/tv/${p.id}/season/$sn")
-                    val eps = seasonJson?.get("episodes")
+                    val cnt = s.get("episode_count")?.asInt() ?: 0
+                    if (cnt <= 0) continue
+                    val sj = tmdbGet("/tv/${p.id}/season/$sn")
+                    val eps = sj?.get("episodes")
                     if (eps != null && eps.isArray) {
                         for (ep in eps) {
                             val en = ep.get("episode_number")?.asInt() ?: continue
-                            val fixed = fixEpisode(en)
+                            val fixed = fixEp(en)
                             episodes.add(newEpisode("""{"type":"tv","id":${p.id},"s":$sn,"e":$fixed}""") {
                                 this.name = ep.s("name") ?: "S${sn}E$fixed"
                                 this.season = sn
                                 this.episode = fixed
                                 this.posterUrl = poster(ep.s("still_path"))
                                 this.description = ep.s("overview")
-                                this.score = scoreFrom10(ep)
+                                this.score = score10(ep)
                             })
                         }
-                    } else {
-                        for (en in 1..epCount) {
-                            episodes.add(newEpisode("""{"type":"tv","id":${p.id},"s":$sn,"e":$en}""") {
-                                this.name = "S${sn}E$en"
-                                this.season = sn
-                                this.episode = en
-                            })
-                        }
-                    }
+                    } else for (en in 1..cnt) episodes.add(newEpisode("""{"type":"tv","id":${p.id},"s":$sn,"e":$en}""") {
+                        this.name = "S${sn}E$en"; this.season = sn; this.episode = en
+                    })
                 }
             }
-
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = posterUrl
-                this.backgroundPosterUrl = backdrop
-                this.year = year
-                this.plot = description
-                this.score = score
-                this.tags = tags
+            newTvSeriesLoadResponse(d.s("name") ?: "Unknown", url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster(d.s("poster_path"))
+                this.backgroundPosterUrl = poster(d.s("backdrop_path"), "w780")
+                this.year = yearOf(d.s("first_air_date"))
+                this.plot = d.s("overview")
+                this.score = score10(d)
+                this.tags = d.get("genres")?.mapNotNull { it.s("name") }
             }
         }
     }
 
-    // ========================================================================
-    // VIDLOVE — uses corsFetch (handles DNS-blocked api.vidlove.cc)
-    // ========================================================================
-    private data class StreamResult(
-        val url: String,
-        val label: String,
-        val subs: List<Pair<String, String>> = emptyList(),
-    )
+    // ================================================================
+    // VIDLOVE
+    // ================================================================
+    private data class Stream(val url: String, val label: String, val subs: List<Pair<String, String>> = emptyList())
 
     private suspend fun vidloveStream(
-        type: String, id: Int, season: Int, episode: Int, suffix: String, variantLabel: String
-    ): StreamResult? {
-        val path = if (type == "tv") {
-            "/tv?id=$id&season=$season&episode=$episode&mode=json$suffix"
-        } else {
-            "/movie?id=$id&mode=json$suffix"
-        }
-        val text = corsFetch("$vidloveBase$path", vidloveReferer, "vidlove-$variantLabel") ?: return null
-
+        type: String, id: Int, s: Int, e: Int, suffix: String, vLabel: String,
+    ): Stream? {
+        val path = if (type == "tv") "/tv?id=$id&season=$s&episode=$e&mode=json$suffix"
+                   else "/movie?id=$id&mode=json$suffix"
+        val text = fetchWithFallback("$vidloveBase$path", "vidlove-$vLabel", apiProxies) ?: return null
         return try {
-            if (text.trimStart().startsWith("<")) {
-                CJLog.logErr("vidlove-$variantLabel", "returned HTML (Cloudflare block): ${text.take(80)}")
-                return null
-            }
-            val json = mapper.readTree(text)
-
-            // Detect app-level error codes (e.g. 2004)
-            val code = json.get("code")?.asInt()
+            val j = mapper.readTree(text)
+            val code = j.get("code")?.asInt()
             if (code != null && code != 0 && code != 200) {
-                CJLog.log("vidlove-$variantLabel", "error code=$code msg=${json.get("message")?.asText()}")
+                CJLog.log("vidlove-$vLabel", "code=$code msg=${j.get("message")?.asText()}")
                 return null
             }
-            val errMsg = json.get("error")?.asText()
-            if (!errMsg.isNullOrBlank()) {
-                CJLog.log("vidlove-$variantLabel", "error field: $errMsg")
-                return null
-            }
-
-            val src = json.get("source") ?: run {
-                CJLog.log("vidlove-$variantLabel", "no 'source' field. Keys: ${json.fieldNames().asSequence().toList()}")
-                return null
-            }
-            val url = src.s("url") ?: run {
-                CJLog.log("vidlove-$variantLabel", "no 'url' in source")
-                return null
-            }
+            val src = j.get("source") ?: return null
+            val url = src.s("url") ?: return null
             if (!url.startsWith("http")) return null
-
             val quality = parseQuality(src.s("manifest"))
             val subs = mutableListOf<Pair<String, String>>()
-            val subsArr = json.get("subtitles")
-            if (subsArr != null && subsArr.isArray) {
-                for (sub in subsArr) {
-                    val file = sub.s("file") ?: sub.s("url") ?: continue
-                    val lang = sub.s("language") ?: sub.s("label") ?: "en"
-                    subs.add(lang to file)
-                }
-            }
-            StreamResult(url, quality, subs)
+            j.get("subtitles")?.let { if (it.isArray) for (sub in it) {
+                val f = sub.s("file") ?: sub.s("url") ?: continue
+                subs.add((sub.s("language") ?: sub.s("label") ?: "en") to f)
+            } }
+            Stream(url, quality, subs)
         } catch (e: Exception) {
-            CJLog.logErr("vidlove-$variantLabel", "parse fail", e)
+            CJLog.logErr("vidlove-$vLabel", "parse fail", e)
             null
         }
     }
 
-    private fun parseQuality(manifest: String?): String {
-        if (manifest == null) return "Auto"
-        val regex = Regex("RESOLUTION=(\\d+)x(\\d+)")
-        var maxH = 0
-        for (m in regex.findAll(manifest)) {
-            val h = m.groupValues[2].toIntOrNull() ?: continue
-            if (h > maxH) maxH = h
+    private fun parseQuality(m: String?): String {
+        if (m == null) return "Auto"
+        var max = 0
+        Regex("RESOLUTION=(\\d+)x(\\d+)").findAll(m).forEach {
+            it.groupValues[2].toIntOrNull()?.let { h -> if (h > max) max = h }
         }
         return when {
-            maxH >= 2160 -> "2160p"
-            maxH >= 1080 -> "1080p"
-            maxH >= 720 -> "720p"
-            maxH >= 480 -> "480p"
-            maxH > 0 -> "${maxH}p"
-            else -> "Auto"
+            max >= 2160 -> "2160p"; max >= 1080 -> "1080p"
+            max >= 720 -> "720p"; max >= 480 -> "480p"
+            max > 0 -> "${max}p"; else -> "Auto"
         }
     }
 
-    // ========================================================================
-    // VIDROCK — uses corsFetch for API
-    // ========================================================================
-    private fun hexToBytes(hex: String): ByteArray =
-        ByteArray(hex.length / 2) { i ->
-            ((hex[i * 2].digitToInt(16) shl 4) or hex[i * 2 + 1].digitToInt(16)).toByte()
-        }
+    // ================================================================
+    // VIDROCK
+    // ================================================================
+    private fun hexBytes(h: String): ByteArray =
+        ByteArray(h.length / 2) { i -> ((h[i * 2].digitToInt(16) shl 4) or h[i * 2 + 1].digitToInt(16)).toByte() }
 
-    private fun b64UrlToStd(s: String): String {
+    private fun b64Url(s: String): String {
         var r = s.replace('-', '+').replace('_', '/')
         while (r.length % 4 != 0) r += "="
         return r
     }
 
-    private fun vidrockDecrypt(token: String): String? {
-        return try {
-            val std = b64UrlToStd(token)
-            if (std.length < 20) return null
+    private fun vidrockDec(token: String): String? = try {
+        val std = b64Url(token)
+        if (std.length < 20) null else {
             val iv = Base64.decode(std.substring(0, 16), Base64.DEFAULT)
             val data = Base64.decode(std.substring(16), Base64.DEFAULT)
-            val key = hexToBytes(vidrockKeyHex)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-            String(cipher.doFinal(data), Charsets.UTF_8)
-        } catch (e: Exception) {
-            CJLog.logErr("vidrock", "decrypt failed", e)
-            null
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(hexBytes(vidrockKeyHex), "AES"), GCMParameterSpec(128, iv))
+            String(c.doFinal(data), Charsets.UTF_8)
         }
-    }
+    } catch (e: Exception) { CJLog.logErr("vidrock", "dec fail", e); null }
 
-    private suspend fun vidrockStreams(
-        type: String, id: Int, season: Int, episode: Int
-    ): List<StreamResult> {
-        val path = if (type == "tv") "tv/$id/$season/$episode" else "movie/$id"
-        val text = corsFetch("$vidrockBase/api/$path", "$vidrockBase/", "vidrock-api") ?: return emptyList()
-
+    private suspend fun vidrockStreams(p: ParsedUrl): List<Stream> {
+        val path = if (p.type == "tv") "tv/${p.id}/${p.s}/${p.e}" else "movie/${p.id}"
+        val text = fetchWithFallback("$vidrockBase/api/$path", "vidrock", apiProxies) ?: return emptyList()
         return try {
-            if (text.trimStart().startsWith("<")) {
-                CJLog.logErr("vidrock", "returned HTML: ${text.take(80)}")
-                return emptyList()
-            }
-            val json = mapper.readTree(text)
-            val out = mutableListOf<StreamResult>()
-
-            json.fieldNames().forEach { name ->
-                val s = json.get(name) ?: return@forEach
+            val j = mapper.readTree(text)
+            val out = mutableListOf<Stream>()
+            j.fieldNames().forEach { name ->
+                val s = j.get(name) ?: return@forEach
                 if (!s.isObject) return@forEach
                 val enc = s.s("url")
                 if (enc.isNullOrBlank()) {
-                    CJLog.log("vidrock", "$name: empty url (dead source)")
+                    CJLog.log("vidrock", "$name: empty")
                     return@forEach
                 }
-                val dec = vidrockDecrypt(enc) ?: return@forEach
+                val dec = vidrockDec(enc) ?: return@forEach
                 if (!dec.startsWith("http")) return@forEach
                 val lang = s.s("language") ?: ""
-                val label = name + (if (lang.isNotBlank()) " ($lang)" else "")
-                out.add(StreamResult(dec, label))
+                out.add(Stream(dec, name + (if (lang.isNotBlank()) " ($lang)" else "")))
             }
             out
-        } catch (e: Exception) {
-            CJLog.logErr("vidrock", "parse fail", e)
-            emptyList()
-        }
+        } catch (e: Exception) { CJLog.logErr("vidrock", "parse", e); emptyList() }
     }
 
-    // ========================================================================
-    // M3U8 VALIDATION
-    // ========================================================================
-    private suspend fun isValidM3u8(url: String, referer: String, tag: String): Boolean {
-        return try {
-            val text = app.get(
-                url,
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to referer,
-                    "Accept" to "*/*",
-                    "Range" to "bytes=0-2047",
-                )
-            ).text
-            val ok = text.trimStart().startsWith("#EXTM3U")
-            if (!ok) {
-                val preview = text.take(120).replace("\n", " ").replace("\r", "")
-                CJLog.log("$tag-probe", "NOT m3u8 (${text.length}b): $preview")
+    // ================================================================
+    // NXSHA  (AES-256-CBC with OpenSSL EVP_BytesToKey)
+    // ================================================================
+    private fun nxEvp(pass: ByteArray, salt: ByteArray, keyLen: Int, ivLen: Int): Pair<ByteArray, ByteArray> {
+        val md = MessageDigest.getInstance("MD5")
+        val out = mutableListOf<Byte>()
+        var prev = ByteArray(0)
+        while (out.size < keyLen + ivLen) {
+            md.reset()
+            md.update(prev)
+            md.update(pass)
+            md.update(salt)
+            prev = md.digest()
+            prev.forEach { out.add(it) }
+        }
+        val arr = out.toByteArray()
+        return arr.sliceArray(0 until keyLen) to arr.sliceArray(keyLen until keyLen + ivLen)
+    }
+
+    private fun nxEncode(obj: JSONObject): String {
+        val salt = ByteArray(8).also { java.util.Random().nextBytes(it) }
+        obj.put("_req_ts", System.currentTimeMillis())
+        obj.put("_req_salt", Integer.toHexString((Math.random() * Int.MAX_VALUE).toInt()))
+        val payload = obj.toString().toByteArray(Charsets.UTF_8)
+        val (key, iv) = nxEvp(nxPass.toByteArray(Charsets.UTF_8), salt, 32, 16)
+        val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        val enc = c.doFinal(payload)
+        val combined = "Salted__".toByteArray(Charsets.UTF_8) + salt + enc
+        return Base64.encodeToString(combined, Base64.NO_WRAP or Base64.URL_SAFE).trimEnd('=')
+    }
+
+    private fun nxDecode(b64url: String): JSONObject? = try {
+        var std = b64url.replace('-', '+').replace('_', '/')
+        while (std.length % 4 != 0) std += "="
+        val combined = Base64.decode(std, Base64.DEFAULT)
+        if (combined.size < 17) null else {
+            val salt = combined.sliceArray(8 until 16)
+            val enc = combined.sliceArray(16 until combined.size)
+            val (key, iv) = nxEvp(nxPass.toByteArray(Charsets.UTF_8), salt, 32, 16)
+            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val dec = c.doFinal(enc)
+            val j = JSONObject(String(dec, Charsets.UTF_8))
+            j.remove("_req_ts"); j.remove("_req_salt")
+            j
+        }
+    } catch (e: Exception) {
+        CJLog.logErr("nxsha", "decode fail: ${e.message}")
+        null
+    }
+
+    private suspend fun nxshaSources(p: ParsedUrl): List<Stream> {
+        val out = mutableListOf<Stream>()
+        try {
+            val q1 = nxEncode(JSONObject().apply {
+                put("tmdbId", p.id.toString())
+                put("imdb_id", "")
+                put("type", p.type)
+                put("season", p.s)
+                put("episode", p.e)
+            })
+            val r1 = fetchWithFallback("$nxBase/api/servers?q=$q1", "nxsha-servers", apiProxies) ?: return out
+            val r1Json = JSONObject(r1)
+            val hash = r1Json.optString("_hash")
+            if (hash.isBlank()) { CJLog.log("nxsha", "no hash: ${r1.take(80)}"); return out }
+            val decoded = nxDecode(hash) ?: return out
+            val serversArr = decoded.optJSONArray("servers") ?: return out
+
+            val providers = mutableListOf<Pair<JSONObject, String>>()
+            for (i in 0 until serversArr.length()) {
+                val srv = serversArr.optJSONObject(i) ?: continue
+                val scraper = srv.optString("scraper")
+                if (scraper in nxProviders) providers.add(srv to scraper)
             }
-            ok
-        } catch (e: Exception) {
-            CJLog.log("$tag-probe", "fail: ${e.message}")
-            false
-        }
+            providers.sortBy { (_, sc) -> nxPreferred.indexOf(sc).let { if (it < 0) 999 else it } }
+            CJLog.log("nxsha", "${providers.size} providers (of ${serversArr.length()})")
+
+            for ((srv, scraper) in providers.take(5)) {
+                try {
+                    val q2 = nxEncode(JSONObject().apply {
+                        put("ex_lang", true)
+                        put("provider", scraper)
+                        put("tmdbId", p.id.toString())
+                        put("imdb_id", "")
+                        put("type", p.type)
+                        put("season", p.s)
+                        put("episode", p.e)
+                    })
+                    val r2 = fetchWithFallback("$nxBase/api/sources?q=$q2", "nxsha-$scraper", apiProxies) ?: continue
+                    val r2Json = JSONObject(r2)
+                    val h2 = r2Json.optString("_hash")
+                    if (h2.isBlank()) continue
+                    val dec2 = nxDecode(h2) ?: continue
+                    val srcArr = dec2.optJSONArray("sources") ?: continue
+                    for (j in 0 until srcArr.length()) {
+                        val src = srcArr.optJSONObject(j) ?: continue
+                        val url = src.optString("url")
+                        if (url.isBlank() || !url.startsWith("http")) continue
+                        if (src.optString("type") == "embed") continue
+                        val name = nxPretty[scraper] ?: scraper
+                        val label = src.optString("label").ifBlank { src.optString("quality") }.ifBlank { "multi" }
+                        out.add(Stream(url, "NxSha $name - $label"))
+                    }
+                } catch (e: Exception) { CJLog.log("nxsha-$scraper", "fail: ${e.message}") }
+            }
+        } catch (e: Exception) { CJLog.logErr("nxsha", "sources", e) }
+        return out
     }
 
-    // ========================================================================
-    // LOAD LINKS — only emit VERIFIED streams, trigger clipboard on 0
-    // ========================================================================
-    private data class Candidate(
-        val label: String,
-        val url: String,
-        val referer: String,
-        val headers: Map<String, String>,
-        val verified: Boolean,
+    // ================================================================
+    // M3U8 VALIDATION (browser-like headers)
+    // ================================================================
+    private suspend fun isValidM3u8(url: String, referer: String, tag: String): Boolean = try {
+        val baseOrigin = try { java.net.URI(referer).let { "${it.scheme}://${it.host}" } } catch (_: Exception) { referer }
+        val text = app.get(
+            url,
+            headers = mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to referer,
+                "Origin" to baseOrigin,
+                "Accept" to "*/*",
+                "Accept-Language" to "en-US,en;q=0.9",
+                "Accept-Encoding" to "identity",
+                "Range" to "bytes=0-2047",
+                "Connection" to "keep-alive",
+                "Sec-Fetch-Dest" to "empty",
+                "Sec-Fetch-Mode" to "cors",
+                "Sec-Fetch-Site" to "cross-site",
+            )
+        ).text
+        val ok = text.trimStart().startsWith("#EXTM3U")
+        if (!ok) CJLog.log("$tag-probe", "NOT m3u8 (${text.length}b): ${text.take(80).replace("\n", " ")}")
+        ok
+    } catch (e: Exception) {
+        CJLog.log("$tag-probe", "fail: ${e.message}")
+        false
+    }
+
+    // ================================================================
+    // LOAD LINKS
+    // ================================================================
+    private data class Cand(
+        val label: String, val url: String, val referer: String,
+        val headers: Map<String, String>, val verified: Boolean,
         val subs: List<Pair<String, String>>,
     )
 
     override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
+        data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
@@ -632,103 +668,82 @@ class CineJoyProvider : MainAPI() {
 
         val p = parseUrl(data)
         if (p == null) {
-            CJLog.logErr("loadLinks", "parseUrl failed")
-            CJLog.copyToClipboard("parseUrl failed for $data")
+            CJLog.logErr("loadLinks", "parse fail")
+            CJLog.copyToClipboard("parseUrl fail", force = true)
             return false
         }
         CJLog.log("loadLinks", "type=${p.type} id=${p.id} s=${p.s} e=${p.e}")
 
-        val candidates = mutableListOf<Candidate>()
+        val cands = mutableListOf<Cand>()
 
-        // ── VidLove: 7 variants ──
+        // ── VidLove: 3 variants (reduced from 7 to avoid proxy rate limit) ──
         val vlVariants = listOf(
             "" to "Nebula",
-            "&sources=warden" to "Solara",
             "&sources=moviebox" to "Lisbon",
-            "&sources=vidapi" to "Athens",
-            "&sources=moviebox2" to "MovieBox2",
-            "&sources=cinefreak" to "PEKKA",
-            "&sources=ipcloud" to "IPCloud",
+            "&sources=warden" to "Solara",
         )
-        for ((suffix, label) in vlVariants) {
-            val s = vidloveStream(p.type, p.id, p.s, p.e, suffix, label) ?: continue
-            val verified = isValidM3u8(s.url, vidloveReferer, "vidlove-$label")
-            candidates.add(
-                Candidate(
-                    label = "CineJoy $label - ${s.label}",
-                    url = s.url,
-                    referer = vidloveReferer,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Referer" to vidloveReferer,
-                        "Origin" to "https://player.vidlove.cc",
-                    ),
-                    verified = verified,
-                    subs = s.subs,
-                )
-            )
+        for ((suffix, lbl) in vlVariants) {
+            val s = vidloveStream(p.type, p.id, p.s, p.e, suffix, lbl) ?: continue
+            val ok = isValidM3u8(s.url, vidloveReferer, "vl-$lbl")
+            cands.add(Cand(
+                label = "CineJoy $lbl - ${s.label}", url = s.url,
+                referer = vidloveReferer,
+                headers = mapOf("User-Agent" to userAgent, "Referer" to vidloveReferer, "Origin" to "https://player.vidlove.cc"),
+                verified = ok, subs = s.subs,
+            ))
         }
 
         // ── VidRock ──
-        val vr = vidrockStreams(p.type, p.id, p.s, p.e)
-        for (s in vr) {
-            val verified = isValidM3u8(s.url, "$vidrockBase/", "vidrock-${s.label}")
-            candidates.add(
-                Candidate(
-                    label = "CineJoy ${s.label}",
-                    url = s.url,
-                    referer = "$vidrockBase/",
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Referer" to "$vidrockBase/",
-                    ),
-                    verified = verified,
-                    subs = emptyList(),
-                )
-            )
+        for (s in vidrockStreams(p)) {
+            val ok = isValidM3u8(s.url, "$vidrockBase/", "vr-${s.label}")
+            cands.add(Cand(
+                label = "CineJoy ${s.label}", url = s.url,
+                referer = "$vidrockBase/",
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to "$vidrockBase/",
+                    "Origin" to vidrockBase,
+                ),
+                verified = ok, subs = emptyList(),
+            ))
         }
 
-        val verifiedList = candidates.filter { it.verified }
-        CJLog.log("loadLinks", "candidates=${candidates.size} verified=${verifiedList.size}")
-
-        // Log all rejected candidates for debug
-        for (c in candidates.filter { !it.verified }) {
-            CJLog.logErr("loadLinks", "REJECTED: ${c.label} -> ${c.url.take(80)}")
+        // ── NxSha ──
+        for (s in nxshaSources(p)) {
+            val ok = isValidM3u8(s.url, "$nxBase/", "nx-${s.label.take(20)}")
+            cands.add(Cand(
+                label = s.label, url = s.url,
+                referer = "$nxBase/",
+                headers = mapOf("User-Agent" to userAgent, "Referer" to "$nxBase/", "Origin" to nxBase),
+                verified = ok, subs = s.subs,
+            ))
         }
 
-        // ── Emit only verified streams ──
+        val verified = cands.filter { it.verified }
+        CJLog.log("loadLinks", "candidates=${cands.size} verified=${verified.size}")
+
+        for (c in cands.filter { !it.verified }) {
+            CJLog.logErr("loadLinks", "REJECTED ${c.label} -> ${c.url.take(80)}")
+        }
+
         var found = false
-        for (c in verifiedList) {
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = c.label,
-                    url = c.url,
-                    type = ExtractorLinkType.M3U8,
-                ) {
-                    this.referer = c.referer
-                    this.quality = Qualities.Unknown.value
-                    this.headers = c.headers
-                }
-            )
-            for ((lang, subUrl) in c.subs) {
-                subtitleCallback.invoke(newSubtitleFile(url = subUrl, lang = lang))
-            }
+        for (c in verified) {
+            callback.invoke(newExtractorLink(name, c.label, c.url, ExtractorLinkType.M3U8) {
+                this.referer = c.referer
+                this.quality = Qualities.Unknown.value
+                this.headers = c.headers
+            })
+            for ((lang, sub) in c.subs) subtitleCallback.invoke(newSubtitleFile(url = sub, lang = lang))
             found = true
         }
 
         if (!found) {
-            // Trigger clipboard dump for user to report
-            val reason = when {
-                candidates.isEmpty() -> "0 candidates (all APIs failed — check [vidlove-*]/[vidrock-*] in log)"
-                else -> "0 verified / ${candidates.size} unverified (all URLs returned dead/HTML)"
-            }
+            val reason = if (cands.isEmpty()) "0 candidates (all APIs failed)" else "0 verified / ${cands.size} unverified"
             CJLog.logErr("loadLinks", "FAILED: $reason")
-            CJLog.copyToClipboard("no verified streams — $reason")
+            CJLog.copyToClipboard("no verified — $reason", force = true)
         } else {
-            CJLog.log("loadLinks", "SUCCESS: emitting ${verifiedList.size} verified streams")
+            CJLog.log("loadLinks", "SUCCESS: emitted ${verified.size} streams")
         }
-
         return found
     }
 }
