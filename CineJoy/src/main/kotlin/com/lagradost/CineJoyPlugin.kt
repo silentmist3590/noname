@@ -1,0 +1,147 @@
+package com.lagradost
+
+import android.content.Context
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Element
+
+// ============================================================
+// PLUGIN ENTRY POINT — class có @CloudstreamPlugin PHẢI : Plugin()
+// ============================================================
+@CloudstreamPlugin
+class CineJoyPlugin : Plugin() {
+    override fun load(context: Context) {
+        registerMainAPI(CineJoyProvider())
+    }
+}
+
+// ============================================================
+// PROVIDER — class MainAPI KHÔNG có annotation
+// ============================================================
+class CineJoyProvider : MainAPI() {
+    override var mainUrl = "https://cinejoy.to"
+    private val backupUrl = "https://cinejoy.net"
+
+    override var name = "CineJoy"
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
+    override var lang = "vi"
+    override val hasMainPage = true
+
+    data class CineJoyResponse(
+        @JsonProperty("code") val code: Int?,
+        @JsonProperty("message") val message: String?,
+        @JsonProperty("url") val url: String?,
+        @JsonProperty("status") val status: Boolean?
+    )
+
+    private val baseHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer" to "$mainUrl/",
+        "X-Requested-With" to "XMLHttpRequest"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val document = app.get("$mainUrl/home?page=$page", headers = baseHeaders, referer = "$mainUrl/").document
+        val home = document.select("div.item-movie").mapNotNull { it.toSearchResult() }
+        return newHomePageResponse(request.name, home)
+    }
+
+    private fun Element.toSearchResult(): SearchResponse? {
+        val title = this.selectFirst("h3.title")?.text() ?: return null
+
+        val aTag = this.selectFirst("a") ?: return null
+        val href = fixUrl(aTag.attr("href"))
+
+        val imgTag = this.selectFirst("img")
+        val rawPoster = imgTag?.attr("data-src")?.takeIf { it.isNotBlank() }
+            ?: imgTag?.attr("src") ?: ""
+        val posterUrl = if (rawPoster.isNotBlank()) fixUrl(rawPoster) else null
+
+        return newMovieSearchResponse(title, href, TvType.Movie) {
+            this.posterUrl = posterUrl
+        }
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        val document = app.get(url, headers = baseHeaders, referer = "$mainUrl/").document
+        val title = document.selectFirst("h1.movie-title")?.text() ?: "Không rõ"
+        val description = document.selectFirst("div.description")?.text()
+
+        val posterElement = document.selectFirst("img.poster")
+        val posterSrc = posterElement?.attr("src") ?: ""
+        val poster = if (posterSrc.isNotBlank()) fixUrl(posterSrc) else null
+
+        // Try to parse episodes (for TV series)
+        val episodes = document.select("ul.list-episode li").mapIndexedNotNull { index, element ->
+            val link = element.selectFirst("a")?.attr("href") ?: return@mapIndexedNotNull null
+            if (link.isBlank()) return@mapIndexedNotNull null
+            newEpisode(fixUrl(link)) {
+                this.name = "Tập ${index + 1}"
+                this.episode = index + 1
+            }
+        }
+
+        // Decide Movie vs TvSeries based on presence of episodes
+        return if (episodes.isNotEmpty()) {
+            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.plot = description
+                this.posterUrl = poster
+            }
+        } else {
+            newMovieLoadResponse(title, url, TvType.Movie, url) {
+                this.plot = description
+                this.posterUrl = poster
+            }
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        suspend fun fetchStream(targetUrl: String, serverName: String): Boolean {
+            return try {
+                val response = app.get(targetUrl, headers = baseHeaders, referer = "$mainUrl/")
+                val apiResponse = response.parsedSafe<CineJoyResponse>()
+
+                // Not JSON (probably HTML player page) -> fail
+                if (apiResponse == null) return false
+
+                // API-level error code
+                if (apiResponse.code == 2004) return false
+
+                val streamUrl = apiResponse.url
+                if (streamUrl.isNullOrBlank()) return false
+
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = streamUrl,
+                        type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        var isSuccess = fetchStream(data, "CineJoy - Server chính")
+
+        if (!isSuccess) {
+            val backupDataUrl = data.replace(mainUrl, backupUrl)
+            isSuccess = fetchStream(backupDataUrl, "CineJoy - Server dự phòng")
+        }
+
+        return isSuccess
+    }
+}
