@@ -1,5 +1,5 @@
 // Phiên bản plugin — tăng số này mỗi lần cập nhật để CloudStream nhận bản mới
-version = 7
+version = 8
 
 cloudstream {
     description = "Phim & TV Series từ moviesapi.to (TMDB / IMDb ID)"
