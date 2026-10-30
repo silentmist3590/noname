@@ -27,16 +27,45 @@ class CineJoyProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    // ──────────────────────────────────────────────────────────────────────
+    // CONFIG
+    // ──────────────────────────────────────────────────────────────────────
     private val mapper = jacksonObjectMapper()
+    private fun log(tag: String, msg: String) = println("[CineJoy][$tag] $msg")
+    private fun logErr(tag: String, msg: String, e: Throwable? = null) {
+        println("[CineJoy][$tag][ERR] $msg${if (e != null) " | ${e.message}" else ""}")
+    }
 
+    // TMDB keys (from CineJoy's own JS bundle - both are live)
     private val tmdbKey = "8476a7ab80ad76f0936744df0430e67c"
     private val tmdbFallbackKey = "439c478a771f35c05022f9feabcca01c"
-    private val tmdbBase = "https://api.themoviedb.org/3"
-    private val tmdbImg = "https://image.tmdb.org/t/p"
 
+    // OMDb (optional fallback - leave empty to skip)
+    private val omdbApiKey = ""
+
+    // Image proxy
+    private val imgProxy = "https://wsrv.nl/?url="
+
+    // TMDB direct domains
+    private val tmdbDirectDomains = listOf(
+        "https://api.tmdb.org",
+        "https://api.themoviedb.org",
+        "https://tmdb.demojameson.de5.net",
+        "https://daili.smdhb.com",
+        "https://vidora-tmdb.wwmm.date",
+    )
+
+    // CORS proxies
+    private val tmdbCorsProxies: List<(String) -> String> = listOf(
+        { url -> "https://cors.eu.org/$url" },
+        { url -> "https://api.codetabs.com/v1/proxy/?quest=${URLEncoder.encode(url, "UTF-8")}" },
+        { url -> "https://api.allorigins.win/raw?url=${URLEncoder.encode(url, "UTF-8")}" },
+        { url -> "https://cinejoytv.fun/relay?url=${URLEncoder.encode(url, "UTF-8")}" },
+    )
+
+    // Stream providers
     private val vidloveBase = "https://api.vidlove.cc"
     private val vidloveReferer = "https://player.vidlove.cc/"
-
     private val vidrockBase = "https://vidrock.net"
     private val vidrockKeyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
 
@@ -55,34 +84,79 @@ class CineJoyProvider : MainAPI() {
     )
 
     // ========================================================================
-    // TMDB
+    // TMDB (multi-domain + CORS)
     // ========================================================================
     private suspend fun tmdbGet(path: String, useFallback: Boolean = false): JsonNode? {
-        val sep = if (path.contains("?")) "&" else "?"
         val key = if (useFallback) tmdbFallbackKey else tmdbKey
-        val url = "$tmdbBase$path${sep}api_key=$key"
-        return try {
-            val text = app.get(
-                url,
-                headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json")
-            ).text
-            if (text.isBlank()) {
-                if (!useFallback) tmdbGet(path, true) else null
-            } else {
-                val node = mapper.readTree(text)
-                if (node.get("status_code") != null && !useFallback) tmdbGet(path, true)
-                else node
+        val sep = if (path.contains("?")) "&" else "?"
+        val fullPath = "$path${sep}api_key=$key"
+
+        for (base in tmdbDirectDomains) {
+            try {
+                val text = app.get(
+                    "$base$fullPath",
+                    headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
+                    referer = null
+                ).text
+                if (text.isBlank() || !text.trimStart().startsWith("{")) {
+                    log("tmdb", "$base -> non-JSON")
+                    continue
+                }
+                val j = mapper.readTree(text)
+                val status = j.get("status_code")?.asInt()
+                if (status != null && status != 0) {
+                    log("tmdb", "$base -> status $status")
+                    if (!useFallback && (status == 7 || status == 3)) return tmdbGet(path, true)
+                    continue
+                }
+                log("tmdb", "$base -> OK")
+                return j
+            } catch (e: Exception) {
+                log("tmdb", "$base -> ${e.message}")
             }
-        } catch (e: Exception) {
-            if (!useFallback) tmdbGet(path, true) else null
         }
+
+        val targetUrl = "https://api.themoviedb.org/3$fullPath"
+        for (buildProxy in tmdbCorsProxies) {
+            try {
+                val text = app.get(
+                    buildProxy(targetUrl),
+                    headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
+                    referer = null
+                ).text
+                if (text.isBlank() || !text.trimStart().startsWith("{")) continue
+                val j = mapper.readTree(text)
+                val status = j.get("status_code")?.asInt()
+                if (status != null && status != 0) continue
+                log("tmdb-cors", "OK")
+                return j
+            } catch (e: Exception) {
+                log("tmdb-cors", "failed: ${e.message}")
+            }
+        }
+
+        if (!useFallback) return tmdbGet(path, true)
+        return null
     }
 
     private fun JsonNode.s(k: String): String? =
         get(k)?.takeIf { !it.isNull && !it.isContainerNode }?.asText()?.takeIf { it.isNotBlank() }
 
-    private fun poster(path: String?, size: String = "w500"): String? =
-        if (path != null) "$tmdbImg/$size$path" else null
+    private fun proxyImg(originalUrl: String): String =
+        "$imgProxy${URLEncoder.encode(originalUrl, "UTF-8")}"
+
+    /** Build TMDB image URL proxied via wsrv.nl. Falls back to OMDb if no path. */
+    private fun poster(path: String?, size: String = "w500", imdbId: String? = null): String? {
+        if (path != null) {
+            return proxyImg("https://image.tmdb.org/t/p/$size$path")
+        }
+        // OMDb fallback (only when TMDB has no poster and key configured)
+        if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt") &&
+            omdbApiKey.isNotBlank() && omdbApiKey != "YOUR_OMDB_API_KEY") {
+            return "https://img.omdbapi.com/?apikey=$omdbApiKey&i=$imdbId"
+        }
+        return null
+    }
 
     private fun yearOf(date: String?): Int? =
         if (date == null || date.length < 4) null else date.take(4).toIntOrNull()
@@ -93,7 +167,6 @@ class CineJoyProvider : MainAPI() {
         return if (r.get("first_air_date") != null || r.get("name") != null) "tv" else "movie"
     }
 
-    /** Convert TMDB 0-10 double to CloudStream Score object. */
     private fun scoreFrom10(r: JsonNode): Score? {
         val v = r.get("vote_average")?.asDouble() ?: return null
         if (v <= 0) return null
@@ -105,7 +178,9 @@ class CineJoyProvider : MainAPI() {
         val type = mediaTypeOf(r)
         val title = r.s("title") ?: r.s("name") ?: return null
         val url = """{"type":"$type","id":$id}"""
-        val posterUrl = poster(r.s("poster_path"))
+        // TMDB response sometimes includes imdb_id (only if append_to_response=external_ids, else null)
+        val imdbId = r.s("imdb_id")
+        val posterUrl = poster(r.s("poster_path"), "w500", imdbId)
         val year = yearOf(r.s("release_date") ?: r.s("first_air_date"))
         val score = scoreFrom10(r)
 
@@ -131,6 +206,7 @@ class CineJoyProvider : MainAPI() {
         if (results != null && results.isArray) {
             for (r in results) tmdbToSearch(r)?.let { items.add(it) }
         }
+        log("main", "${request.name}: ${items.size} items")
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -145,6 +221,7 @@ class CineJoyProvider : MainAPI() {
             if (mt != "movie" && mt != "tv") continue
             tmdbToSearch(r)?.let { out.add(it) }
         }
+        log("search", "query=$query: ${out.size} items")
         return out
     }
 
@@ -173,7 +250,7 @@ class CineJoyProvider : MainAPI() {
         return if (p.type == "movie") {
             val d = tmdbGet("/movie/${p.id}") ?: return null
             val title = d.s("title") ?: "Unknown"
-            val posterUrl = poster(d.s("poster_path"))
+            val posterUrl = poster(d.s("poster_path"), "w500", d.s("imdb_id"))
             val backdrop = poster(d.s("backdrop_path"), "w780")
             val description = d.s("overview")
             val year = yearOf(d.s("release_date"))
@@ -193,7 +270,7 @@ class CineJoyProvider : MainAPI() {
         } else {
             val d = tmdbGet("/tv/${p.id}") ?: return null
             val title = d.s("name") ?: "Unknown"
-            val posterUrl = poster(d.s("poster_path"))
+            val posterUrl = poster(d.s("poster_path"), "w500", d.s("imdb_id"))
             val backdrop = poster(d.s("backdrop_path"), "w780")
             val description = d.s("overview")
             val year = yearOf(d.s("first_air_date"))
@@ -248,7 +325,7 @@ class CineJoyProvider : MainAPI() {
     }
 
     // ========================================================================
-    // VIDLOVE
+    // VIDLOVE (7 variants)
     // ========================================================================
     private data class StreamResult(
         val url: String,
@@ -292,7 +369,10 @@ class CineJoyProvider : MainAPI() {
                 }
             }
             StreamResult(url, quality, subs)
-        } catch (e: Exception) { null }
+        } catch (e: Exception) {
+            logErr("vidlove", "stream $suffix failed", e)
+            null
+        }
     }
 
     private fun parseQuality(manifest: String?): String {
@@ -333,16 +413,15 @@ class CineJoyProvider : MainAPI() {
             if (std.length < 20) return null
             val ivB64 = std.substring(0, 16)
             val dataB64 = std.substring(16)
-
             val iv = Base64.decode(ivB64, Base64.DEFAULT)
             val data = Base64.decode(dataB64, Base64.DEFAULT)
             val key = hexToBytes(vidrockKeyHex)
-
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             val spec = GCMParameterSpec(128, iv)
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), spec)
             String(cipher.doFinal(data), Charsets.UTF_8)
         } catch (e: Exception) {
+            logErr("vidrock", "decrypt failed", e)
             null
         }
     }
@@ -374,7 +453,10 @@ class CineJoyProvider : MainAPI() {
                 out.add(StreamResult(dec, label))
             }
             out
-        } catch (e: Exception) { emptyList() }
+        } catch (e: Exception) {
+            logErr("vidrock", "streams failed", e)
+            emptyList()
+        }
     }
 
     // ========================================================================
@@ -389,6 +471,7 @@ class CineJoyProvider : MainAPI() {
         val p = parseUrl(data) ?: return false
         var found = false
 
+        // VidLove: 7 variants
         val vlVariants = listOf(
             "" to "Nebula",
             "&sources=warden" to "Solara",
@@ -417,6 +500,7 @@ class CineJoyProvider : MainAPI() {
             found = true
         }
 
+        // VidRock
         val vr = vidrockStreams(p.type, p.id, p.s, p.e)
         for (s in vr) {
             callback.invoke(
@@ -433,6 +517,7 @@ class CineJoyProvider : MainAPI() {
             found = true
         }
 
+        log("links", "found=$found (vidlove variants tried=7, vidrock=${vr.size})")
         return found
     }
 }
