@@ -1,7 +1,11 @@
 package com.lagradost
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
 import android.util.Base64
+import android.widget.Toast
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
@@ -9,17 +13,101 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
+// ============================================================================
+// DEBUG LOGGER - buffer log + auto-copy clipboard
+// ============================================================================
+object CJLog {
+    private const val MAX_LINES = 250
+    private const val RATE_LIMIT_MS = 3000L
+
+    private val buffer = mutableListOf<String>()
+    private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    @Volatile private var lastCopyAt = 0L
+    @Volatile private var ctx: Context? = null
+
+    fun attachContext(c: Context) {
+        ctx = c.applicationContext
+    }
+
+    @Synchronized
+    fun clear() {
+        buffer.clear()
+    }
+
+    @Synchronized
+    fun log(tag: String, msg: String) {
+        val line = "${fmt.format(Date())} [$tag] $msg"
+        buffer.add(line)
+        if (buffer.size > MAX_LINES) buffer.removeAt(0)
+        println("[CineJoy] $msg")
+    }
+
+    @Synchronized
+    fun logErr(tag: String, msg: String, e: Throwable? = null) {
+        val detail = if (e != null) "$msg | ${e.javaClass.simpleName}: ${e.message}" else msg
+        val line = "${fmt.format(Date())} [$tag][ERR] $detail"
+        buffer.add(line)
+        if (buffer.size > MAX_LINES) buffer.removeAt(0)
+        println("[CineJoy][ERR] $detail")
+        e?.printStackTrace()
+    }
+
+    @Synchronized
+    fun copyToClipboard(reason: String, toast: Boolean = true) {
+        val c = ctx ?: run {
+            println("[CineJoy][clipboard] no context")
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastCopyAt < RATE_LIMIT_MS) return
+        lastCopyAt = now
+
+        try {
+            val header = buildString {
+                appendLine("=== CineJoy Debug ===")
+                appendLine("Reason: $reason")
+                appendLine("Time:   ${Date()}")
+                appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}")
+                appendLine("Lines:  ${buffer.size}")
+                appendLine("--- log ---")
+            }
+            val fullText = header + buffer.joinToString("\n")
+
+            val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("CineJoy log", fullText))
+
+            if (toast) {
+                Toast.makeText(c, "CineJoy log copied (${buffer.size} lines) — please share", Toast.LENGTH_LONG).show()
+            }
+            println("[CineJoy][clipboard] copied ${buffer.size} lines (reason: $reason)")
+        } catch (e: Throwable) {
+            println("[CineJoy][clipboard] failed: ${e.message}")
+        }
+    }
+}
+
+// ============================================================================
+// PLUGIN ENTRY
+// ============================================================================
 @CloudstreamPlugin
 class CineJoyPlugin : Plugin() {
     override fun load(context: Context) {
+        CJLog.attachContext(context)
         registerMainAPI(CineJoyProvider())
     }
 }
 
+// ============================================================================
+// PROVIDER
+// ============================================================================
 class CineJoyProvider : MainAPI() {
     override var mainUrl = "https://cinejoy.pk"
     override var name = "CineJoy"
@@ -28,30 +116,20 @@ class CineJoyProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val mapper = jacksonObjectMapper()
-    private fun log(tag: String, msg: String) = println("[CineJoy][$tag] $msg")
-    private fun logErr(tag: String, msg: String, e: Throwable? = null) {
-        println("[CineJoy][$tag][ERR] $msg${if (e != null) " | ${e.message}" else ""}")
-    }
 
-    // TMDB keys (from CineJoy's own JS bundle)
     private val tmdbKey = "8476a7ab80ad76f0936744df0430e67c"
     private val tmdbFallbackKey = "439c478a771f35c05022f9feabcca01c"
 
-    // OMDb (optional, blank = disabled)
-    private val omdbApiKey = ""
-
     private val imgProxy = "https://wsrv.nl/?url="
 
-    // --- TMDB direct domains: put api.tmdb.org FIRST (works in VN where api.themoviedb.org is DNS-blocked)
     private val tmdbDirectDomains = listOf(
-        "https://api.tmdb.org",           // old official - typically works in VN
-        "https://api.themoviedb.org",     // new official - often blocked
+        "https://api.tmdb.org",
+        "https://api.themoviedb.org",
         "https://tmdb.demojameson.de5.net",
         "https://daili.smdhb.com",
         "https://vidora-tmdb.wwmm.date",
     )
 
-    // --- CORS proxies (backup if direct fails)
     private val tmdbCorsProxies: List<(String) -> String> = listOf(
         { url -> "https://cors.eu.org/$url" },
         { url -> "https://api.codetabs.com/v1/proxy/?quest=${URLEncoder.encode(url, "UTF-8")}" },
@@ -59,7 +137,6 @@ class CineJoyProvider : MainAPI() {
         { url -> "https://cinejoytv.fun/relay?url=${URLEncoder.encode(url, "UTF-8")}" },
     )
 
-    // Stream providers
     private val vidloveBase = "https://api.vidlove.cc"
     private val vidloveReferer = "https://player.vidlove.cc/"
     private val vidrockBase = "https://vidrock.net"
@@ -80,80 +157,64 @@ class CineJoyProvider : MainAPI() {
     )
 
     // ========================================================================
-    // TMDB — FIX: normalize path to always start with /3/
+    // TMDB
     // ========================================================================
     private suspend fun tmdbGet(path: String, useFallback: Boolean = false): JsonNode? {
         val key = if (useFallback) tmdbFallbackKey else tmdbKey
-
-        // ──── THE FIX ────
-        // TMDB API requires /3/ prefix. Accept both "/3/..." and "/..." formats.
         val normalizedPath = when {
             path.startsWith("/3/") || path.startsWith("/3?") -> path
             else -> "/3$path"
         }
         val sep = if (normalizedPath.contains("?")) "&" else "?"
         val fullPath = "$normalizedPath${sep}api_key=$key"
-        // fullPath = "/3/trending/movie/week?page=1&api_key=..."
 
-        // ──── Strategy 1: direct domains ────
         for (base in tmdbDirectDomains) {
             try {
                 val url = "$base$fullPath"
-                // https://api.tmdb.org/3/trending/movie/week?page=1&api_key=... ✓
                 val text = app.get(
                     url,
                     headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
                     referer = null
                 ).text
                 if (text.isBlank() || !text.trimStart().startsWith("{")) {
-                    log("tmdb", "$base -> non-JSON (${text.take(60).replace("\n"," ")})")
+                    CJLog.log("tmdb", "$base -> non-JSON")
                     continue
                 }
                 val j = mapper.readTree(text)
                 val status = j.get("status_code")?.asInt()
                 if (status != null && status != 0) {
-                    log("tmdb", "$base -> status $status")
+                    CJLog.log("tmdb", "$base -> status $status")
                     if (!useFallback && (status == 7 || status == 3)) return tmdbGet(path, true)
                     continue
                 }
-                log("tmdb", "$base -> OK")
+                CJLog.log("tmdb", "$base -> OK")
                 return j
             } catch (e: Exception) {
-                log("tmdb", "$base -> ${e.message}")
+                CJLog.log("tmdb", "$base -> ${e.message}")
             }
         }
 
-        // ──── Strategy 2: CORS proxies ────
-        // FIX: target URL built from fullPath (which now has /3/), NOT from base + "/3" + fullPath
         val targetUrl = "https://api.themoviedb.org$fullPath"
-        // https://api.themoviedb.org/3/trending/movie/week?page=1&api_key=... ✓
         for (buildProxy in tmdbCorsProxies) {
             try {
-                val proxied = buildProxy(targetUrl)
                 val text = app.get(
-                    proxied,
+                    buildProxy(targetUrl),
                     headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
                     referer = null
                 ).text
-                if (text.isBlank() || !text.trimStart().startsWith("{")) {
-                    log("tmdb-cors", "non-JSON")
-                    continue
-                }
+                if (text.isBlank() || !text.trimStart().startsWith("{")) continue
                 val j = mapper.readTree(text)
                 val status = j.get("status_code")?.asInt()
-                if (status != null && status != 0) {
-                    log("tmdb-cors", "status $status")
-                    continue
-                }
-                log("tmdb-cors", "OK")
+                if (status != null && status != 0) continue
+                CJLog.log("tmdb-cors", "OK")
                 return j
             } catch (e: Exception) {
-                log("tmdb-cors", "failed: ${e.message}")
+                CJLog.log("tmdb-cors", "failed: ${e.message}")
             }
         }
 
         if (!useFallback) return tmdbGet(path, true)
-        logErr("tmdb", "ALL SOURCES FAILED for $path")
+        CJLog.logErr("tmdb", "ALL SOURCES FAILED for $path")
         return null
     }
 
@@ -163,14 +224,8 @@ class CineJoyProvider : MainAPI() {
     private fun proxyImg(originalUrl: String): String =
         "$imgProxy${URLEncoder.encode(originalUrl, "UTF-8")}"
 
-    private fun poster(path: String?, size: String = "w500", imdbId: String? = null): String? {
-        if (path != null) return proxyImg("https://image.tmdb.org/t/p/$size$path")
-        if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt") &&
-            omdbApiKey.isNotBlank() && omdbApiKey != "YOUR_OMDB_API_KEY") {
-            return "https://img.omdbapi.com/?apikey=$omdbApiKey&i=$imdbId"
-        }
-        return null
-    }
+    private fun poster(path: String?, size: String = "w500"): String? =
+        if (path != null) proxyImg("https://image.tmdb.org/t/p/$size$path") else null
 
     private fun yearOf(date: String?): Int? =
         if (date == null || date.length < 4) null else date.take(4).toIntOrNull()
@@ -192,7 +247,7 @@ class CineJoyProvider : MainAPI() {
         val type = mediaTypeOf(r)
         val title = r.s("title") ?: r.s("name") ?: return null
         val url = """{"type":"$type","id":$id}"""
-        val posterUrl = poster(r.s("poster_path"), "w500", r.s("imdb_id"))
+        val posterUrl = poster(r.s("poster_path"))
         val year = yearOf(r.s("release_date") ?: r.s("first_air_date"))
         val score = scoreFrom10(r)
 
@@ -212,18 +267,31 @@ class CineJoyProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        CJLog.clear()
         val items = mutableListOf<SearchResponse>()
-        // request.data = "/trending/movie/week" etc (no /3/, tmdbGet will add it)
         val json = tmdbGet("${request.data}?page=$page")
         val results = json?.get("results")
         if (results != null && results.isArray) {
             for (r in results) tmdbToSearch(r)?.let { items.add(it) }
         }
-        log("main", "${request.name}: ${items.size} items")
+        CJLog.log("main", "${request.name}: ${items.size} items")
+
+        if (items.isEmpty()) {
+            CJLog.logErr("main", "EMPTY RESULT for ${request.name}")
+            CJLog.copyToClipboard("getMainPage empty for ${request.name}")
+        }
+
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        // Manual trigger
+        if (query.trim().equals("!log", ignoreCase = true)) {
+            CJLog.copyToClipboard("manual trigger from search")
+            return emptyList()
+        }
+
+        CJLog.clear()
         if (query.isBlank()) return emptyList()
         val q = URLEncoder.encode(query, "UTF-8")
         val json = tmdbGet("/search/multi?query=$q&page=1&include_adult=false")
@@ -234,7 +302,7 @@ class CineJoyProvider : MainAPI() {
             if (mt != "movie" && mt != "tv") continue
             tmdbToSearch(r)?.let { out.add(it) }
         }
-        log("search", "query=$query: ${out.size} items")
+        CJLog.log("search", "query=$query: ${out.size} items")
         return out
     }
 
@@ -258,12 +326,20 @@ class CineJoyProvider : MainAPI() {
         if (e >= 800) (e % 100) + 1 + ((e / 100) - 8) * 2 else e
 
     override suspend fun load(url: String): LoadResponse? {
-        val p = parseUrl(url) ?: return null
+        CJLog.clear()
+        val p = parseUrl(url) ?: run {
+            CJLog.logErr("load", "parseUrl failed for $url")
+            return null
+        }
+        CJLog.log("load", "type=${p.type} id=${p.id}")
 
         return if (p.type == "movie") {
-            val d = tmdbGet("/movie/${p.id}") ?: return null
+            val d = tmdbGet("/movie/${p.id}") ?: run {
+                CJLog.logErr("load", "TMDB movie ${p.id} failed")
+                return null
+            }
             val title = d.s("title") ?: "Unknown"
-            val posterUrl = poster(d.s("poster_path"), "w500", d.s("imdb_id"))
+            val posterUrl = poster(d.s("poster_path"))
             val backdrop = poster(d.s("backdrop_path"), "w780")
             val description = d.s("overview")
             val year = yearOf(d.s("release_date"))
@@ -281,9 +357,12 @@ class CineJoyProvider : MainAPI() {
                 this.tags = tags
             }
         } else {
-            val d = tmdbGet("/tv/${p.id}") ?: return null
+            val d = tmdbGet("/tv/${p.id}") ?: run {
+                CJLog.logErr("load", "TMDB tv ${p.id} failed")
+                return null
+            }
             val title = d.s("name") ?: "Unknown"
-            val posterUrl = poster(d.s("poster_path"), "w500", d.s("imdb_id"))
+            val posterUrl = poster(d.s("poster_path"))
             val backdrop = poster(d.s("backdrop_path"), "w780")
             val description = d.s("overview")
             val year = yearOf(d.s("first_air_date"))
@@ -338,7 +417,7 @@ class CineJoyProvider : MainAPI() {
     }
 
     // ========================================================================
-    // VIDLOVE
+    // VIDLOVE - with error code detection
     // ========================================================================
     private data class StreamResult(
         val url: String,
@@ -363,11 +442,43 @@ class CineJoyProvider : MainAPI() {
                     "Accept" to "application/json",
                 )
             ).text
-            if (text.isBlank()) return null
+            if (text.isBlank()) {
+                CJLog.log("vidlove", "empty response")
+                return null
+            }
+
+            // Log full response body for debugging 2004 issues
+            CJLog.log("vidlove", "raw response (${text.length}b): ${text.take(500)}")
+
             val json = mapper.readTree(text)
-            val src = json.get("source") ?: return null
-            val url = src.s("url") ?: return null
-            if (!url.startsWith("http")) return null
+
+            // Detect application-level error codes (including 2004)
+            val code = json.get("code")?.asInt()
+            if (code != null && code != 0 && code != 200) {
+                val msg = json.get("message")?.asText() ?: ""
+                CJLog.logErr("vidlove", "ERROR CODE $code: $msg")
+                return null
+            }
+            val errMsg = json.get("error")?.asText()
+            if (!errMsg.isNullOrBlank()) {
+                CJLog.logErr("vidlove", "error field: $errMsg")
+                return null
+            }
+
+            // Check for source
+            val src = json.get("source")
+            if (src == null || src.isNull) {
+                CJLog.log("vidlove", "no 'source' field, keys=${json.fieldNames().asSequence().toList()}")
+                return null
+            }
+            val url = src.s("url") ?: run {
+                CJLog.log("vidlove", "no 'url' in source")
+                return null
+            }
+            if (!url.startsWith("http")) {
+                CJLog.log("vidlove", "invalid url: $url")
+                return null
+            }
 
             val manifest = src.s("manifest")
             val quality = parseQuality(manifest)
@@ -383,7 +494,7 @@ class CineJoyProvider : MainAPI() {
             }
             StreamResult(url, quality, subs)
         } catch (e: Exception) {
-            logErr("vidlove", "stream $suffix failed", e)
+            CJLog.logErr("vidlove", "exception for $suffix", e)
             null
         }
     }
@@ -407,7 +518,32 @@ class CineJoyProvider : MainAPI() {
     }
 
     // ========================================================================
-    // VIDROCK (AES-GCM)
+    // M3U8 VALIDATION - check that URL actually returns HLS playlist
+    // ========================================================================
+    private suspend fun isValidM3u8(url: String, referer: String): Boolean {
+        return try {
+            val text = app.get(
+                url,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to referer,
+                    "Accept" to "*/*",
+                    "Range" to "bytes=0-1023",
+                )
+            ).text
+            val ok = text.trimStart().startsWith("#EXTM3U")
+            if (!ok) {
+                CJLog.log("probe", "NOT m3u8 (${text.length}b): ${text.take(200)}")
+            }
+            ok
+        } catch (e: Exception) {
+            CJLog.log("probe", "failed: ${e.message}")
+            false
+        }
+    }
+
+    // ========================================================================
+    // VIDROCK
     // ========================================================================
     private fun hexToBytes(hex: String): ByteArray =
         ByteArray(hex.length / 2) { i ->
@@ -434,7 +570,7 @@ class CineJoyProvider : MainAPI() {
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), spec)
             String(cipher.doFinal(data), Charsets.UTF_8)
         } catch (e: Exception) {
-            logErr("vidrock", "decrypt failed", e)
+            CJLog.logErr("vidrock", "decrypt failed", e)
             null
         }
     }
@@ -453,7 +589,16 @@ class CineJoyProvider : MainAPI() {
                 )
             ).text
             if (text.isBlank()) return emptyList()
+            CJLog.log("vidrock", "raw (${text.length}b): ${text.take(300)}")
+
             val json = mapper.readTree(text)
+            // Check for error indicators
+            val err = json.get("error")?.asText()
+            if (!err.isNullOrBlank()) {
+                CJLog.logErr("vidrock", "error field: $err")
+                return emptyList()
+            }
+
             val out = mutableListOf<StreamResult>()
             json.fieldNames().forEach { name ->
                 val s = json.get(name) ?: return@forEach
@@ -467,23 +612,43 @@ class CineJoyProvider : MainAPI() {
             }
             out
         } catch (e: Exception) {
-            logErr("vidrock", "streams failed", e)
+            CJLog.logErr("vidrock", "streams failed", e)
             emptyList()
         }
     }
 
     // ========================================================================
-    // LOAD LINKS
+    // LOAD LINKS - collect candidates, probe, emit verified + fallback
     // ========================================================================
+    private data class Candidate(
+        val label: String,
+        val url: String,
+        val referer: String,
+        val headers: Map<String, String>,
+        val verified: Boolean,
+        val subs: List<Pair<String, String>>,
+    )
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val p = parseUrl(data) ?: return false
-        var found = false
+        CJLog.clear()
+        CJLog.log("loadLinks", "start data=$data")
 
+        val p = parseUrl(data)
+        if (p == null) {
+            CJLog.logErr("loadLinks", "parseUrl failed")
+            CJLog.copyToClipboard("parseUrl failed for $data")
+            return false
+        }
+        CJLog.log("loadLinks", "type=${p.type} id=${p.id} s=${p.s} e=${p.e}")
+
+        val candidates = mutableListOf<Candidate>()
+
+        // ── VidLove: 7 variants ──
         val vlVariants = listOf(
             "" to "Nebula",
             "&sources=warden" to "Solara",
@@ -495,40 +660,79 @@ class CineJoyProvider : MainAPI() {
         )
         for ((suffix, label) in vlVariants) {
             val s = vidloveStream(p.type, p.id, p.s, p.e, suffix) ?: continue
+            val verified = isValidM3u8(s.url, vidloveReferer)
+            val headers = mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to vidloveReferer,
+                "Origin" to "https://player.vidlove.cc",
+            )
+            candidates.add(
+                Candidate(
+                    label = "CineJoy $label - ${s.label}" + if (!verified) " (unverified)" else "",
+                    url = s.url,
+                    referer = vidloveReferer,
+                    headers = headers,
+                    verified = verified,
+                    subs = s.subs,
+                )
+            )
+            CJLog.log("vidlove", "$label -> ${if (verified) "VERIFIED" else "unverified"}")
+        }
+
+        // ── VidRock ──
+        val vr = vidrockStreams(p.type, p.id, p.s, p.e)
+        for (s in vr) {
+            val verified = isValidM3u8(s.url, "$vidrockBase/")
+            val headers = mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to "$vidrockBase/",
+            )
+            candidates.add(
+                Candidate(
+                    label = "CineJoy ${s.label}" + if (!verified) " (unverified)" else "",
+                    url = s.url,
+                    referer = "$vidrockBase/",
+                    headers = headers,
+                    verified = verified,
+                    subs = emptyList(),
+                )
+            )
+            CJLog.log("vidrock", "${s.label} -> ${if (verified) "VERIFIED" else "unverified"}")
+        }
+
+        // ── Selection: prefer verified. If none, take first 3 unverified. ──
+        val verifiedList = candidates.filter { it.verified }
+        val unverifiedList = candidates.filter { !it.verified }
+        val toEmit = if (verifiedList.isNotEmpty()) verifiedList
+                      else unverifiedList.take(3)
+
+        CJLog.log("loadLinks", "candidates=${candidates.size} verified=${verifiedList.size} emit=${toEmit.size}")
+
+        var found = false
+        for (c in toEmit) {
             callback.invoke(
                 newExtractorLink(
                     source = name,
-                    name = "CineJoy $label - ${s.label}",
-                    url = s.url,
-                    type = if (s.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                    name = c.label,
+                    url = c.url,
+                    type = if (c.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
                 ) {
-                    this.referer = vidloveReferer
+                    this.referer = c.referer
                     this.quality = Qualities.Unknown.value
+                    this.headers = c.headers
                 }
             )
-            for ((lang, subUrl) in s.subs) {
+            for ((lang, subUrl) in c.subs) {
                 subtitleCallback.invoke(newSubtitleFile(url = subUrl, lang = lang))
             }
             found = true
         }
 
-        val vr = vidrockStreams(p.type, p.id, p.s, p.e)
-        for (s in vr) {
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = "CineJoy ${s.label}",
-                    url = s.url,
-                    type = if (s.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                ) {
-                    this.referer = "$vidrockBase/"
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-            found = true
+        if (!found) {
+            CJLog.logErr("loadLinks", "NO STREAMS AT ALL for ${p.type}/${p.id}/${p.s}/${p.e}")
+            CJLog.copyToClipboard("no streams for ${p.type}/${p.id}")
         }
 
-        log("links", "found=$found (vidlove=$vlVariants.size tried, vidrock=${vr.size})")
         return found
     }
 }
