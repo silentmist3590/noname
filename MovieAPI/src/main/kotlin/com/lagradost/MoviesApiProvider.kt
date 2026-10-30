@@ -16,11 +16,10 @@ class MoviesApiProvider : MainAPI() {
 
     private val mapper = jacksonObjectMapper()
 
-    // --- TMDB API key (public key) ---
-    private val tmdbKey = "4e44d9029b1270a757cddc766a1bcb63"
+    // TMDB keys - both are live as of 2026-10. Primary + automatic fallback.
+    private val tmdbKey = "8476a7ab80ad76f0936744df0430e67c"
+    private val tmdbFallbackKey = "439c478a771f35c05022f9feabcca01c"
 
-    // --- Multi-domain fallback for TMDB API ---
-    // Order: official -> old official -> proxies that inject key
     private val tmdbApiDomains = listOf(
         "https://api.themoviedb.org",
         "https://api.tmdb.org",
@@ -29,7 +28,6 @@ class MoviesApiProvider : MainAPI() {
         "https://vidora-tmdb.wwmm.date"
     )
 
-    // --- Multi-domain fallback for TMDB images ---
     private val tmdbImgDomains = listOf(
         "https://image.tmdb.org",
         "https://imagetmdb.com",
@@ -47,13 +45,13 @@ class MoviesApiProvider : MainAPI() {
     @Volatile private var cachedKey: String? = null
     @Volatile private var cachedKeyAt: Long = 0L
 
-    // In-memory caches
     private val posterCache = HashMap<String, String?>()
     private val backdropCache = HashMap<String, String?>()
     private val subsCache = HashMap<String, List<Pair<String, String>>>()
 
-    // Limit TMDB lookups per page
-    private val maxTmdbLookupsPerPage = 12
+    // Fetch poster for every title on the page (30 per page typical).
+    // Cache makes repeat loads instant after first fetch.
+    private val maxTmdbLookupsPerPage = 30
 
     private val apiBaseHeaders: Map<String, String> by lazy {
         mapOf(
@@ -156,7 +154,6 @@ class MoviesApiProvider : MainAPI() {
         return null
     }
 
-    // Resolve image path to full URL using fallback image domains
     private fun resolveImg(path: String?, size: String = "w500"): String? {
         if (path.isNullOrBlank()) return null
         if (path.startsWith("http")) return path
@@ -172,35 +169,48 @@ class MoviesApiProvider : MainAPI() {
     private fun JsonNode.imdbId(): String? = str("imdb_id", "imdbid", "imdbId", "imdb")
     private fun JsonNode.title(): String? = str("title", "name", "original_title", "orig_title")
 
-    // -------------------------------------------------- TMDB API with multi-domain fallback
+    // -------------------------------------------------- TMDB multi-key + multi-domain
 
     /**
-     * Try each TMDB API domain in order until one returns a valid JSON object.
-     * Returns the parsed JsonNode or null.
+     * Try each TMDB API domain with the given key.
+     * If the domain returns status_code == 7 (invalid key), retry with fallback key.
+     * If all official domains fail, proxies that inject their own key are tried.
      */
-    private suspend fun tmdbGet(path: String): JsonNode? {
-        // path example: "/3/movie/550?api_key=..." or "/3/find/tt123?..."
+    private suspend fun tmdbGet(path: String, useFallback: Boolean = false): JsonNode? {
+        val key = if (useFallback) tmdbFallbackKey else tmdbKey
+        val sep = if (path.contains("?")) "&" else "?"
+
         for (base in tmdbApiDomains) {
             try {
-                val url = if (path.startsWith("http")) path else "$base$path"
-                val text = app.get(url, headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent)).text
+                val url = "$base$path${sep}api_key=$key"
+                val text = app.get(
+                    url,
+                    headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent),
+                    referer = null
+                ).text
                 if (text.isBlank() || !text.trimStart().startsWith("{")) {
-                    DebugLog.log("tmdb", "$base -> non-JSON (${text.take(80)})")
+                    DebugLog.log("tmdb", "$base (key=${key.take(6)}..) -> non-JSON")
                     continue
                 }
                 val j = mapper.readTree(text)
-                // TMDB returns status_code on errors, but proxies may inject key
                 val status = j.get("status_code")?.asInt()
                 if (status != null && status != 0) {
-                    DebugLog.log("tmdb", "$base -> status $status, trying next")
+                    DebugLog.log("tmdb", "$base (key=${key.take(6)}..) -> status $status")
+                    // 7 = Invalid API key. Try fallback key, same or next domain.
+                    if (!useFallback && (status == 7 || status == 3)) {
+                        return tmdbGet(path, true)
+                    }
                     continue
                 }
-                DebugLog.log("tmdb", "$base -> OK")
+                DebugLog.log("tmdb", "$base (key=${key.take(6)}..) -> OK")
                 return j
             } catch (e: Exception) {
                 DebugLog.log("tmdb", "$base failed: ${e.message}")
             }
         }
+
+        // All domains failed with current key. If we weren't on fallback yet, try it.
+        if (!useFallback) return tmdbGet(path, true)
         return null
     }
 
@@ -209,7 +219,7 @@ class MoviesApiProvider : MainAPI() {
     ): String? {
         if (tmdbid != null) {
             val type = if (isTv) "tv" else "movie"
-            val j = tmdbGet("/3/$type/$tmdbid?api_key=$tmdbKey")
+            val j = tmdbGet("/3/$type/$tmdbid")
             if (j != null) {
                 val pp = j.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
                 val bp = j.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
@@ -222,7 +232,7 @@ class MoviesApiProvider : MainAPI() {
             }
         }
         if (imdbId != null && imdbId.startsWith("tt")) {
-            val j = tmdbGet("/3/find/$imdbId?api_key=$tmdbKey&external_source=imdb_id")
+            val j = tmdbGet("/3/find/$imdbId?external_source=imdb_id")
             if (j != null) {
                 val arr = if (isTv) j.get("tv_results") else j.get("movie_results")
                 if (arr != null && arr.isArray && arr.size() > 0) {
