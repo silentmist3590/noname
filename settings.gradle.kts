@@ -13,4 +13,5 @@ include(":CineJoy")
 include(":MovieAPI")
 include(":Hicine")
 include(":Moviehub")
+include(":Okru")
 rootProject.name = "CloudstreamPlugins"
