@@ -1,15 +1,10 @@
-plugins {
-    kotlin("android")
-}
-
-version = 2 // Tăng số này mỗi khi bạn cập nhật plugin
-
 cloudstream {
-    language = "vi" // hoặc "ru" tùy theo ngôn ngữ chính bạn muốn
+    language = "vi"
     description = "Xem video trực tiếp từ ok.ru trên CloudStream."
-    authors = listOf("TênCủaBạn") // Thay bằng tên của bạn
-    status = 1 // 1 = hoạt động bình thường
+    authors = listOf("TênThậtCủaBạn")  // ← SỬA placeholder này
+    status = 1
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
     iconUrl = "https://ok.ru/favicon.ico"
+    version = 3  // ← Tăng lên 3 (số nguyên dương)
 }
