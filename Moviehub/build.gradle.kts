@@ -1,5 +1,5 @@
 // Tăng số này mỗi lần cập nhật để CloudStream nhận bản mới
-version = 1
+version = 2
 
 cloudstream {
     description = "MoviesHubHD (movieshubhd.com): danh mục TMDB + stream trực tiếp từ mạng player VidNest (Hindi/English, đa âm thanh, phụ đề)"
