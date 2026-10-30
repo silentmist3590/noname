@@ -4,7 +4,7 @@ plugins {
 
 cloudstream {
     language = "en"
-    version = 2
+    version = 3
     description = "CineHD (cinehd.vc) - Movies & TV Series with Vietsub, 1080p Original Audio & Fast HLS Servers"
     authors = listOf("TJ-Plugins")
     status = 1
