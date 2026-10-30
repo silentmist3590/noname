@@ -13,20 +13,84 @@ class OkRuProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "vi"
     override val hasQuickSearch = true
+    override val hasMainPage = true
+
+    /**
+     * Trang chủ của plugin — hiển thị danh sách video gợi ý để người dùng
+     * có thể chọn OkRu làm nguồn cung cấp chính trên màn hình Home.
+     *
+     * Vì ok.ru không có API công khai cho "video mới nhất" mà không cần đăng nhập,
+     * ta dùng trang tìm kiếm với một số từ khóa phổ biến để tạo các mục gợi ý.
+     */
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        val pages = mutableListOf<HomePageList>()
+
+        // Một số query mặc định để tạo các mục trên trang chủ
+        val defaultQueries = listOf(
+            "phim" to "Phim",
+            "nhạc" to "Nhạc",
+            "hài" to "Hài",
+            "trailer" to "Trailer"
+        )
+
+        for ((query, label) in defaultQueries) {
+            try {
+                val items = searchInternal(query)
+                if (items.isNotEmpty()) {
+                    pages.add(newHomePageList(label, items))
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        return if (pages.isEmpty()) null else newHomePageResponse(pages)
+    }
 
     override suspend fun search(query: String): List<SearchResponse>? {
-        val searchUrl = "$mainUrl/search/video?st.query=$query"
-        val document = app.get(searchUrl).document
-        val results = mutableListOf<SearchResponse>()
+        return searchInternal(query)
+    }
 
-        document.select("div.video-card, div[data-video]").forEach { element ->
-            val title = element.selectFirst("a.video-card_lk, a[data-video]")?.text()
-                ?: element.selectFirst("div.video-card_n")?.text()
-                ?: return@forEach
-            val href = element.selectFirst("a.video-card_lk, a[data-video]")?.attr("href")
-                ?: return@forEach
+    /**
+     * Hàm dùng chung cho cả search và getMainPage
+     */
+    private suspend fun searchInternal(query: String): List<SearchResponse> {
+        val results = mutableListOf<SearchResponse>()
+        val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
+        val searchUrl = "$mainUrl/search/video?st.query=$encodedQuery"
+
+        val document = try {
+            app.get(
+                searchUrl,
+                headers = mapOf(
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                    "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
+                )
+            ).document
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return results
+        }
+
+        // Selector cho kết quả tìm kiếm video của ok.ru
+        // Nếu ok.ru thay đổi giao diện, cần cập nhật các selector này
+        val cards = document.select("div.video-card, div.video-card_v2, a.video-card_lk, div[data-video]")
+
+        cards.forEach { element ->
+            val linkEl = if (element.tagName() == "a") element
+                         else element.selectFirst("a.video-card_lk, a[href*=/video/]")
+                         ?: element.selectFirst("a")
+
+            val href = linkEl?.attr("href") ?: return@forEach
             if (!href.contains("/video/")) return@forEach
+
+            val title = linkEl.text().trim().ifEmpty {
+                element.selectFirst("div.video-card_n, div.video-card__title, span.video-card_n")?.text()?.trim()
+                    ?: return@forEach
+            }
+
             val poster = element.selectFirst("img")?.attr("src")
+                ?: element.selectFirst("img")?.attr("data-src")
 
             results.add(
                 newMovieSearchResponse(title, fixUrl(href)) {
@@ -34,7 +98,9 @@ class OkRuProvider : MainAPI() {
                 }
             )
         }
-        return results
+
+        // Loại bỏ trùng lặp theo URL
+        return results.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -53,13 +119,18 @@ class OkRuProvider : MainAPI() {
         val videoId = extractVideoId(data) ?: return false
         val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
 
-        val response = app.get(
-            apiUrl,
-            headers = mapOf(
-                "Referer" to "https://ok.ru/videoembed/$videoId",
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
-        ).text
+        val response = try {
+            app.get(
+                apiUrl,
+                headers = mapOf(
+                    "Referer" to "https://ok.ru/videoembed/$videoId",
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                )
+            ).text
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return false
+        }
 
         val jsonString = extractJsonFromResponse(response) ?: return false
 
