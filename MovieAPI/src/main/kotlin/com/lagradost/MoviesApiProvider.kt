@@ -15,12 +15,26 @@ class MoviesApiProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val mapper = jacksonObjectMapper()
-    private val tmdbImg = "https://image.tmdb.org/t/p"
 
-    // TMDB API key (public key from a well-known open-source project).
-    // If posters stop showing, replace with your own free key from
-    // https://www.themoviedb.org/settings/api
+    // --- TMDB API key (public key) ---
     private val tmdbKey = "4e44d9029b1270a757cddc766a1bcb63"
+
+    // --- Multi-domain fallback for TMDB API ---
+    // Order: official -> old official -> proxies that inject key
+    private val tmdbApiDomains = listOf(
+        "https://api.themoviedb.org",
+        "https://api.tmdb.org",
+        "https://tmdb.demojameson.de5.net",
+        "https://daili.smdhb.com",
+        "https://vidora-tmdb.wwmm.date"
+    )
+
+    // --- Multi-domain fallback for TMDB images ---
+    private val tmdbImgDomains = listOf(
+        "https://image.tmdb.org",
+        "https://imagetmdb.com",
+        "https://nl.imagetmdb.com"
+    )
 
     private val imgExt = Regex("\\.(?:jpe?g|png|webp|avif)(?:\\?.*)?\\z", RegexOption.IGNORE_CASE)
 
@@ -28,19 +42,17 @@ class MoviesApiProvider : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
 
-    // Live vidora key (rotates on site). WebView hook captures new ones automatically.
     private val vidoraKeyFallback = "3a67e8866ae1d2bb9e81fe7f73315a56eb3bdf5e3e755c7554c8be6910aa6b13"
 
     @Volatile private var cachedKey: String? = null
     @Volatile private var cachedKeyAt: Long = 0L
 
-    // In-memory caches (survive across provider instances while app is running)
+    // In-memory caches
     private val posterCache = HashMap<String, String?>()
     private val backdropCache = HashMap<String, String?>()
     private val subsCache = HashMap<String, List<Pair<String, String>>>()
 
-    // Limit TMDB lookups per page so list loads fast on first run.
-    // After first load, cache makes subsequent loads instant.
+    // Limit TMDB lookups per page
     private val maxTmdbLookupsPerPage = 12
 
     private val apiBaseHeaders: Map<String, String> by lazy {
@@ -144,12 +156,13 @@ class MoviesApiProvider : MainAPI() {
         return null
     }
 
-    private fun img(p: String?, size: String = "w500"): String? = when {
-        p.isNullOrBlank() -> null
-        p.startsWith("http") -> p
-        p.startsWith("//") -> "https:$p"
-        p.startsWith("/") -> "$tmdbImg/$size$p"
-        else -> "$mainUrl/$p"
+    // Resolve image path to full URL using fallback image domains
+    private fun resolveImg(path: String?, size: String = "w500"): String? {
+        if (path.isNullOrBlank()) return null
+        if (path.startsWith("http")) return path
+        if (path.startsWith("//")) return "https:$path"
+        if (path.startsWith("/")) return "${tmdbImgDomains.first()}/t/p/$size$path"
+        return "$mainUrl/$path"
     }
 
     private fun JsonNode.mediaId(): String? =
@@ -159,51 +172,68 @@ class MoviesApiProvider : MainAPI() {
     private fun JsonNode.imdbId(): String? = str("imdb_id", "imdbid", "imdbId", "imdb")
     private fun JsonNode.title(): String? = str("title", "name", "original_title", "orig_title")
 
-    // -------------------------------------------------- TMDB (poster + backdrop)
+    // -------------------------------------------------- TMDB API with multi-domain fallback
+
+    /**
+     * Try each TMDB API domain in order until one returns a valid JSON object.
+     * Returns the parsed JsonNode or null.
+     */
+    private suspend fun tmdbGet(path: String): JsonNode? {
+        // path example: "/3/movie/550?api_key=..." or "/3/find/tt123?..."
+        for (base in tmdbApiDomains) {
+            try {
+                val url = if (path.startsWith("http")) path else "$base$path"
+                val text = app.get(url, headers = mapOf("Accept" to "application/json", "User-Agent" to userAgent)).text
+                if (text.isBlank() || !text.trimStart().startsWith("{")) {
+                    DebugLog.log("tmdb", "$base -> non-JSON (${text.take(80)})")
+                    continue
+                }
+                val j = mapper.readTree(text)
+                // TMDB returns status_code on errors, but proxies may inject key
+                val status = j.get("status_code")?.asInt()
+                if (status != null && status != 0) {
+                    DebugLog.log("tmdb", "$base -> status $status, trying next")
+                    continue
+                }
+                DebugLog.log("tmdb", "$base -> OK")
+                return j
+            } catch (e: Exception) {
+                DebugLog.log("tmdb", "$base failed: ${e.message}")
+            }
+        }
+        return null
+    }
 
     private suspend fun lookupTmdbPoster(
         tmdbid: String?, imdbId: String?, isTv: Boolean
     ): String? {
         if (tmdbid != null) {
-            try {
-                val type = if (isTv) "tv" else "movie"
-                val info = app.get("https://api.themoviedb.org/3/$type/$tmdbid?api_key=$tmdbKey").text
-                DebugLog.log("tmdb", "GET $type/$tmdbid -> ${info.length}b: ${info.take(120)}")
-                if (info.startsWith("{")) {
-                    val j = mapper.readTree(info)
-                    val pp = j.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
-                    val bp = j.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
-                    val ck = (tmdbid).lowercase()
-                    posterCache[ck] = pp?.let { "$tmdbImg/w500$it" }
-                    backdropCache[ck] = bp?.let { "$tmdbImg/w1280$it" }
+            val type = if (isTv) "tv" else "movie"
+            val j = tmdbGet("/3/$type/$tmdbid?api_key=$tmdbKey")
+            if (j != null) {
+                val pp = j.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
+                val bp = j.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
+                val ck = tmdbid.lowercase()
+                posterCache[ck] = resolveImg(pp, "w500")
+                backdropCache[ck] = resolveImg(bp, "w1280")
+                if (posterCache[ck] != null || backdropCache[ck] != null) {
                     return posterCache[ck]
-                } else {
-                    DebugLog.log("tmdb", "bad response (key may be invalid): ${info.take(200)}")
                 }
-            } catch (e: Exception) {
-                DebugLog.log("tmdb", "lookup $tmdbid failed: ${e.message}")
             }
         }
         if (imdbId != null && imdbId.startsWith("tt")) {
-            try {
-                val find = app.get(
-                    "https://api.themoviedb.org/3/find/$imdbId?api_key=$tmdbKey&external_source=imdb_id"
-                ).text
-                if (find.startsWith("{")) {
-                    val j = mapper.readTree(find)
-                    val arr = if (isTv) j.get("tv_results") else j.get("movie_results")
-                    if (arr != null && arr.isArray && arr.size() > 0) {
-                        val first = arr.get(0)
-                        val pp = first.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
-                        val bp = first.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
-                        val ck = imdbId.lowercase()
-                        posterCache[ck] = pp?.let { "$tmdbImg/w500$it" }
-                        backdropCache[ck] = bp?.let { "$tmdbImg/w1280$it" }
-                        return posterCache[ck]
-                    }
+            val j = tmdbGet("/3/find/$imdbId?api_key=$tmdbKey&external_source=imdb_id")
+            if (j != null) {
+                val arr = if (isTv) j.get("tv_results") else j.get("movie_results")
+                if (arr != null && arr.isArray && arr.size() > 0) {
+                    val first = arr.get(0)
+                    val pp = first.get("poster_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
+                    val bp = first.get("backdrop_path")?.asText()?.takeIf { it != "null" && it.isNotBlank() }
+                    val ck = imdbId.lowercase()
+                    posterCache[ck] = resolveImg(pp, "w500")
+                    backdropCache[ck] = resolveImg(bp, "w1280")
+                    return posterCache[ck]
                 }
-            } catch (e: Exception) {
-                DebugLog.log("tmdb", "find $imdbId failed: ${e.message}")
             }
         }
         return null
@@ -233,7 +263,7 @@ class MoviesApiProvider : MainAPI() {
             val id = item.mediaId() ?: continue
             val title = item.title() ?: continue
 
-            var poster = img(item.findImage())
+            var poster = resolveImg(item.findImage())
             val cacheKey = (item.tmdbId() ?: item.imdbId() ?: "").lowercase()
 
             if (poster == null) {
@@ -282,7 +312,7 @@ class MoviesApiProvider : MainAPI() {
             for (item in items) {
                 val id = item.mediaId() ?: continue
                 val title = item.title() ?: continue
-                var poster = img(item.findImage())
+                var poster = resolveImg(item.findImage())
                 val ck = (item.tmdbId() ?: item.imdbId() ?: "").lowercase()
                 if (poster == null) {
                     poster = when {
@@ -338,7 +368,7 @@ class MoviesApiProvider : MainAPI() {
                         eps += mkEpisode(
                             id, sn, en,
                             e.str("name", "title"), e.str("overview"),
-                            img(e.str("still_path", "still", "image"), "w300")
+                            resolveImg(e.str("still_path", "still", "image"), "w300")
                         )
                     }
                 } else {
@@ -382,8 +412,8 @@ class MoviesApiProvider : MainAPI() {
         val node = getJson("$mainUrl/api/discover/$endpoint?$param=$id")?.items()?.firstOrNull()
 
         val title = node?.title() ?: id
-        var poster = img(node?.findImage())
-        var backdrop = img(node?.findImage(backdrop = true), "w1280")
+        var poster = resolveImg(node?.findImage())
+        var backdrop = resolveImg(node?.findImage(backdrop = true), "w1280")
         val plot = node?.str("overview", "plot", "description", "synopsis")
         val year = node?.let {
             (it.str("year") ?: it.str("release_date", "first_air_date"))?.take(4)?.toIntOrNull()
@@ -431,7 +461,7 @@ class MoviesApiProvider : MainAPI() {
     }
 
     // ================================================================
-    //          SUBTITLES (via /api/vidora/v1/subtitles/...)
+    //          SUBTITLES
     // ================================================================
 
     private suspend fun fetchSubtitles(
@@ -489,14 +519,12 @@ class MoviesApiProvider : MainAPI() {
                 }
             }
 
-            // Try common envelope keys first, then the root itself
             tryAdd(json.get("subtitles"))
             tryAdd(json.get("tracks"))
             tryAdd(json.get("data"))
             tryAdd(json.get("subs"))
             if (result.isEmpty()) tryAdd(json)
 
-            // Deduplicate by URL
             val seen = HashSet<String>()
             val deduped = result.filter { seen.add(it.second) }
 
@@ -579,7 +607,6 @@ class MoviesApiProvider : MainAPI() {
                 }
             }
 
-            // Inline tracks from source (may be present in some responses)
             val inlineTracks = sources?.firstOrNull()?.get("tracks")
             if (inlineTracks != null && inlineTracks.isArray) {
                 for (t in inlineTracks) {
@@ -592,7 +619,6 @@ class MoviesApiProvider : MainAPI() {
                 }
             }
 
-            // Dedicated subtitles endpoint
             if (found) fetchSubtitles(embed, key, subtitleCallback)
 
             found
@@ -723,7 +749,6 @@ class MoviesApiProvider : MainAPI() {
                         this.headers = streamHeaders
                     }
                 )
-                // Still try to fetch subs with whatever key we have
                 if (capturedKey != null) fetchSubtitles(data, capturedKey!!, subtitleCallback)
                 return true
             }
