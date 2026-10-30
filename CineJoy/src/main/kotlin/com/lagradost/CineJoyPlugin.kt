@@ -8,6 +8,7 @@ import android.widget.Toast
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
@@ -17,8 +18,8 @@ import java.util.Date
 import java.util.Locale
 
 // ============================================================================
-// DEBUG HELPER
-// Gom log vào buffer + auto-copy clipboard khi lỗi
+// DEBUG HELPER — buffer log + auto-copy clipboard khi lỗi
+// Dùng println (không dùng DebugLog vì đã bị remove ở CloudStream 4.x)
 // ============================================================================
 object CineJoyDebug {
     private const val MAX_LINES = 200
@@ -35,7 +36,7 @@ object CineJoyDebug {
         val line = "${fmt.format(Date())} [$step] $msg"
         buffer.add(line)
         if (buffer.size > MAX_LINES) buffer.removeAt(0)
-        DebugLog.log(TAG, msg)
+        println("[$TAG] $msg")
     }
 
     @Synchronized
@@ -44,7 +45,8 @@ object CineJoyDebug {
         val line = "${fmt.format(Date())} [$step][ERROR] $detail"
         buffer.add(line)
         if (buffer.size > MAX_LINES) buffer.removeAt(0)
-        DebugLog.error(TAG, detail, e)
+        println("[$TAG][ERROR] $detail")
+        e?.printStackTrace()
     }
 
     @Synchronized
@@ -55,11 +57,6 @@ object CineJoyDebug {
     @Synchronized
     fun snapshot(): String = buffer.joinToString("\n")
 
-    /**
-     * Copy toàn bộ buffer vào clipboard + toast.
-     * @param auto true nếu gọi tự động do lỗi (có rate-limit, toast style khác)
-     * @param reason lý do ngắn gọn (vd: "loadLinks returned false")
-     */
     @Synchronized
     fun dumpToClipboard(auto: Boolean = false, reason: String = "") {
         val now = System.currentTimeMillis()
@@ -67,7 +64,10 @@ object CineJoyDebug {
         lastCopyAt = now
 
         try {
-            val ctx = getContext() ?: return
+            val ctx = getContext() ?: run {
+                println("[$TAG] dumpToClipboard: no context")
+                return
+            }
 
             val header = buildString {
                 appendLine("=== CineJoy Debug${if (auto) " (AUTO-COPIED ON ERROR)" else ""} ===")
@@ -92,15 +92,13 @@ object CineJoyDebug {
                 Toast.LENGTH_LONG
             ).show()
 
-            DebugLog.log(TAG, "dumpToClipboard OK (${buffer.size} lines, auto=$auto)")
+            println("[$TAG] dumpToClipboard OK (${buffer.size} lines, auto=$auto)")
         } catch (e: Throwable) {
-            DebugLog.error(TAG, "dumpToClipboard failed: ${e.message}")
+            println("[$TAG] dumpToClipboard failed: ${e.message}")
         }
     }
 
-    /**
-     * Lấy Context an toàn qua reflection — thử nhiều API của CloudStream.
-     */
+    /** Lấy Context qua reflection — thử nhiều API của CloudStream. */
     private fun getContext(): Context? {
         // 1) App.getAppContext()
         try {
@@ -130,6 +128,14 @@ object CineJoyDebug {
             val cls = Class.forName("com.lagradost.cloudstream3.CommonActivity")
             val m = cls.getMethod("getActivity")
             (m.invoke(null) as? Context)?.let { return it }
+        } catch (_: Throwable) {}
+
+        // 5) Plugin context (được giữ bởi Plugin.load)
+        try {
+            val cls = Class.forName("com.lagradost.cloudstream3.plugins.Plugin")
+            val f = cls.getDeclaredField("context")
+            f.isAccessible = true
+            (f.get(null) as? Context)?.let { return it }
         } catch (_: Throwable) {}
 
         return null
@@ -227,7 +233,7 @@ class CineJoyProvider : MainAPI() {
     // SEARCH
     // ========================================================================
     override suspend fun search(query: String): List<SearchResponse> {
-        // Manual dump trigger — gõ "!log" trong search để copy clipboard
+        // Manual dump trigger — gõ "!log" trong search
         if (query.trim().equals("!log", ignoreCase = true)) {
             CineJoyDebug.dumpToClipboard(auto = false)
             return emptyList()
@@ -365,7 +371,6 @@ class CineJoyProvider : MainAPI() {
                 }
             }
 
-            // Fallback scrape
             CineJoyDebug.log("load", "fallback to scrape")
             return scrapeLoad(url)
         } catch (e: Exception) {
@@ -424,7 +429,7 @@ class CineJoyProvider : MainAPI() {
     ): Boolean {
         CineJoyDebug.log("loadLinks", "start data=$data")
 
-        // -------- Attempt 1: direct API (if site returns JSON) --------
+        // Attempt 1: direct API (site may return JSON)
         try {
             val resp = app.get(data, headers = baseHeaders, referer = "$mainUrl/")
             CineJoyDebug.log("loadLinks", "direct response: ${resp.text.take(300)}")
@@ -449,7 +454,7 @@ class CineJoyProvider : MainAPI() {
             CineJoyDebug.logError("loadLinks", "direct attempt exception", e)
         }
 
-        // -------- Attempt 2: WebView capture --------
+        // Attempt 2: WebView capture
         CineJoyDebug.log("loadLinks", "fallback to WebView")
         try {
             val resolver = WebViewResolver(
@@ -498,7 +503,6 @@ class CineJoyProvider : MainAPI() {
             CineJoyDebug.logError("loadLinks", "WebView exception", e)
         }
 
-        // -------- Failure: auto-copy log --------
         CineJoyDebug.logError("loadLinks", "FAILED — no links found")
         CineJoyDebug.dumpToClipboard(auto = true, reason = "loadLinks found no playable link")
         return false
