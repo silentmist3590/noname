@@ -53,7 +53,7 @@ class MoviesApiProvider : MainAPI() {
     private val subsCache = HashMap<String, List<Pair<String, String>>>()
 
     // Limit TMDB lookups per page
-    private val maxTmdbLookupsPerPage = 12
+    private val maxTmdbLookupsPerPage = 30
 
     private val apiBaseHeaders: Map<String, String> by lazy {
         mapOf(
