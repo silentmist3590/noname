@@ -691,10 +691,9 @@ class CineHDProvider : MainAPI() {
 
             val (key, iv) = evpBytesToKey(nxPass, salt, 32, 16)
 
-            // ĐOẠN MỚI ĐÃ SỬA:
             val payload = JSONObject(obj.toString()).apply {
                 put("_req_ts", System.currentTimeMillis())
-                put("_req_salt", java.util.UUID.randomUUID().toString().take(8))
+                put("_req_salt", Long.toString(SecureRandom().nextLong(), 36))
             }.toString()
 
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
