@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class OkRuPlugin : Plugin() {
     override fun load(context: Context) {
-        // Đăng ký OkRuProvider để CloudStream có thể sử dụng
         registerMainAPI(OkRuProvider())
     }
 }
