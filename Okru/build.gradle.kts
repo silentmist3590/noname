@@ -3,7 +3,7 @@ plugins {
 }
 
 // Version phải là số nguyên dương, tăng mỗi khi cập nhật
-version = 5
+version = 6
 
 cloudstream {
     language = "vi"
