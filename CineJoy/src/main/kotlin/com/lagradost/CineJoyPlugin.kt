@@ -291,11 +291,6 @@ class CineJoyProvider : MainAPI() {
         return if (r.get("first_air_date") != null || r.get("name") != null) "tv" else "movie"
     }
 
-    private fun score10(r: JsonNode): Score? {
-        val v = r.get("vote_average")?.asDouble() ?: return null
-        return if (v <= 0) null else Score.from10(v)
-    }
-
     private fun tmdbToSearch(r: JsonNode): SearchResponse? {
         val id = r.get("id")?.asInt() ?: return null
         val type = mediaType(r)
@@ -303,14 +298,13 @@ class CineJoyProvider : MainAPI() {
         val url = """{"type":"$type","id":$id}"""
         val posterUrl = poster(r.s("poster_path"))
         val year = yearOf(r.s("release_date") ?: r.s("first_air_date"))
-        val score = score10(r)
         return if (type == "tv") {
             newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
-                this.posterUrl = posterUrl; this.year = year; this.score = score
+                this.posterUrl = posterUrl; this.year = year
             }
         } else {
             newMovieSearchResponse(title, url, TvType.Movie) {
-                this.posterUrl = posterUrl; this.year = year; this.score = score
+                this.posterUrl = posterUrl; this.year = year
             }
         }
     }
@@ -373,7 +367,6 @@ class CineJoyProvider : MainAPI() {
                 this.backgroundPosterUrl = poster(d.s("backdrop_path"), "w780")
                 this.year = yearOf(d.s("release_date"))
                 this.plot = d.s("overview")
-                this.score = score10(d)
                 this.duration = d.get("runtime")?.asInt()?.takeIf { it > 0 }
                 this.tags = d.get("genres")?.mapNotNull { it.s("name") }
             }
@@ -398,7 +391,6 @@ class CineJoyProvider : MainAPI() {
                                 this.episode = fixed
                                 this.posterUrl = poster(ep.s("still_path"))
                                 this.description = ep.s("overview")
-                                this.score = score10(ep)
                             })
                         }
                     } else for (en in 1..cnt) episodes.add(newEpisode("""{"type":"tv","id":${p.id},"s":$sn,"e":$en}""") {
@@ -411,7 +403,6 @@ class CineJoyProvider : MainAPI() {
                 this.backgroundPosterUrl = poster(d.s("backdrop_path"), "w780")
                 this.year = yearOf(d.s("first_air_date"))
                 this.plot = d.s("overview")
-                this.score = score10(d)
                 this.tags = d.get("genres")?.mapNotNull { it.s("name") }
             }
         }
