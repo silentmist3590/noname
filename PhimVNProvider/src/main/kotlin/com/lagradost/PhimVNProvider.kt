@@ -1,4 +1,4 @@
-package com.phimvn
+package com.lagradost
 
 import android.content.Context
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -14,9 +14,6 @@ import org.json.JSONObject
 private const val LINK_SEP = "|||"
 private const val UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-// =====================================================================
-// Local HTTP server — giữ nguyên
-// =====================================================================
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var server: java.net.ServerSocket? = null
@@ -66,9 +63,6 @@ private object LocalPlaylist {
     }
 }
 
-// =====================================================================
-// Plugin entry
-// =====================================================================
 @CloudstreamPlugin
 class PhimVNPlugin : Plugin() {
     override fun load(context: Context) {
@@ -76,9 +70,6 @@ class PhimVNPlugin : Plugin() {
     }
 }
 
-// =====================================================================
-// Provider — full implementation với clipboard log
-// =====================================================================
 class PhimVNProvider : MainAPI() {
     override var mainUrl = "https://phim.nguonc.com"
     override var name = "PhimVN"
@@ -101,7 +92,8 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("HOME", "page=$page name=${request.name}")
 
-        val res = app.get("$mainUrl/api/films/${request.data}?page=$page").parsedSafe<PageResponse>()
+        val res = app.get("$mainUrl/api/films/${request.data}?page=$page")
+            .parsedSafe<PageResponse>()
         val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
         val hasNext = (res?.paginate?.currentPage ?: 0) < (res?.paginate?.totalPage ?: 0)
 
@@ -113,7 +105,8 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("SEARCH", "query=$query")
 
-        val res = app.get("$mainUrl/api/films/search?keyword=$query").parsedSafe<PageResponse>()
+        val res = app.get("$mainUrl/api/films/search?keyword=$query")
+            .parsedSafe<PageResponse>()
         val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
 
         ClipboardLogger.logAndCopy("SEARCH", "→ ${list.size} results")
@@ -193,7 +186,6 @@ class PhimVNProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Reset buffer — mỗi phiên play có log riêng
         ClipboardLogger.reset()
 
         val parts = data.split(LINK_SEP, limit = 2)
@@ -206,9 +198,7 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.logAndCopy("SESSION", "apiM3u8=${apiM3u8 ?: "null"}")
         if (embed != null) {
             val hash = hashOf(embed)
-            ClipboardLogger.logAndCopy(
-                "SESSION", "hash=${hash.ifBlank { "(không có)" }}"
-            )
+            ClipboardLogger.logAndCopy("SESSION", "hash=${hash.ifBlank { "(không có)" }}")
         }
 
         val layers = listOf("api", "streamc-hash", "bootstrap", "data-obf", "scan", "webview")
@@ -273,7 +263,6 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.logAndCopy("EMIT", "✗ callback throw: ${it.message?.take(120)}")
     }.getOrDefault(false)
 
-    // ----- helpers
     private fun looksLikePlaylist(t: String?): Boolean = t != null &&
             t.trimStart().startsWith("#EXTM3U") &&
             t.lines().any { it.isNotBlank() && !it.startsWith("#") }
@@ -319,7 +308,6 @@ class PhimVNProvider : MainAPI() {
         }
 
         ClipboardLogger.logAndCopy("DIRECT-$via", "code=${r.code} size=${r.text.length}")
-
         if (r.code != 200) return null
         val body = r.text
 
@@ -350,7 +338,6 @@ class PhimVNProvider : MainAPI() {
         }
     }
 
-    // ----- tầng streamc-hash
     private suspend fun viaStreamcHash(embed: String): Stream? {
         val hash = hashOf(embed).takeIf { it.isNotBlank() } ?: run {
             ClipboardLogger.logAndCopy("STREAMC", "✗ không có hash trong embed")
@@ -367,7 +354,6 @@ class PhimVNProvider : MainAPI() {
         return null
     }
 
-    // ----- tầng bootstrap
     private suspend fun viaBootstrap(embed: String): Stream? {
         val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
         ClipboardLogger.logAndCopy("BOOTSTRAP", "origin=$origin")
@@ -427,7 +413,6 @@ class PhimVNProvider : MainAPI() {
         return direct(playlist, embed, "bootstrap", listOf(video))
     }
 
-    // ----- tầng data-obf
     private suspend fun viaDataObf(embed: String): Stream? {
         val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
         val html = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
@@ -444,7 +429,6 @@ class PhimVNProvider : MainAPI() {
         return direct("$origin/$sub.m3u8", embed, "data-obf", listOf(j.optString("hD")))
     }
 
-    // ----- tầng scan
     private suspend fun viaScan(embed: String): Stream? {
         val seen = mutableSetOf<String>()
 
@@ -460,21 +444,18 @@ class PhimVNProvider : MainAPI() {
                 return null
             }
 
-            // 1. m3u8 trực tiếp
             val m3u8s = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").findAll(html).toList()
             ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${m3u8s.size} link m3u8")
             for (m in m3u8s) {
                 direct(m.value, embed, "scan", listOf(hashOf(embed)))?.let { return it }
             }
 
-            // 2. link streamc HLS
             val streamcs = Regex("""https?://hls\.streamc\.xyz/[^\s"'<>\\]+""").findAll(html).toList()
             ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${streamcs.size} link streamc")
             for (m in streamcs) {
                 direct(m.value, embed, "scan-streamc", listOf(hashOf(embed)))?.let { return it }
             }
 
-            // 3. iframe con
             val iframes = Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).toList()
             ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${iframes.size} iframe")
             for (m in iframes) {
@@ -487,7 +468,6 @@ class PhimVNProvider : MainAPI() {
         return scan(embed, 0)
     }
 
-    // ----- tầng WebView
     private suspend fun viaWebView(embed: String): Stream? {
         ClipboardLogger.logAndCopy("WEBVIEW", "mở WebView sniff m3u8")
         val sniffed = app.get(
@@ -503,7 +483,6 @@ class PhimVNProvider : MainAPI() {
         return direct(sniffed, embed, "webview", listOf(hashOf(embed)))
     }
 
-    // ---------------------------------------------------------------- crypto
     private fun sha256(b: ByteArray) =
         java.security.MessageDigest.getInstance("SHA-256").digest(b)
 
@@ -522,7 +501,6 @@ class PhimVNProvider : MainAPI() {
         s.substring(it * 2, it * 2 + 2).toInt(16).toByte()
     }
 
-    // ---------------------------------------------------------------- data
     data class Paginate(
         @JsonProperty("current_page") val currentPage: Int?,
         @JsonProperty("total_page") val totalPage: Int?
