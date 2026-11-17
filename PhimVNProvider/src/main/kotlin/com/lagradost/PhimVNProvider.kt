@@ -1,7 +1,6 @@
 package com.phimvn
 
 import android.content.Context
-import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
@@ -10,14 +9,14 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 
-private const val TAG = "PhimVN"
 private const val LINK_SEP = "|||"
+private const val UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-private const val UA =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-/** Máy chủ HTTP nhỏ trên 127.0.0.1 để đưa playlist đã giải mã cho trình phát. */
+// =====================================================================
+// Local HTTP server — giữ nguyên
+// =====================================================================
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var server: java.net.ServerSocket? = null
@@ -57,10 +56,8 @@ private object LocalPlaylist {
                 if (body == null) {
                     out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                 } else {
-                    out.write(
-                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
-                            "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray()
-                    )
+                    out.write(("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray())
                     if (!line.startsWith("HEAD")) out.write(body)
                 }
                 out.flush()
@@ -69,6 +66,9 @@ private object LocalPlaylist {
     }
 }
 
+// =====================================================================
+// Plugin entry
+// =====================================================================
 @CloudstreamPlugin
 class PhimVNPlugin : Plugin() {
     override fun load(context: Context) {
@@ -76,15 +76,9 @@ class PhimVNPlugin : Plugin() {
     }
 }
 
-/**
- * PhimVN lấy luồng phát theo nhiều tầng, thử lần lượt và kiểm tra kết quả ở từng tầng,
- * để khi trang đổi cách phát thì tầng khác vẫn có thể cứu được:
- *  1. m3u8 trực tiếp từ API
- *  2. giao thức bootstrap (AES-GCM) của player embed
- *  3. kiểu cũ data-obf
- *  4. quét HTML embed (và iframe con) tìm .m3u8, tự giải mã playlist nếu bị mã hóa
- *  5. WebView chạy player thật và bắt yêu cầu .m3u8
- */
+// =====================================================================
+// Provider — full implementation với clipboard log
+// =====================================================================
 class PhimVNProvider : MainAPI() {
     override var mainUrl = "https://phim.nguonc.com"
     override var name = "PhimVN"
@@ -92,10 +86,7 @@ class PhimVNProvider : MainAPI() {
     override var lang = "vi"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(
-        TvType.Movie,
-        TvType.TvSeries,
-        TvType.AsianDrama,
-        TvType.Anime
+        TvType.Movie, TvType.TvSeries, TvType.AsianDrama, TvType.Anime
     )
 
     override val mainPage = mainPageOf(
@@ -105,18 +96,28 @@ class PhimVNProvider : MainAPI() {
         "danh-sach/hoat-hinh" to "Hoạt Hình"
     )
 
-    // ---------------------------------------------------------------- danh sách / chi tiết
-
+    // ---------------------------------------------------------------- danh sách
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val res = app.get("$mainUrl/api/films/${request.data}?page=$page").parsedSafe<PageResponse>()
+        ClipboardLogger.reset()
+        ClipboardLogger.logAndCopy("HOME", "page=$page name=${request.name}")
+
+        val res = app.get("$mainUrl/api/films/${request.data}?page=$page").parsedSafe()
         val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
         val hasNext = (res?.paginate?.currentPage ?: 0) < (res?.paginate?.totalPage ?: 0)
+
+        ClipboardLogger.logAndCopy("HOME", "→ ${list.size} items | hasNext=$hasNext")
         return newHomePageResponse(request.name, list, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val res = app.get("$mainUrl/api/films/search?keyword=$query").parsedSafe<PageResponse>()
-        return res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
+        ClipboardLogger.reset()
+        ClipboardLogger.logAndCopy("SEARCH", "query=$query")
+
+        val res = app.get("$mainUrl/api/films/search?keyword=$query").parsedSafe()
+        val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
+
+        ClipboardLogger.logAndCopy("SEARCH", "→ ${list.size} results")
+        return list
     }
 
     private fun Item.toSearch(): SearchResponse? {
@@ -130,13 +131,26 @@ class PhimVNProvider : MainAPI() {
         }
     }
 
+    // ---------------------------------------------------------------- load
     override suspend fun load(url: String): LoadResponse? {
-        val movie = app.get(url).parsedSafe<DetailResponse>()?.movie ?: return null
+        ClipboardLogger.reset()
+        ClipboardLogger.logAndCopy("LOAD", "url=$url")
+
+        val movie = app.get(url).parsedSafe()?.movie ?: run {
+            ClipboardLogger.logAndCopy("LOAD", "✗ API trả về null")
+            return null
+        }
         val title = movie.name ?: return null
+
         val episodes = mutableListOf<Episode>()
+        var totalServers = 0
+        var totalEps = 0
+
         movie.episodes?.forEach { server ->
             val serverName = server.serverName ?: "NguonC"
+            totalServers++
             server.items?.forEach { ep ->
+                totalEps++
                 val embed = ep.embed
                 val m3u8 = ep.m3u8
                 if (!embed.isNullOrBlank() || !m3u8.isNullOrBlank()) {
@@ -149,6 +163,12 @@ class PhimVNProvider : MainAPI() {
                 }
             }
         }
+
+        ClipboardLogger.logAndCopy(
+            "LOAD",
+            "✓ title=$title | servers=$totalServers | eps=$totalEps | validEpisodes=${episodes.size}"
+        )
+
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = movie.posterUrl ?: movie.thumbUrl
             this.plot = movie.description
@@ -157,8 +177,6 @@ class PhimVNProvider : MainAPI() {
     }
 
     // ---------------------------------------------------------------- phát
-
-    /** Kết quả của một tầng: hoặc URL m3u8 dùng được ngay, hoặc nội dung playlist đã giải mã. */
     private class Stream(val url: String?, val text: String?, val via: String)
 
     private fun segHeaders(embed: String) = mapOf(
@@ -175,36 +193,74 @@ class PhimVNProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Reset buffer — mỗi phiên play có log riêng
+        ClipboardLogger.reset()
+
         val parts = data.split(LINK_SEP, limit = 2)
         val embed = (if (parts.size == 2) parts[1] else data).trim().takeIf { it.isNotBlank() }
-        val apiM3u8 = (if (parts.size == 2) parts[0] else "").trim()
-            .takeIf { it.contains(".m3u8") }
-
+        val apiM3u8 = (if (parts.size == 2) parts[0] else "").trim().takeIf { it.contains(".m3u8") }
         val e = embed ?: "$mainUrl/"
-        for (tag in listOf("api", "bootstrap", "data-obf", "scan", "webview")) {
+
+        ClipboardLogger.logAndCopy("=== PLAY ===", "data=${data.take(200)}")
+        ClipboardLogger.logAndCopy("SESSION", "embed=${embed ?: "null"}")
+        ClipboardLogger.logAndCopy("SESSION", "apiM3u8=${apiM3u8 ?: "null"}")
+        if (embed != null) {
+            val hash = hashOf(embed)
+            ClipboardLogger.logAndCopy(
+                "SESSION", "hash=${hash.ifBlank { "(không có)" }}"
+            )
+        }
+
+        val layers = listOf("api", "streamc-hash", "bootstrap", "data-obf", "scan", "webview")
+
+        for (tag in layers) {
+            ClipboardLogger.logAndCopy("LAYER-$tag", "→ bắt đầu")
+
             val st = runCatching {
                 when (tag) {
                     "api" -> apiM3u8?.let { direct(it, e, "api") }
+                    "streamc-hash" -> embed?.let { viaStreamcHash(it) }
                     "bootstrap" -> embed?.let { viaBootstrap(it) }
                     "data-obf" -> embed?.let { viaDataObf(it) }
                     "scan" -> embed?.let { viaScan(it) }
                     else -> embed?.let { viaWebView(it) }
                 }
             }.onFailure {
-                Log.d(TAG, "tầng $tag lỗi: ${it.javaClass.simpleName} ${it.message?.take(120)}")
+                ClipboardLogger.logAndCopy(
+                    "LAYER-$tag",
+                    "✗ exception: ${it.javaClass.simpleName} ${it.message?.take(100)}"
+                )
             }.getOrNull()
+
             if (st == null) {
-                Log.d(TAG, "tầng $tag: không có kết quả")
+                ClipboardLogger.logAndCopy("LAYER-$tag", "✗ không có kết quả")
                 continue
             }
-            Log.d(TAG, "tầng $tag: dùng được (${st.via})")
-            if (emit(st, e, callback)) return true
+
+            ClipboardLogger.logAndCopy("LAYER-$tag", "✓ dùng được | via=${st.via}")
+
+            if (emit(st, e, callback)) {
+                ClipboardLogger.logAndCopy("LINKS", "=== SUCCESS via $tag ===")
+                return true
+            } else {
+                ClipboardLogger.logAndCopy("LAYER-$tag", "✗ emit fail (callback lỗi)")
+            }
         }
+
+        ClipboardLogger.logAndCopy("LINKS", "=== FAILED: tất cả tầng thất bại ===")
         return false
     }
 
-    private suspend fun emit(st: Stream, embed: String, callback: (ExtractorLink) -> Unit): Boolean = runCatching {
+    private suspend fun emit(
+        st: Stream,
+        embed: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean = runCatching {
         val link = if (st.text != null) LocalPlaylist.url(st.text) else st.url!!
+        ClipboardLogger.logAndCopy(
+            "EMIT",
+            "url=${link.take(180)} | via=${st.via} | ${if (st.text != null) "text=${st.text.length}B" else "raw"}"
+        )
         callback(
             newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
                 this.referer = embed
@@ -213,17 +269,18 @@ class PhimVNProvider : MainAPI() {
             }
         )
         true
+    }.onFailure {
+        ClipboardLogger.logAndCopy("EMIT", "✗ callback throw: ${it.message?.take(120)}")
     }.getOrDefault(false)
 
-    // ----- kiểm tra / giải mã playlist dùng chung cho mọi tầng
-
-    private fun looksLikePlaylist(t: String?): Boolean =
-        t != null && t.trimStart().startsWith("#EXTM3U") && t.lines().any { it.isNotBlank() && !it.startsWith("#") }
+    // ----- helpers
+    private fun looksLikePlaylist(t: String?): Boolean = t != null &&
+            t.trimStart().startsWith("#EXTM3U") &&
+            t.lines().any { it.isNotBlank() && !it.startsWith("#") }
 
     private fun hashOf(embed: String): String =
         Regex("""[?&]hash=([0-9a-fA-F]+)""").find(embed)?.groupValues?.get(1).orEmpty()
 
-    /** Biến các dòng đường dẫn tương đối thành tuyệt đối để phát được từ máy chủ cục bộ. */
     private fun absolutize(text: String, base: String): String {
         val origin = Regex("""^(https?://[^/]+)""").find(base)?.groupValues?.get(1) ?: return text
         val dir = base.substringBefore('?').substringBeforeLast('/') + "/"
@@ -247,32 +304,87 @@ class PhimVNProvider : MainAPI() {
         return String(gcm(key, hex(iv), android.util.Base64.decode(line, android.util.Base64.DEFAULT), null))
     }
 
-    /** Tải một URL m3u8, giải mã nếu cần, và trả về Stream nếu hợp lệ. */
-    private suspend fun direct(url: String, embed: String, via: String, hashes: List<String> = emptyList()): Stream? {
-        val r = app.get(url, referer = embed, headers = segHeaders(embed))
-        if (r.code != 200) return null
-        val body = r.text
-        if (body.contains("#ENC-AESGCM")) {
-            val tryHashes = (hashes + hashOf(embed)).filter { it.isNotBlank() }.distinct()
-            for (h in tryHashes) {
-                val plain = runCatching { decryptPlaylist(body, h) }.getOrNull()
-                if (looksLikePlaylist(plain)) return Stream(null, absolutize(plain!!, url), "$via+giải mã")
-            }
+    private suspend fun direct(
+        url: String,
+        embed: String,
+        via: String,
+        hashes: List<String> = emptyList()
+    ): Stream? {
+        ClipboardLogger.logAndCopy("DIRECT-$via", "GET ${url.take(200)}")
+        val r = try {
+            app.get(url, referer = embed, headers = segHeaders(embed))
+        } catch (t: Throwable) {
+            ClipboardLogger.logAndCopy("DIRECT-$via", "✗ fetch fail: ${t.message?.take(120)}")
             return null
         }
-        return if (looksLikePlaylist(body)) Stream(url, null, via) else null
+
+        ClipboardLogger.logAndCopy("DIRECT-$via", "code=${r.code} size=${r.text.length}")
+
+        if (r.code != 200) return null
+        val body = r.text
+
+        if (body.contains("#ENC-AESGCM")) {
+            ClipboardLogger.logAndCopy("DIRECT-$via", "playlist bị mã hoá AES-GCM")
+            val tryHashes = (hashes + hashOf(embed)).filter { it.isNotBlank() }.distinct()
+            ClipboardLogger.logAndCopy("DIRECT-$via", "thử ${tryHashes.size} hash")
+            for (h in tryHashes) {
+                val plain = runCatching { decryptPlaylist(body, h) }.getOrNull()
+                if (looksLikePlaylist(plain)) {
+                    ClipboardLogger.logAndCopy("DIRECT-$via", "✓ giải mã OK hash=${h.take(16)}…")
+                    return Stream(null, absolutize(plain!!, url), "$via+decrypted")
+                }
+            }
+            ClipboardLogger.logAndCopy("DIRECT-$via", "✗ decrypt fail (không hash nào đúng)")
+            return null
+        }
+
+        return if (looksLikePlaylist(body)) {
+            ClipboardLogger.logAndCopy("DIRECT-$via", "✓ playlist OK")
+            Stream(url, null, via)
+        } else {
+            ClipboardLogger.logAndCopy(
+                "DIRECT-$via",
+                "✗ không phải playlist | head=${body.take(40).replace("\n", "\\n")}"
+            )
+            null
+        }
     }
 
-    // ----- tầng 2: bootstrap
+    // ----- tầng streamc-hash
+    private suspend fun viaStreamcHash(embed: String): Stream? {
+        val hash = hashOf(embed).takeIf { it.isNotBlank() } ?: run {
+            ClipboardLogger.logAndCopy("STREAMC", "✗ không có hash trong embed")
+            return null
+        }
+        ClipboardLogger.logAndCopy("STREAMC", "hash=${hash.take(16)}…")
+        val candidates = listOf(
+            "https://hls.streamc.xyz/$hash/hls.m3u8",
+            "https://hls.streamc.xyz/$hash/master.m3u8"
+        )
+        for (url in candidates) {
+            direct(url, embed, "streamc-hash")?.let { return it }
+        }
+        return null
+    }
 
+    // ----- tầng bootstrap
     private suspend fun viaBootstrap(embed: String): Stream? {
         val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
-        val shell = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA))
-        val cfg = Regex("""<script id="stream-bootstrap"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL)
-            .find(shell.text)?.groupValues?.get(1) ?: return null
-        val api = org.json.JSONObject(cfg).optString("api").takeIf { it.isNotBlank() } ?: return null
+        ClipboardLogger.logAndCopy("BOOTSTRAP", "origin=$origin")
 
-        val body = org.json.JSONObject().apply {
+        val shell = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA))
+        val cfg = Regex("""window\.__PLAYER_CONFIG__\s*=\s*(\{.*?\});""", RegexOption.DOT_MATCHES_ALL)
+            .find(shell.text)?.groupValues?.get(1) ?: run {
+            ClipboardLogger.logAndCopy("BOOTSTRAP", "✗ không tìm thấy PLAYER_CONFIG")
+            return null
+        }
+        val api = JSONObject(cfg).optString("api").takeIf { it.isNotBlank() } ?: run {
+            ClipboardLogger.logAndCopy("BOOTSTRAP", "✗ config không có api field")
+            return null
+        }
+        ClipboardLogger.logAndCopy("BOOTSTRAP", "api=$api")
+
+        val body = JSONObject().apply {
             put("action", "bootstrap")
             put("referrer", "$mainUrl/")
             put("frame_origins", org.json.JSONArray().put(mainUrl))
@@ -282,88 +394,135 @@ class PhimVNProvider : MainAPI() {
             put("path_chunks", true)
             put("bootstrap_format", "aesgcm-v1")
         }.toString()
+
         val resp = app.post(
             api,
             requestBody = body.toRequestBody("application/json".toMediaType()),
             headers = mapOf("Origin" to origin, "Referer" to embed, "User-Agent" to UA, "Accept" to "*/*")
         )
+        ClipboardLogger.logAndCopy("BOOTSTRAP", "POST code=${resp.code}")
         if (resp.code != 200) return null
 
-        var j = org.json.JSONObject(resp.text)
+        var j = JSONObject(resp.text)
         if (j.optString("format") == "aesgcm-v1") {
+            ClipboardLogger.logAndCopy("BOOTSTRAP", "response bị mã hoá — giải mã")
             val aad = "stream-bootstrap-v1\n$api".toByteArray()
             val plain = gcm(
-                sha256(aad), hex(j.getString("iv")),
-                android.util.Base64.decode(j.getString("data"), android.util.Base64.DEFAULT), aad
+                sha256(aad),
+                hex(j.getString("iv")),
+                android.util.Base64.decode(j.getString("data"), android.util.Base64.DEFAULT),
+                aad
             )
-            j = org.json.JSONObject(String(plain))
+            j = JSONObject(String(plain))
+            ClipboardLogger.logAndCopy("BOOTSTRAP", "✓ giải mã OK")
         }
+
         val video = j.optString("video").ifBlank { hashOf(embed) }
-        val playlist = j.optJSONObject("preissued")?.optString("playlist")?.takeIf { it.isNotBlank() } ?: return null
+        val playlist = j.optJSONObject("preissued")?.optString("playlist")?.takeIf { it.isNotBlank() }
+            ?: run {
+                ClipboardLogger.logAndCopy("BOOTSTRAP", "✗ response không có preissued.playlist")
+                return null
+            }
+        ClipboardLogger.logAndCopy("BOOTSTRAP", "playlist=${playlist.take(120)}")
         return direct(playlist, embed, "bootstrap", listOf(video))
     }
 
-    // ----- tầng 3: data-obf (kiểu cũ)
-
+    // ----- tầng data-obf
     private suspend fun viaDataObf(embed: String): Stream? {
         val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
         val html = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
-        val obf = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.get(1) ?: return null
-        val j = org.json.JSONObject(String(android.util.Base64.decode(obf, android.util.Base64.DEFAULT)))
-        val sub = j.optString("sUb").takeIf { it.isNotBlank() } ?: return null
+        val obf = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.get(1) ?: run {
+            ClipboardLogger.logAndCopy("DATAOBF", "✗ không có data-obf")
+            return null
+        }
+        val j = JSONObject(String(android.util.Base64.decode(obf, android.util.Base64.DEFAULT)))
+        val sub = j.optString("sUb").takeIf { it.isNotBlank() } ?: run {
+            ClipboardLogger.logAndCopy("DATAOBF", "✗ không có sUb")
+            return null
+        }
+        ClipboardLogger.logAndCopy("DATAOBF", "sUb=$sub | hD=${j.optString("hD").take(16)}…")
         return direct("$origin/$sub.m3u8", embed, "data-obf", listOf(j.optString("hD")))
     }
 
-    // ----- tầng 4: quét HTML (kể cả iframe con)
-
+    // ----- tầng scan
     private suspend fun viaScan(embed: String): Stream? {
         val seen = mutableSetOf<String>()
+
         suspend fun scan(url: String, depth: Int): Stream? {
             if (!seen.add(url) || depth > 1) return null
-            val html = app.get(url, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
-                .replace("\\/", "/")
-            for (m in Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").findAll(html)) {
+            ClipboardLogger.logAndCopy("SCAN", "fetch depth=$depth url=${url.take(120)}")
+
+            val html = try {
+                app.get(url, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
+                    .replace("\\/", "/")
+            } catch (t: Throwable) {
+                ClipboardLogger.logAndCopy("SCAN", "✗ fetch fail: ${t.message?.take(80)}")
+                return null
+            }
+
+            // 1. m3u8 trực tiếp
+            val m3u8s = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").findAll(html).toList()
+            ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${m3u8s.size} link m3u8")
+            for (m in m3u8s) {
                 direct(m.value, embed, "scan", listOf(hashOf(embed)))?.let { return it }
             }
-            for (m in Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html)) {
+
+            // 2. link streamc HLS
+            val streamcs = Regex("""https?://hls\.streamc\.xyz/[^\s"'<>\\]+""").findAll(html).toList()
+            ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${streamcs.size} link streamc")
+            for (m in streamcs) {
+                direct(m.value, embed, "scan-streamc", listOf(hashOf(embed)))?.let { return it }
+            }
+
+            // 3. iframe con
+            val iframes = Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).toList()
+            ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${iframes.size} iframe")
+            for (m in iframes) {
                 val src = m.groupValues[1].let { if (it.startsWith("//")) "https:$it" else it }
                 if (src.startsWith("http")) scan(src, depth + 1)?.let { return it }
             }
             return null
         }
+
         return scan(embed, 0)
     }
 
-    // ----- tầng 5: WebView
-
+    // ----- tầng WebView
     private suspend fun viaWebView(embed: String): Stream? {
+        ClipboardLogger.logAndCopy("WEBVIEW", "mở WebView sniff m3u8")
         val sniffed = app.get(
             embed,
             referer = "$mainUrl/",
             interceptor = WebViewResolver(Regex("""\.m3u8"""))
         ).url
-        if (!sniffed.contains(".m3u8")) return null
+        ClipboardLogger.logAndCopy("WEBVIEW", "sniffed=${sniffed.take(180)}")
+        if (!sniffed.contains(".m3u8")) {
+            ClipboardLogger.logAndCopy("WEBVIEW", "✗ không bắt được m3u8")
+            return null
+        }
         return direct(sniffed, embed, "webview", listOf(hashOf(embed)))
     }
 
-    // ---------------------------------------------------------------- mật mã
-
-    private fun sha256(b: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(b)
+    // ---------------------------------------------------------------- crypto
+    private fun sha256(b: ByteArray) =
+        java.security.MessageDigest.getInstance("SHA-256").digest(b)
 
     private fun gcm(key: ByteArray, iv: ByteArray, data: ByteArray, aad: ByteArray?): ByteArray {
         val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
         c.init(
-            javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"),
+            javax.crypto.Cipher.DECRYPT_MODE,
+            javax.crypto.spec.SecretKeySpec(key, "AES"),
             javax.crypto.spec.GCMParameterSpec(128, iv)
         )
         if (aad != null) c.updateAAD(aad)
         return c.doFinal(data)
     }
 
-    private fun hex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+    private fun hex(s: String) = ByteArray(s.length / 2) {
+        s.substring(it * 2, it * 2 + 2).toInt(16).toByte()
+    }
 
-    // ---------------------------------------------------------------- dữ liệu
-
+    // ---------------------------------------------------------------- data
     data class Paginate(
         @JsonProperty("current_page") val currentPage: Int?,
         @JsonProperty("total_page") val totalPage: Int?
@@ -379,9 +538,17 @@ class PhimVNProvider : MainAPI() {
 
     data class PageResponse(val paginate: Paginate?, val items: List<Item>?)
 
-    data class EpisodeItem(val name: String?, val slug: String?, val embed: String?, val m3u8: String?)
+    data class EpisodeItem(
+        val name: String?,
+        val slug: String?,
+        val embed: String?,
+        val m3u8: String?
+    )
 
-    data class Server(@JsonProperty("server_name") val serverName: String?, val items: List<EpisodeItem>?)
+    data class Server(
+        @JsonProperty("server_name") val serverName: String?,
+        val items: List<EpisodeItem>?
+    )
 
     data class Movie(
         val name: String?,
