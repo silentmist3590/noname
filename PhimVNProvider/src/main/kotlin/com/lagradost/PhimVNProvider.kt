@@ -101,7 +101,7 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("HOME", "page=$page name=${request.name}")
 
-        val res = app.get("$mainUrl/api/films/${request.data}?page=$page").parsedSafe()
+        val res = app.get("$mainUrl/api/films/${request.data}?page=$page").parsedSafe<PageResponse>()
         val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
         val hasNext = (res?.paginate?.currentPage ?: 0) < (res?.paginate?.totalPage ?: 0)
 
@@ -113,7 +113,7 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("SEARCH", "query=$query")
 
-        val res = app.get("$mainUrl/api/films/search?keyword=$query").parsedSafe()
+        val res = app.get("$mainUrl/api/films/search?keyword=$query").parsedSafe<PageResponse>()
         val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
 
         ClipboardLogger.logAndCopy("SEARCH", "→ ${list.size} results")
@@ -136,7 +136,7 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LOAD", "url=$url")
 
-        val movie = app.get(url).parsedSafe()?.movie ?: run {
+        val movie = app.get(url).parsedSafe<DetailResponse>()?.movie ?: run {
             ClipboardLogger.logAndCopy("LOAD", "✗ API trả về null")
             return null
         }
