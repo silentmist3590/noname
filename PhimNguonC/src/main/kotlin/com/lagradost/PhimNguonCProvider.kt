@@ -172,7 +172,7 @@ class PhimNguonCProvider : MainAPI() {
     ): Boolean {
         ClipboardLogger.reset()
         fun note(msg: String) {
-            ClipboardLogger.logAndCopy("v27", msg)
+            ClipboardLogger.logAndCopy("v28", msg)
         }
         note("loadLinks data=${data.take(300)}")
         return try {
@@ -344,7 +344,47 @@ class PhimNguonCProvider : MainAPI() {
             val key = mac.doFinal(video.toByteArray())
             text = String(gcmDecrypt(key, hex(iv), android.util.Base64.decode(line, android.util.Base64.DEFAULT), null))
         }
-        return text.takeIf { it.trimStart().startsWith("#EXTM3U") }
+        if (!text.trimStart().startsWith("#EXTM3U")) {
+            note("giải mã xong nhưng không phải playlist: ${headOf(text, 120)}")
+            return null
+        }
+        note("playlist giải mã (${text.length} ký tự):\n${text.take(900)}")
+        // Playlist được phát từ 127.0.0.1 nên mọi đường dẫn tương đối phải đổi thành tuyệt đối theo URL playlist gốc
+        fun absolute(u: String): String = try { java.net.URI(pl).resolve(u.trim()).toString() } catch (_: Throwable) { u }
+        val fixed = text.lines().joinToString("\n") { l ->
+            when {
+                l.isBlank() -> l
+                l.startsWith("#") -> Regex("URI=\"([^\"]+)\"").replace(l) { m -> "URI=\"" + absolute(m.groupValues[1]) + "\"" }
+                else -> absolute(l)
+            }
+        }
+        val firstUri = fixed.lines().firstOrNull { it.isNotBlank() && !it.startsWith("#") }
+        note("URL đầu tiên sau khi chuẩn hoá: ${firstUri?.take(200)}")
+        if (firstUri != null) probeSegment(firstUri, embed, note)
+        return fixed
+    }
+
+    // Thử tải đoạn đầu với vài bộ header để biết server chấp nhận cái nào (ghi log)
+    private fun probeSegment(url: String, embed: String, note: (String) -> Unit) {
+        val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return
+        val variants = listOf(
+            "A(embed ref)" to mapOf("User-Agent" to UA, "Referer" to embed),
+            "B(origin ref+Origin)" to mapOf("User-Agent" to UA, "Referer" to "$origin/", "Origin" to origin),
+            "C(chỉ UA)" to mapOf("User-Agent" to UA),
+            "D(navigate)" to mapOf("User-Agent" to UA, "Referer" to embed, "Sec-Fetch-Mode" to "navigate", "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language" to "en-us,en;q=0.5")
+        )
+        for ((label, h) in variants) {
+            try {
+                val rb = okhttp3.Request.Builder().url(url)
+                h.forEach { (k, v) -> rb.header(k, v) }
+                app.baseClient.newCall(rb.build()).execute().use { r ->
+                    val b = r.body?.bytes() ?: ByteArray(0)
+                    note("probe $label -> HTTP ${r.code} ct=${r.header("Content-Type")} len=${b.size} head=" + b.take(16).joinToString("") { x -> "%02x".format(x) })
+                }
+            } catch (t: Throwable) {
+                note("probe $label lỗi: ${t.message?.take(100)}")
+            }
+        }
     }
 
     private fun originOf(url: String): String {
