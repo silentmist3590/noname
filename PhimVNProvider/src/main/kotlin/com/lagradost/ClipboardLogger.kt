@@ -1,4 +1,4 @@
-package com.lagradost
+package com.phimvn
 
 import android.content.ClipData
 import android.content.ClipboardManager
