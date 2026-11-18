@@ -14,3 +14,18 @@ include(":MovieAPI")
 include(":Hicine")
 include(":Moviehub")
 rootProject.name = "CloudstreamPlugins"
+
+// settings.gradle.kts
+pluginManagement {
+    repositories {
+        // ... các repo khác
+        maven("https://jitpack.io")
+    }
+}
+
+dependencyResolutionManagement {
+    repositories {
+        // ... các repo khác
+        maven("https://jitpack.io")
+    }
+}
