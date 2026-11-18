@@ -18,11 +18,12 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -580,8 +581,9 @@ class PhimVNPlugin : Plugin() {
 }
 
 /**
- * PhimVN lấy luồng phát theo nhiều tầng và phát qua LocalProxy HTTP/2:
- *  1. m3u8 trực tiếp từ API
+ * PhimVN cào trực tiếp giao diện HTML + endpoint /episodes của phim.nguonc.com
+ * và phát video qua LocalProxy HTTP/2:
+ *  1. m3u8 trực tiếp từ API (nếu có)
  *  2. Giao thức bootstrap / issue (JSON & AES-GCM, cả hls và aesgcm-v2) của streamc.xyz
  *  3. Kiểu cũ data-obf
  *  4. Quét HTML embed (kể cả iframe con)
@@ -606,63 +608,150 @@ class PhimVNProvider : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
-        "phim-moi-cap-nhat" to "Phim Mới Cập Nhật",
+        "danh-sach-phim" to "Phim Mới Cập Nhật",
         "danh-sach/phim-bo" to "Phim Bộ",
         "danh-sach/phim-le" to "Phim Lẻ",
-        "danh-sach/hoat-hinh" to "Hoạt Hình"
+        "the-loai/hoat-hinh" to "Hoạt Hình",
+        "danh-sach/tv-shows" to "TV Shows"
     )
 
-    // ---------------------------------------------------------------- danh sách / chi tiết
+    // ---------------------------------------------------------------- danh sách / chi tiết (HTML + /episodes)
+
+    private fun browserHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
+        "User-Agent" to UA,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer" to referer
+    )
+
+    private fun extractBestPoster(container: Element?): String? {
+        if (container == null) return null
+        val img = container.selectFirst("picture img, img")
+        val directSrc = img?.attr("abs:src")?.trim()?.takeIf { it.startsWith("http") }
+        val srcset = img?.attr("srcset")?.trim().orEmpty()
+        val bestFromSrcset = srcset.split(",")
+            .map { it.trim().substringBefore(" ") }
+            .lastOrNull { it.startsWith("http") }
+        return bestFromSrcset ?: directSrc
+    }
+
+    private fun parseMovieList(doc: Document): List<SearchResponse> {
+        val out = mutableListOf<SearchResponse>()
+        val seen = HashSet<String>()
+        val rows = doc.select("tbody tr")
+        for (row in rows) {
+            val link = row.selectFirst("a.nc-movie-identity") ?: continue
+            val href = link.attr("abs:href").trim().ifBlank {
+                val rel = link.attr("href").trim()
+                if (rel.startsWith("/")) "$mainUrl$rel" else rel
+            }
+            if (!href.startsWith("http") || !seen.add(href)) continue
+
+            val title = row.selectFirst(".nc-movie-copy strong")?.text()?.trim()?.ifBlank { null }
+                ?: link.attr("title").trim().ifBlank { null }
+                ?: continue
+            val poster = extractBestPoster(link)
+            val yr = row.selectFirst("td[data-label=Năm] .nc-tag")?.text()?.trim()?.toIntOrNull()
+            val fmt = row.selectFirst("td[data-label=Định dạng]")?.text().orEmpty()
+            val tvType = if (fmt.contains("lẻ", ignoreCase = true)) TvType.Movie else TvType.TvSeries
+
+            out.add(
+                newMovieSearchResponse(title, href, tvType) {
+                    this.posterUrl = poster
+                    this.year = yr
+                }
+            )
+        }
+        return out
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val res = app.get("$mainUrl/api/films/${request.data}?page=$page").parsedSafe<PageResponse>()
-        val list = res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
-        val hasNext = (res?.paginate?.currentPage ?: 0) < (res?.paginate?.totalPage ?: 0)
+        val url = "$mainUrl/${request.data}?page=$page"
+        val doc = app.get(url, headers = browserHeaders()).document
+        val list = parseMovieList(doc)
+        val hasNext = doc.selectFirst("a[rel=next]") != null ||
+            doc.selectFirst("a[href*='page=${page + 1}']") != null
         return newHomePageResponse(request.name, list, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query.trim(), "UTF-8")
-        val res = app.get("$mainUrl/api/films/search?keyword=$encoded").parsedSafe<PageResponse>()
-        return res?.items?.mapNotNull { it.toSearch() } ?: emptyList()
-    }
-
-    private fun Item.toSearch(): SearchResponse? {
-        val title = name ?: return null
-        val s = slug ?: return null
-        val poster = posterUrl ?: thumbUrl
-        val yr = year?.toIntOrNull()
-        return newMovieSearchResponse(title, "$mainUrl/api/film/$s", TvType.Movie) {
-            this.posterUrl = poster
-            this.year = yr
-        }
+        val doc = app.get("$mainUrl/tim-kiem?keyword=$encoded", headers = browserHeaders()).document
+        return parseMovieList(doc)
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val movie = app.get(url).parsedSafe<DetailResponse>()?.movie ?: return null
-        val title = movie.name ?: return null
+        val filmUrl = if (url.contains("/api/film/")) {
+            "$mainUrl/phim/${url.substringAfterLast('/').substringBefore('?')}"
+        } else {
+            url
+        }
+
+        val doc = app.get(filmUrl, headers = browserHeaders()).document
+        val title = doc.selectFirst("#nc-film-title")?.text()?.trim()?.ifBlank { null }
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
+            ?: return null
+        val poster = extractBestPoster(doc.selectFirst(".nc-film-poster"))
+            ?: doc.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
+        val plot = doc.selectFirst(".nc-film-description")?.text()?.trim()?.ifBlank { null }
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")?.trim()
+
+        val year = doc.select(".nc-film-facts div").firstNotNullOfOrNull { div ->
+            val dt = div.selectFirst("dt")?.text().orEmpty()
+            if (dt.contains("Năm", ignoreCase = true)) {
+                Regex("""(19\d{2}|20\d{2})""").find(div.selectFirst("dd")?.text().orEmpty())
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
+            } else {
+                null
+            }
+        }
+
+        val episodeEndpoint = doc.selectFirst("[data-episode-url]")
+            ?.attr("abs:data-episode-url")?.trim()?.ifBlank { null }
+            ?: "${filmUrl.trimEnd('/')}/episodes"
+
+        val epJsonText = runCatching {
+            app.get(
+                episodeEndpoint,
+                referer = filmUrl,
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Accept" to "application/json",
+                    "X-Requested-With" to "XMLHttpRequest"
+                )
+            ).text
+        }.getOrNull().orEmpty()
+
         val episodes = mutableListOf<Episode>()
-        movie.episodes?.forEach { server ->
-            val serverName = server.serverName ?: "NguonC"
-            server.items?.forEach { ep ->
-                val embed = ep.embed
-                val m3u8 = ep.m3u8
-                if (!embed.isNullOrBlank() || !m3u8.isNullOrBlank()) {
-                    val epNum = Regex("""(\d+)""").find(ep.name.orEmpty())
-                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                    episodes.add(
-                        newEpisode("${m3u8.orEmpty()}$LINK_SEP${embed.orEmpty()}") {
-                            this.name = "$serverName - Tập ${ep.name ?: "1"}"
-                            this.episode = epNum
-                        }
-                    )
+        val epJson = runCatching { JSONObject(epJsonText) }.getOrNull()
+        val serversArr = epJson?.optJSONArray("servers")
+        if (serversArr != null) {
+            for (sIdx in 0 until serversArr.length()) {
+                val srv = serversArr.optJSONObject(sIdx) ?: continue
+                val serverName = srv.optString("name", "NguonC").ifBlank { "NguonC" }
+                val listArr = srv.optJSONArray("list") ?: continue
+                for (eIdx in 0 until listArr.length()) {
+                    val ep = listArr.optJSONObject(eIdx) ?: continue
+                    val embed = ep.optString("embed").trim()
+                    val m3u8 = ep.optString("m3u8").trim()
+                    if (embed.isNotEmpty() || m3u8.isNotEmpty()) {
+                        val epLabel = ep.optString("name", "1").ifBlank { "1" }
+                        val epNum = Regex("""(\d+)""").find(epLabel)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        episodes.add(
+                            newEpisode("$m3u8$LINK_SEP$embed") {
+                                this.name = "$serverName - Tập $epLabel"
+                                this.episode = epNum
+                            }
+                        )
+                    }
                 }
             }
         }
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-            this.posterUrl = movie.posterUrl ?: movie.thumbUrl
-            this.plot = movie.description
-            this.year = movie.year
+
+        return newTvSeriesLoadResponse(title, filmUrl, TvType.TvSeries, episodes) {
+            this.posterUrl = poster
+            this.plot = plot
+            this.year = year
         }
     }
 
@@ -1126,36 +1215,4 @@ class PhimVNProvider : MainAPI() {
             }
         }
     }
-
-    // ---------------------------------------------------------------- dữ liệu
-
-    data class Paginate(
-        @JsonProperty("current_page") val currentPage: Int?,
-        @JsonProperty("total_page") val totalPage: Int?
-    )
-
-    data class Item(
-        val name: String?,
-        val slug: String?,
-        val year: String?,
-        @JsonProperty("poster_url") val posterUrl: String?,
-        @JsonProperty("thumb_url") val thumbUrl: String?
-    )
-
-    data class PageResponse(val paginate: Paginate?, val items: List<Item>?)
-
-    data class EpisodeItem(val name: String?, val slug: String?, val embed: String?, val m3u8: String?)
-
-    data class Server(@JsonProperty("server_name") val serverName: String?, val items: List<EpisodeItem>?)
-
-    data class Movie(
-        val name: String?,
-        val year: Int?,
-        val description: String?,
-        @JsonProperty("poster_url") val posterUrl: String?,
-        @JsonProperty("thumb_url") val thumbUrl: String?,
-        val episodes: List<Server>?
-    )
-
-    data class DetailResponse(val movie: Movie?)
 }
