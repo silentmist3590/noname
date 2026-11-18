@@ -28,23 +28,9 @@ import kotlin.coroutines.suspendCoroutine
 data class SniffHit(
     val url: String,
     val referer: String,
-    val source: String        // "network" | "hls-hook" | "fetch-hook" | "video-hook"
+    val source: String   // "network" | "hls-hook" | "fetch-hook" | "xhr-hook" | "video-hook"
 )
 
-/**
- * Sniffer thông minh cho PhimVN.
- *
- * Chiến lược phát hiện URL stream (kể cả khi bị che giấu):
- *  1. Network intercept — bắt URL khớp nhiều pattern rộng:
- *     .m3u8, .mp4, /hls/, /stream/, /playlist, /manifest, format=m3u8...
- *  2. Hook JavaScript — bắt URL nằm trong hls.js (dùng cho blob: video):
- *     - Hls.prototype.loadSource()
- *     - window.fetch()
- *     - XMLHttpRequest.open()
- *     - video.src qua MutationObserver
- *  3. Ưu tiên URL từ JS hook (đây mới là URL thật sau khi blob URL được tạo)
- *  4. Fallback network intercept nếu không hook được JS
- */
 object PhimVNSniffer {
 
     private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
@@ -57,17 +43,15 @@ object PhimVNSniffer {
         "disable-devtool", "acscdn", "rapidadexchange",
         "cloudflareinsights", "beacon.min.js", "gstatic.com/cv",
         "cuid", "fingerprint", "clarity.ms", "hotjar",
-        "facebook", "google", "recaptcha", "sentry"
+        "facebook.com", "recaptcha", "sentry.io"
     )
 
-    /** Regex bắt URL nghi ngờ là stream. Rộng rãi để tránh bỏ sót. */
     private val STREAM_HINTS = listOf(
         Regex("""\.m3u8""", RegexOption.IGNORE_CASE),
         Regex("""\.mp4""", RegexOption.IGNORE_CASE),
         Regex("""\.m4v""", RegexOption.IGNORE_CASE),
-        Regex("""/hls[/_]""", RegexOption.IGNORE_CASE),
-        Regex("""/hls\.""", RegexOption.IGNORE_CASE),
-        Regex("""/stream[/_]""", RegexOption.IGNORE_CASE),
+        Regex("""/hls[/_.]""", RegexOption.IGNORE_CASE),
+        Regex("""/stream[/_.]""", RegexOption.IGNORE_CASE),
         Regex("""/playlist""", RegexOption.IGNORE_CASE),
         Regex("""/manifest""", RegexOption.IGNORE_CASE),
         Regex("""master\.m3u""", RegexOption.IGNORE_CASE),
@@ -77,7 +61,6 @@ object PhimVNSniffer {
         Regex("""type=m3u8""", RegexOption.IGNORE_CASE)
     )
 
-    /** Regex loại trừ URL chắc chắn là segment / file phụ. */
     private val SEGMENT_BLOCK = Regex(
         """.*\.(ts|m4s|key|aac|vtt|srt|jpg|jpeg|png|gif|webp|css|woff2?)(\?.*)?$""",
         RegexOption.IGNORE_CASE
@@ -93,7 +76,7 @@ object PhimVNSniffer {
 
         return suspendCoroutine { cont ->
             val main = Handler(Looper.getMainLooper())
-            val hits = ConcurrentHashMap<String, SniffHit>()   // url -> hit
+            val hits = ConcurrentHashMap<String, SniffHit>()
             val done = AtomicBoolean(false)
             val lastPageUrl = arrayOf(url)
             val resumed = AtomicBoolean(false)
@@ -114,6 +97,22 @@ object PhimVNSniffer {
 
                 if (hits.putIfAbsent(cleanUrl, SniffHit(cleanUrl, lastPageUrl[0], source)) == null) {
                     ClipboardLogger.logAndCopy("SNIFF", "✓ [$source] ${cleanUrl.take(180)}")
+                }
+            }
+
+            fun scheduleAfter(ms: Long) {
+                main.postDelayed({
+                    val hasM3u8 = hits.keys.any { it.contains(".m3u8", true) }
+                    if (hasM3u8) cleanup() else main.postDelayed({ cleanup() }, 5000L)
+                }, ms)
+            }
+
+            fun cleanup() {
+                if (!done.compareAndSet(false, true)) return
+                try { CookieManager.getInstance().flush() } catch (_: Throwable) {}
+                main.post {
+                    try { (activity.window.decorView as? ViewGroup)?.let { root -> } } catch (_: Throwable) {}
+                    finish(sortHits(hits.values.toList()))
                 }
             }
 
@@ -157,7 +156,7 @@ object PhimVNSniffer {
                     overlay.addView(webView, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
                     overlay.addView(spinner)
 
-                    fun cleanup() {
+                    fun closeAll() {
                         if (!done.compareAndSet(false, true)) return
                         try { CookieManager.getInstance().flush() } catch (_: Throwable) {}
                         main.post {
@@ -170,7 +169,6 @@ object PhimVNSniffer {
                         }
                     }
 
-                    // ----- 1. Network intercept
                     webView.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(
                             view: WebView?,
@@ -188,54 +186,29 @@ object PhimVNSniffer {
                         override fun onPageFinished(view: WebView?, url: String?) {
                             if (url != null) lastPageUrl[0] = url
                             spinner.visibility = View.GONE
-                            // Inject hooks + auto-click play
                             view?.evaluateJavascript(JS_HOOKS, null)
                             view?.evaluateJavascript(AUTOPLAY_JS, null)
                             view?.evaluateJavascript(DPAD_JS, null)
                         }
                     }
 
-                    // ----- 2. JS console hook (nơi nhận URL từ JS_HOOKS)
                     webView.webChromeClient = object : WebChromeClient() {
                         override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
                             val m = msg?.message() ?: return false
                             when {
                                 m.startsWith("[HLS] ") -> {
-                                    val u = m.removePrefix("[HLS] ").trim()
-                                    addHit(u, "hls-hook")
+                                    addHit(m.removePrefix("[HLS] ").trim(), "hls-hook")
                                     if (hits.size >= 1) scheduleAfter(waitForResultsMs)
                                 }
-                                m.startsWith("[FETCH] ") -> {
-                                    val u = m.removePrefix("[FETCH] ").trim()
-                                    addHit(u, "fetch-hook")
-                                }
-                                m.startsWith("[XHR] ") -> {
-                                    val u = m.removePrefix("[XHR] ").trim()
-                                    addHit(u, "xhr-hook")
-                                }
-                                m.startsWith("[VIDEO] ") -> {
-                                    val u = m.removePrefix("[VIDEO] ").trim()
-                                    addHit(u, "video-hook")
-                                }
-                                m.startsWith("[HOOK-INIT]") -> {
-                                    ClipboardLogger.logAndCopy("JS", "Hooks đã cài đặt")
-                                }
+                                m.startsWith("[FETCH] ") -> addHit(m.removePrefix("[FETCH] ").trim(), "fetch-hook")
+                                m.startsWith("[XHR] ") -> addHit(m.removePrefix("[XHR] ").trim(), "xhr-hook")
+                                m.startsWith("[VIDEO] ") -> addHit(m.removePrefix("[VIDEO] ").trim(), "video-hook")
+                                m.startsWith("[HOOK-INIT]") -> ClipboardLogger.logAndCopy("JS", "Hooks đã cài đặt")
                             }
                             return true
                         }
                     }
 
-                    // Chờ thêm sau khi có kết quả đầu tiên để tích thêm URL khác
-                    fun scheduleAfter(ms: Long) {
-                        main.postDelayed({
-                            // Nếu có m3u8 → đóng luôn. Nếu chỉ có URL không .m3u8 → chờ thêm 5s
-                            val hasM3u8 = hits.keys.any { it.contains(".m3u8", true) }
-                            if (hasM3u8) cleanup()
-                            else main.postDelayed({ cleanup() }, 5000L)
-                        }, ms)
-                    }
-
-                    // ----- 3. D-pad cursor cho TV Box
                     webView.setOnKeyListener { _, keyCode, event ->
                         if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
                         when (keyCode) {
@@ -248,13 +221,14 @@ object PhimVNSniffer {
                         }
                     }
 
-                    // ----- 4. Attach + load
                     try {
                         (activity.window.decorView as? ViewGroup)?.addView(overlay)
                     } catch (_: Throwable) {}
 
                     webView.loadUrl(url)
-                    main.postDelayed({ cleanup() }, timeoutMs)
+
+                    // Gọi closeAll thay vì cleanup vì đã định nghĩa đúng ở trên
+                    main.postDelayed({ closeAll() }, timeoutMs)
 
                 } catch (t: Throwable) {
                     ClipboardLogger.logAndCopy("SNIFFER", "init fail: ${t.message}")
@@ -268,7 +242,7 @@ object PhimVNSniffer {
         compareBy(
             {
                 when {
-                    it.url.contains(".m3u8", true) && it.source != "network" -> 0   // ưu tiên nhất
+                    it.url.contains(".m3u8", true) && it.source != "network" -> 0
                     it.url.contains(".m3u8", true) -> 1
                     it.url.contains(".mp4", true) -> 2
                     else -> 3
@@ -278,9 +252,6 @@ object PhimVNSniffer {
         )
     )
 
-    // =====================================================================
-    // JavaScript
-    // =====================================================================
     private const val JS_HOOKS = """
     (function(){
       if (window.__vsHooked) return;
@@ -294,65 +265,70 @@ object PhimVNSniffer {
         } catch (e) {}
       }
 
-      // 1. Hook Hls.js loadSource (quan trọng nhất - URL thật nằm ở đây)
-      var _Hls = window.Hls;
-      if (_Hls && _Hls.prototype && _Hls.prototype.loadSource) {
-        var _orig = _Hls.prototype.loadSource;
-        _Hls.prototype.loadSource = function(src) {
-          report('HLS', src);
-          return _orig.apply(this, arguments);
-        };
-      }
-      // Một số bản dùng class khác
-      ['Hls', 'hlsjs', 'HlsJs'].forEach(function(name) {
-        var C = window[name];
-        if (C && C.prototype && C.prototype.loadSource && !C.prototype.__hooked) {
-          C.prototype.__hooked = true;
-          var o = C.prototype.loadSource;
-          C.prototype.loadSource = function(src) {
+      try {
+        var _Hls = window.Hls;
+        if (_Hls && _Hls.prototype && _Hls.prototype.loadSource) {
+          var _orig = _Hls.prototype.loadSource;
+          _Hls.prototype.loadSource = function(src) {
             report('HLS', src);
-            return o.apply(this, arguments);
+            return _orig.apply(this, arguments);
           };
         }
-      });
+      } catch (e) {}
 
-      // 2. Hook fetch
-      if (window.fetch && !window.fetch.__hooked) {
-        var of = window.fetch;
-        window.fetch = function(input) {
-          try {
-            var u = typeof input === 'string' ? input : (input && input.url) || '';
-            report('FETCH', u);
-          } catch (e) {}
-          return of.apply(this, arguments);
-        };
-        window.fetch.__hooked = true;
-      }
+      try {
+        ['Hls', 'hlsjs', 'HlsJs'].forEach(function(name) {
+          var C = window[name];
+          if (C && C.prototype && C.prototype.loadSource && !C.prototype.__hooked) {
+            C.prototype.__hooked = true;
+            var o = C.prototype.loadSource;
+            C.prototype.loadSource = function(src) {
+              report('HLS', src);
+              return o.apply(this, arguments);
+            };
+          }
+        });
+      } catch (e) {}
 
-      // 3. Hook XHR
-      if (window.XMLHttpRequest && !window.XMLHttpRequest.prototype.__hooked) {
-        var ox = window.XMLHttpRequest.prototype.open;
-        window.XMLHttpRequest.prototype.open = function(method, url) {
-          try { report('XHR', String(url)); } catch (e) {}
-          return ox.apply(this, arguments);
-        };
-        window.XMLHttpRequest.prototype.__hooked = true;
-      }
+      try {
+        if (window.fetch && !window.fetch.__hooked) {
+          var of = window.fetch;
+          window.fetch = function(input) {
+            try {
+              var u = typeof input === 'string' ? input : (input && input.url) || '';
+              report('FETCH', u);
+            } catch (e) {}
+            return of.apply(this, arguments);
+          };
+          window.fetch.__hooked = true;
+        }
+      } catch (e) {}
 
-      // 4. Hook URL.createObjectURL - bắt nguồn blob (fallback nếu không hook được Hls)
-      if (window.URL && window.URL.createObjectURL && !window.URL.createObjectURL.__hooked) {
-        var oc = window.URL.createObjectURL;
-        window.URL.createObjectURL = function(obj) {
-          try {
-            if (obj && obj.src) report('HLS', obj.src);
-            else if (obj && obj.url) report('HLS', obj.url);
-          } catch (e) {}
-          return oc.apply(this, arguments);
-        };
-        window.URL.createObjectURL.__hooked = true;
-      }
+      try {
+        if (window.XMLHttpRequest && !window.XMLHttpRequest.prototype.__hooked) {
+          var ox = window.XMLHttpRequest.prototype.open;
+          window.XMLHttpRequest.prototype.open = function(method, url) {
+            try { report('XHR', String(url)); } catch (e) {}
+            return ox.apply(this, arguments);
+          };
+          window.XMLHttpRequest.prototype.__hooked = true;
+        }
+      } catch (e) {}
 
-      // 5. MutationObserver cho thẻ <video> (bắt src kể cả blob - kèm báo để user biết có player)
+      try {
+        if (window.URL && window.URL.createObjectURL && !window.URL.createObjectURL.__hooked) {
+          var oc = window.URL.createObjectURL;
+          window.URL.createObjectURL = function(obj) {
+            try {
+              if (obj && obj.src) report('HLS', obj.src);
+              else if (obj && obj.url) report('HLS', obj.url);
+            } catch (e) {}
+            return oc.apply(this, arguments);
+          };
+          window.URL.createObjectURL.__hooked = true;
+        }
+      } catch (e) {}
+
       try {
         var mo = new MutationObserver(function(muts) {
           muts.forEach(function(m) {
