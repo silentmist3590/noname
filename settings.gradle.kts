@@ -1,3 +1,5 @@
+import org.gradle.api.initialization.resolve.RepositoriesMode
+
 include(":PhimNguonC")
 include(":InternetArchive")
 include(":VsMov")
@@ -15,10 +17,11 @@ include(":Hicine")
 include(":Moviehub")
 rootProject.name = "CloudstreamPlugins"
 
-// settings.gradle.kts
 pluginManagement {
     repositories {
-        // ... các repo khác
+        google()
+        gradlePluginPortal()
+        mavenCentral()
         maven("https://jitpack.io")
     }
 }
@@ -26,7 +29,8 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        google() // 👈 ĐÃ THÊM DÒNG NÀY
         mavenCentral()
-        maven { url = uri("https://jitpack.io") } // Dòng quan trọng
+        maven { url = uri("https://jitpack.io") }
     }
 }
