@@ -10,5 +10,5 @@ cloudstream {
 }
 dependencies {
     // ... các dependency hiện có
-    implementation("com.github.darkryh:Cloudflare-Bypass:1.0.0")
+    implementation("com.github.darkryh:Cloudflare-Bypass:0.0.5")
 }
