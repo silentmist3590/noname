@@ -3,65 +3,18 @@ package com.lagradost
 import android.content.Context
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import com.phimvn.ClipboardLogger
+import com.phimvn.PhimVNSniffer
+import com.phimvn.SniffHit
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 
 private const val LINK_SEP = "|||"
 private const val UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-private object LocalPlaylist {
-    private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
-    private var server: java.net.ServerSocket? = null
-
-    @Synchronized
-    fun url(text: String): String {
-        val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
-            server = it
-            start(it)
-        }
-        val id = "pl_${System.nanoTime()}.m3u8"
-        store[id] = text
-        return "http://127.0.0.1:${s.localPort}/$id"
-    }
-
-    private fun start(s: java.net.ServerSocket) {
-        Thread {
-            while (!s.isClosed) {
-                val c = try { s.accept() } catch (e: Exception) { break }
-                Thread { handle(c) }.apply { isDaemon = true }.start()
-            }
-        }.apply { isDaemon = true }.start()
-    }
-
-    private fun handle(c: java.net.Socket) {
-        runCatching {
-            c.use {
-                val r = c.getInputStream().bufferedReader()
-                val line = r.readLine() ?: return
-                while (true) {
-                    val h = r.readLine() ?: break
-                    if (h.isEmpty()) break
-                }
-                val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
-                val body = path?.let { store[it] }?.toByteArray()
-                val out = c.getOutputStream()
-                if (body == null) {
-                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
-                } else {
-                    out.write(("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
-                            "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray())
-                    if (!line.startsWith("HEAD")) out.write(body)
-                }
-                out.flush()
-            }
-        }
-    }
-}
 
 @CloudstreamPlugin
 class PhimVNPlugin : Plugin() {
@@ -87,7 +40,7 @@ class PhimVNProvider : MainAPI() {
         "danh-sach/hoat-hinh" to "Hoạt Hình"
     )
 
-    // ---------------------------------------------------------------- danh sách
+    // ---------------------------------------------------------------- HOME
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("HOME", "page=$page name=${request.name}")
@@ -101,6 +54,7 @@ class PhimVNProvider : MainAPI() {
         return newHomePageResponse(request.name, list, hasNext = hasNext)
     }
 
+    // ---------------------------------------------------------------- SEARCH
     override suspend fun search(query: String): List<SearchResponse> {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("SEARCH", "query=$query")
@@ -124,7 +78,7 @@ class PhimVNProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------- load
+    // ---------------------------------------------------------------- LOAD
     override suspend fun load(url: String): LoadResponse? {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LOAD", "url=$url")
@@ -169,7 +123,7 @@ class PhimVNProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------- phát
+    // ---------------------------------------------------------------- LOAD LINKS
     private class Stream(val url: String?, val text: String?, val via: String)
 
     private fun segHeaders(embed: String) = mapOf(
@@ -191,50 +145,66 @@ class PhimVNProvider : MainAPI() {
         val parts = data.split(LINK_SEP, limit = 2)
         val embed = (if (parts.size == 2) parts[1] else data).trim().takeIf { it.isNotBlank() }
         val apiM3u8 = (if (parts.size == 2) parts[0] else "").trim().takeIf { it.contains(".m3u8") }
-        val e = embed ?: "$mainUrl/"
 
         ClipboardLogger.logAndCopy("=== PLAY ===", "data=${data.take(200)}")
         ClipboardLogger.logAndCopy("SESSION", "embed=${embed ?: "null"}")
         ClipboardLogger.logAndCopy("SESSION", "apiM3u8=${apiM3u8 ?: "null"}")
-        if (embed != null) {
-            val hash = hashOf(embed)
-            ClipboardLogger.logAndCopy("SESSION", "hash=${hash.ifBlank { "(không có)" }}")
+
+        // ============ TẦNG 1: API trả m3u8 trực tiếp
+        if (apiM3u8 != null) {
+            ClipboardLogger.logAndCopy("LAYER-api", "→ thử API m3u8 trực tiếp")
+            direct(apiM3u8, embed ?: mainUrl, "api")?.let { st ->
+                if (emit(st, embed ?: mainUrl, callback)) {
+                    ClipboardLogger.logAndCopy("LINKS", "=== SUCCESS via API ===")
+                    return true
+                }
+            }
+            ClipboardLogger.logAndCopy("LAYER-api", "✗ API không dùng được")
         }
 
-        val layers = listOf("api", "streamc-hash", "bootstrap", "data-obf", "scan", "webview")
-
-        for (tag in layers) {
-            ClipboardLogger.logAndCopy("LAYER-$tag", "→ bắt đầu")
-
-            val st = runCatching {
-                when (tag) {
-                    "api" -> apiM3u8?.let { direct(it, e, "api") }
-                    "streamc-hash" -> embed?.let { viaStreamcHash(it) }
-                    "bootstrap" -> embed?.let { viaBootstrap(it) }
-                    "data-obf" -> embed?.let { viaDataObf(it) }
-                    "scan" -> embed?.let { viaScan(it) }
-                    else -> embed?.let { viaWebView(it) }
-                }
-            }.onFailure {
-                ClipboardLogger.logAndCopy(
-                    "LAYER-$tag",
-                    "✗ exception: ${it.javaClass.simpleName} ${it.message?.take(100)}"
+        // ============ TẦNG 2: WebView sniff thông minh
+        if (embed != null) {
+            ClipboardLogger.logAndCopy("LAYER-sniffer", "→ khởi động WebView sniffer")
+            val hits = try {
+                PhimVNSniffer.sniff(
+                    url = embed,
+                    referer = "$mainUrl/",
+                    timeoutMs = 60_000L,
+                    waitForResultsMs = 8000L
                 )
-            }.getOrNull()
-
-            if (st == null) {
-                ClipboardLogger.logAndCopy("LAYER-$tag", "✗ không có kết quả")
-                continue
+            } catch (t: Throwable) {
+                ClipboardLogger.logAndCopy("SNIFFER", "✗ throw: ${t.message?.take(120)}")
+                emptyList<SniffHit>()
             }
 
-            ClipboardLogger.logAndCopy("LAYER-$tag", "✓ dùng được | via=${st.via}")
+            ClipboardLogger.logAndCopy("SNIFFER", "Bắt được ${hits.size} URL")
 
-            if (emit(st, e, callback)) {
-                ClipboardLogger.logAndCopy("LINKS", "=== SUCCESS via $tag ===")
-                return true
-            } else {
-                ClipboardLogger.logAndCopy("LAYER-$tag", "✗ emit fail (callback lỗi)")
+            for (hit in hits) {
+                ClipboardLogger.logAndCopy("HIT", "[${hit.source}] ${hit.url.take(150)}")
+                val stream = direct(hit.url, embed, "sniffer-${hit.source}")
+                if (stream != null && emit(stream, embed, callback)) {
+                    ClipboardLogger.logAndCopy("LINKS", "=== SUCCESS via sniffer [${hit.source}] ===")
+                    return true
+                }
+                // Fallback: tin URL sniffer nếu có .m3u8
+                if (hit.url.contains(".m3u8", true)) {
+                    ClipboardLogger.logAndCopy("EMIT-FALLBACK", "tin URL sniffer: ${hit.url.take(120)}")
+                    try {
+                        callback(
+                            newExtractorLink(name, name, hit.url, ExtractorLinkType.M3U8) {
+                                this.referer = embed
+                                this.quality = Qualities.Unknown.value
+                                this.headers = segHeaders(embed)
+                            }
+                        )
+                        ClipboardLogger.logAndCopy("LINKS", "=== SUCCESS via fallback [${hit.source}] ===")
+                        return true
+                    } catch (t: Throwable) {
+                        ClipboardLogger.logAndCopy("EMIT-FALLBACK", "✗ ${t.message?.take(80)}")
+                    }
+                }
             }
+            ClipboardLogger.logAndCopy("LAYER-sniffer", "✗ không URL nào dùng được")
         }
 
         ClipboardLogger.logAndCopy("LINKS", "=== FAILED: tất cả tầng thất bại ===")
@@ -322,7 +292,7 @@ class PhimVNProvider : MainAPI() {
                     return Stream(null, absolutize(plain!!, url), "$via+decrypted")
                 }
             }
-            ClipboardLogger.logAndCopy("DIRECT-$via", "✗ decrypt fail (không hash nào đúng)")
+            ClipboardLogger.logAndCopy("DIRECT-$via", "✗ decrypt fail")
             return null
         }
 
@@ -336,151 +306,6 @@ class PhimVNProvider : MainAPI() {
             )
             null
         }
-    }
-
-    private suspend fun viaStreamcHash(embed: String): Stream? {
-        val hash = hashOf(embed).takeIf { it.isNotBlank() } ?: run {
-            ClipboardLogger.logAndCopy("STREAMC", "✗ không có hash trong embed")
-            return null
-        }
-        ClipboardLogger.logAndCopy("STREAMC", "hash=${hash.take(16)}…")
-        val candidates = listOf(
-            "https://hls.streamc.xyz/$hash/hls.m3u8",
-            "https://hls.streamc.xyz/$hash/master.m3u8"
-        )
-        for (url in candidates) {
-            direct(url, embed, "streamc-hash")?.let { return it }
-        }
-        return null
-    }
-
-    private suspend fun viaBootstrap(embed: String): Stream? {
-        val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
-        ClipboardLogger.logAndCopy("BOOTSTRAP", "origin=$origin")
-
-        val shell = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA))
-        val cfg = Regex("""window\.__PLAYER_CONFIG__\s*=\s*(\{.*?\});""", RegexOption.DOT_MATCHES_ALL)
-            .find(shell.text)?.groupValues?.get(1) ?: run {
-            ClipboardLogger.logAndCopy("BOOTSTRAP", "✗ không tìm thấy PLAYER_CONFIG")
-            return null
-        }
-        val api = JSONObject(cfg).optString("api").takeIf { it.isNotBlank() } ?: run {
-            ClipboardLogger.logAndCopy("BOOTSTRAP", "✗ config không có api field")
-            return null
-        }
-        ClipboardLogger.logAndCopy("BOOTSTRAP", "api=$api")
-
-        val body = JSONObject().apply {
-            put("action", "bootstrap")
-            put("referrer", "$mainUrl/")
-            put("frame_origins", org.json.JSONArray().put(mainUrl))
-            put("request_grant", true)
-            put("playlist_format", "aesgcm-v2")
-            put("pretty_url", true)
-            put("path_chunks", true)
-            put("bootstrap_format", "aesgcm-v1")
-        }.toString()
-
-        val resp = app.post(
-            api,
-            requestBody = body.toRequestBody("application/json".toMediaType()),
-            headers = mapOf("Origin" to origin, "Referer" to embed, "User-Agent" to UA, "Accept" to "*/*")
-        )
-        ClipboardLogger.logAndCopy("BOOTSTRAP", "POST code=${resp.code}")
-        if (resp.code != 200) return null
-
-        var j = JSONObject(resp.text)
-        if (j.optString("format") == "aesgcm-v1") {
-            ClipboardLogger.logAndCopy("BOOTSTRAP", "response bị mã hoá — giải mã")
-            val aad = "stream-bootstrap-v1\n$api".toByteArray()
-            val plain = gcm(
-                sha256(aad),
-                hex(j.getString("iv")),
-                android.util.Base64.decode(j.getString("data"), android.util.Base64.DEFAULT),
-                aad
-            )
-            j = JSONObject(String(plain))
-            ClipboardLogger.logAndCopy("BOOTSTRAP", "✓ giải mã OK")
-        }
-
-        val video = j.optString("video").ifBlank { hashOf(embed) }
-        val playlist = j.optJSONObject("preissued")?.optString("playlist")?.takeIf { it.isNotBlank() }
-            ?: run {
-                ClipboardLogger.logAndCopy("BOOTSTRAP", "✗ response không có preissued.playlist")
-                return null
-            }
-        ClipboardLogger.logAndCopy("BOOTSTRAP", "playlist=${playlist.take(120)}")
-        return direct(playlist, embed, "bootstrap", listOf(video))
-    }
-
-    private suspend fun viaDataObf(embed: String): Stream? {
-        val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return null
-        val html = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
-        val obf = Regex("""data-obf="([^"]+)"""").find(html)?.groupValues?.get(1) ?: run {
-            ClipboardLogger.logAndCopy("DATAOBF", "✗ không có data-obf")
-            return null
-        }
-        val j = JSONObject(String(android.util.Base64.decode(obf, android.util.Base64.DEFAULT)))
-        val sub = j.optString("sUb").takeIf { it.isNotBlank() } ?: run {
-            ClipboardLogger.logAndCopy("DATAOBF", "✗ không có sUb")
-            return null
-        }
-        ClipboardLogger.logAndCopy("DATAOBF", "sUb=$sub | hD=${j.optString("hD").take(16)}…")
-        return direct("$origin/$sub.m3u8", embed, "data-obf", listOf(j.optString("hD")))
-    }
-
-    private suspend fun viaScan(embed: String): Stream? {
-        val seen = mutableSetOf<String>()
-
-        suspend fun scan(url: String, depth: Int): Stream? {
-            if (!seen.add(url) || depth > 1) return null
-            ClipboardLogger.logAndCopy("SCAN", "fetch depth=$depth url=${url.take(120)}")
-
-            val html = try {
-                app.get(url, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text
-                    .replace("\\/", "/")
-            } catch (t: Throwable) {
-                ClipboardLogger.logAndCopy("SCAN", "✗ fetch fail: ${t.message?.take(80)}")
-                return null
-            }
-
-            val m3u8s = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").findAll(html).toList()
-            ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${m3u8s.size} link m3u8")
-            for (m in m3u8s) {
-                direct(m.value, embed, "scan", listOf(hashOf(embed)))?.let { return it }
-            }
-
-            val streamcs = Regex("""https?://hls\.streamc\.xyz/[^\s"'<>\\]+""").findAll(html).toList()
-            ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${streamcs.size} link streamc")
-            for (m in streamcs) {
-                direct(m.value, embed, "scan-streamc", listOf(hashOf(embed)))?.let { return it }
-            }
-
-            val iframes = Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html).toList()
-            ClipboardLogger.logAndCopy("SCAN", "tìm thấy ${iframes.size} iframe")
-            for (m in iframes) {
-                val src = m.groupValues[1].let { if (it.startsWith("//")) "https:$it" else it }
-                if (src.startsWith("http")) scan(src, depth + 1)?.let { return it }
-            }
-            return null
-        }
-
-        return scan(embed, 0)
-    }
-
-    private suspend fun viaWebView(embed: String): Stream? {
-        ClipboardLogger.logAndCopy("WEBVIEW", "mở WebView sniff m3u8")
-        val sniffed = app.get(
-            embed,
-            referer = "$mainUrl/",
-            interceptor = WebViewResolver(Regex("""\.m3u8"""))
-        ).url
-        ClipboardLogger.logAndCopy("WEBVIEW", "sniffed=${sniffed.take(180)}")
-        if (!sniffed.contains(".m3u8")) {
-            ClipboardLogger.logAndCopy("WEBVIEW", "✗ không bắt được m3u8")
-            return null
-        }
-        return direct(sniffed, embed, "webview", listOf(hashOf(embed)))
     }
 
     private fun sha256(b: ByteArray) =
@@ -501,6 +326,57 @@ class PhimVNProvider : MainAPI() {
         s.substring(it * 2, it * 2 + 2).toInt(16).toByte()
     }
 
+    // ---------------------------------------------------------------- Local playlist server
+    private object LocalPlaylist {
+        private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
+        private var server: java.net.ServerSocket? = null
+
+        @Synchronized
+        fun url(text: String): String {
+            val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
+                server = it
+                start(it)
+            }
+            val id = "pl_${System.nanoTime()}.m3u8"
+            store[id] = text
+            return "http://127.0.0.1:${s.localPort}/$id"
+        }
+
+        private fun start(s: java.net.ServerSocket) {
+            Thread {
+                while (!s.isClosed) {
+                    val c = try { s.accept() } catch (e: Exception) { break }
+                    Thread { handle(c) }.apply { isDaemon = true }.start()
+                }
+            }.apply { isDaemon = true }.start()
+        }
+
+        private fun handle(c: java.net.Socket) {
+            runCatching {
+                c.use {
+                    val r = c.getInputStream().bufferedReader()
+                    val line = r.readLine() ?: return
+                    while (true) {
+                        val h = r.readLine() ?: break
+                        if (h.isEmpty()) break
+                    }
+                    val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
+                    val body = path?.let { store[it] }?.toByteArray()
+                    val out = c.getOutputStream()
+                    if (body == null) {
+                        out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    } else {
+                        out.write(("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                                "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray())
+                        if (!line.startsWith("HEAD")) out.write(body)
+                    }
+                    out.flush()
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- Data models
     data class Paginate(
         @JsonProperty("current_page") val currentPage: Int?,
         @JsonProperty("total_page") val totalPage: Int?
