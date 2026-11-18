@@ -43,6 +43,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
@@ -907,7 +908,7 @@ class PhimVNProvider : MainAPI() {
                     val wv = WebView(ctx)
                     val finished = AtomicBoolean(false)
                     val probedUrls = Collections.synchronizedSet(HashSet<String>())
-                    @Volatile var jsVideoHash = StreamCrypto.hashOf(embed)
+                    val jsVideoHash = AtomicReference(StreamCrypto.hashOf(embed))
 
                     fun finish(res: Stream?) {
                         if (!finished.compareAndSet(false, true)) return
@@ -981,13 +982,13 @@ class PhimVNProvider : MainAPI() {
                     val bridge = object {
                         @JavascriptInterface
                         fun onVideoHash(vh: String?) {
-                            if (!vh.isNullOrBlank()) jsVideoHash = vh.trim()
+                            if (!vh.isNullOrBlank()) jsVideoHash.set(vh.trim())
                         }
 
                         @JavascriptInterface
                         fun onPlaylistText(text: String?, vh: String?, baseUrl: String?) {
                             if (finished.get() || text.isNullOrBlank()) return
-                            if (!vh.isNullOrBlank()) jsVideoHash = vh.trim()
+                            if (!vh.isNullOrBlank()) jsVideoHash.set(vh.trim())
                             if (!StreamCrypto.looksLikePlaylist(text)) return
                             if (text.contains("#ENC-AESGCM") || text.contains("#EXT-X-B65")) return
                             val resolvedBase = baseUrl?.takeIf { it.startsWith("http") } ?: embed
@@ -997,7 +998,7 @@ class PhimVNProvider : MainAPI() {
                                     val st = Stream(
                                         playlistText = text,
                                         baseUrl = resolvedBase,
-                                        hashes = listOfNotNull(jsVideoHash.takeIf { it.isNotBlank() }, StreamCrypto.hashOf(embed)),
+                                        hashes = listOf(jsVideoHash.get(), StreamCrypto.hashOf(embed)).filter { it.isNotBlank() }.distinct(),
                                         via = "webview-js"
                                     )
                                     handler.post { finish(st) }
@@ -1080,7 +1081,7 @@ class PhimVNProvider : MainAPI() {
                             ) {
                                 Thread {
                                     if (finished.get()) return@Thread
-                                    val hashes = listOf(jsVideoHash, StreamCrypto.hashOf(embed)).filter { it.isNotBlank() }.distinct()
+                                    val hashes = listOf(jsVideoHash.get(), StreamCrypto.hashOf(embed)).filter { it.isNotBlank() }.distinct()
                                     val st = direct(u, embed, "webview-net", hashes)
                                     if (st != null && !finished.get()) {
                                         handler.post { finish(st) }
