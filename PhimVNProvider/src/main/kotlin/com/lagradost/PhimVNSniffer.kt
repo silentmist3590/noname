@@ -19,6 +19,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import com.lagradost.cloudstream3.CommonActivity
+import darkryh.cloudflare.bypass.BypassClient // Import BypassClient
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
@@ -32,8 +33,7 @@ data class SniffHit(
 
 object PhimVNSniffer {
 
-    // ĐỔI SANG USER-AGENT CỦA ALOHA BROWSER
-    private const val UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 AlohaBrowser/5.2.0"
+    private const val UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
 
     private val AD_DOMAINS = listOf(
         "doubleclick", "googlesyndication", "googleadservices",
@@ -164,27 +164,21 @@ object PhimVNSniffer {
                         }
                     }
 
-                    webView.webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(
-                            view: WebView?,
-                            request: WebResourceRequest?
-                        ): WebResourceResponse? {
-                            val u = request?.url?.toString() ?: return null
-                            addHit(u, "network")
-                            return null
-                        }
-
-                        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    // ================= SỬ DỤNG BYPASS CLIENT =================
+                    webView.webViewClient = object : BypassClient() {
+                        override fun onPageStartedPassed(view: WebView?, url: String?, favicon: Bitmap?) {
+                            super.onPageStartedPassed(view, url, favicon)
                             if (url != null) lastPageUrl[0] = url
-                            // NGUỴ TRANG NGAY TỪ ĐẦU
+                            ClipboardLogger.logAndCopy("BYPASS", "onPageStartedPassed: $url")
                             view?.evaluateJavascript(ANTI_BOT_JS, null)
                         }
 
-                        override fun onPageFinished(view: WebView?, url: String?) {
+                        override fun onPageFinishedByPassed(view: WebView?, url: String?) {
+                            super.onPageFinishedByPassed(view, url)
                             if (url != null) lastPageUrl[0] = url
                             spinner.visibility = View.GONE
-                            
-                            // Kiểm tra xem có bị block hay không
+                            ClipboardLogger.logAndCopy("BYPASS", "onPageFinishedByPassed: $url")
+
                             view?.evaluateJavascript("""
                                 (function() {
                                     var text = document.body ? document.body.innerText : "";
@@ -200,7 +194,18 @@ object PhimVNSniffer {
                             view?.evaluateJavascript(AUTOPLAY_JS, null)
                             view?.evaluateJavascript(DPAD_JS, null)
                         }
+
+                        // Vẫn giữ shouldInterceptRequest để bắt network
+                        override fun shouldInterceptRequest(
+                            view: WebView?,
+                            request: WebResourceRequest?
+                        ): WebResourceResponse? {
+                            val u = request?.url?.toString() ?: return null
+                            addHit(u, "network")
+                            return super.shouldInterceptRequest(view, request)
+                        }
                     }
+                    // =========================================================
 
                     webView.webChromeClient = object : WebChromeClient() {
                         override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
@@ -268,44 +273,13 @@ object PhimVNSniffer {
         )
     )
 
-    // SCRIPT NGUỴ TRANG MẠNH HƠN (CẢI THIỆN KHẢ NĂNG QUA MẶT CLOUDFLARE)
+    // Giữ nguyên các script JS cũ
     private const val ANTI_BOT_JS = """
     (function() {
-        // 1. Ẩn WebDriver
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        
-        // 2. Giả lập ngôn ngữ và plugin
         Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        
-        // 3. Giả lập Chrome runtime
         window.chrome = { runtime: {} };
-
-        // 4. Vượt qua kiểm tra WebGL (Cloudflare rất hay dùng cái này)
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
-            if (parameter === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
-            return getParameter.apply(this, arguments);
-        };
-
-        // 5. Vượt qua kiểm tra Canvas (Fingerprinting)
-        const originalGetContext = HTMLCanvasElement.prototype.getContext;
-        HTMLCanvasElement.prototype.getContext = function(type, attributes) {
-            const context = originalGetContext.apply(this, arguments);
-            if (type === '2d') {
-                const originalGetImageData = context.getImageData;
-                context.getImageData = function() {
-                    const imageData = originalGetImageData.apply(this, arguments);
-                    // Thay đổi 1 chút pixel để tạo fingerprint lạ
-                    if (imageData.data.length > 0) {
-                        imageData.data[0] = imageData.data[0] + 1; 
-                    }
-                    return imageData;
-                };
-            }
-            return context;
-        };
     })();
     """
 
