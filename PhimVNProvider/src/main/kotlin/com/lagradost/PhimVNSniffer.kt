@@ -1,6 +1,5 @@
 package com.phimvn
 
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.graphics.Bitmap
 import android.os.Handler
@@ -28,7 +27,7 @@ import kotlin.coroutines.suspendCoroutine
 data class SniffHit(
     val url: String,
     val referer: String,
-    val source: String   // "network" | "hls-hook" | "fetch-hook" | "xhr-hook" | "video-hook"
+    val source: String
 )
 
 object PhimVNSniffer {
@@ -81,43 +80,15 @@ object PhimVNSniffer {
             val lastPageUrl = arrayOf(url)
             val resumed = AtomicBoolean(false)
 
+            // 1. finish — khai báo đầu tiên (dùng bởi cleanup)
             fun finish(value: List<SniffHit>) {
                 if (!resumed.compareAndSet(false, true)) return
                 cont.resume(value)
             }
 
-            fun addHit(rawUrl: String, source: String) {
-                if (rawUrl.isBlank()) return
-                val cleanUrl = rawUrl.trim().trim('"', '\'')
-                if (cleanUrl.startsWith("blob:") || cleanUrl.startsWith("data:")) return
-                if (!cleanUrl.startsWith("http")) return
-                if (AD_DOMAINS.any { cleanUrl.contains(it, ignoreCase = true) }) return
-                if (SEGMENT_BLOCK.matches(cleanUrl.lowercase())) return
-                if (!STREAM_HINTS.any { it.containsMatchIn(cleanUrl) }) return
-
-                if (hits.putIfAbsent(cleanUrl, SniffHit(cleanUrl, lastPageUrl[0], source)) == null) {
-                    ClipboardLogger.logAndCopy("SNIFF", "✓ [$source] ${cleanUrl.take(180)}")
-                }
-            }
-
-            fun scheduleAfter(ms: Long) {
-                main.postDelayed({
-                    val hasM3u8 = hits.keys.any { it.contains(".m3u8", true) }
-                    if (hasM3u8) cleanup() else main.postDelayed({ cleanup() }, 5000L)
-                }, ms)
-            }
-
-            fun cleanup() {
-                if (!done.compareAndSet(false, true)) return
-                try { CookieManager.getInstance().flush() } catch (_: Throwable) {}
-                main.post {
-                    try { (activity.window.decorView as? ViewGroup)?.let { root -> } } catch (_: Throwable) {}
-                    finish(sortHits(hits.values.toList()))
-                }
-            }
-
             main.post {
                 try {
+                    // 2. Khai báo UI trước
                     val overlay = FrameLayout(activity).apply {
                         setBackgroundColor(0xE6000000.toInt())
                         isFocusable = true
@@ -156,7 +127,8 @@ object PhimVNSniffer {
                     overlay.addView(webView, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
                     overlay.addView(spinner)
 
-                    fun closeAll() {
+                    // 3. cleanup — dùng overlay, webView, finish
+                    fun cleanup() {
                         if (!done.compareAndSet(false, true)) return
                         try { CookieManager.getInstance().flush() } catch (_: Throwable) {}
                         main.post {
@@ -169,6 +141,35 @@ object PhimVNSniffer {
                         }
                     }
 
+                    // 4. scheduleAfter — dùng cleanup
+                    fun scheduleAfter(ms: Long) {
+                        main.postDelayed({
+                            val hasM3u8 = hits.keys.any { it.contains(".m3u8", true) }
+                            if (hasM3u8) cleanup()
+                            else main.postDelayed({ cleanup() }, 5000L)
+                        }, ms)
+                    }
+
+                    // 5. addHit — dùng hits, lastPageUrl
+                    fun addHit(rawUrl: String, source: String) {
+                        if (rawUrl.isBlank()) return
+                        val cleanUrl = rawUrl.trim().trim('"', '\'')
+                        if (cleanUrl.startsWith("blob:") || cleanUrl.startsWith("data:")) return
+                        if (!cleanUrl.startsWith("http")) return
+                        if (AD_DOMAINS.any { cleanUrl.contains(it, ignoreCase = true) }) return
+                        if (SEGMENT_BLOCK.matches(cleanUrl.lowercase())) return
+                        if (!STREAM_HINTS.any { it.containsMatchIn(cleanUrl) }) return
+
+                        if (hits.putIfAbsent(
+                                cleanUrl,
+                                SniffHit(cleanUrl, lastPageUrl[0], source)
+                            ) == null
+                        ) {
+                            ClipboardLogger.logAndCopy("SNIFF", "✓ [$source] ${cleanUrl.take(180)}")
+                        }
+                    }
+
+                    // 6. Giờ mới set WebViewClient (dùng được addHit)
                     webView.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(
                             view: WebView?,
@@ -192,6 +193,7 @@ object PhimVNSniffer {
                         }
                     }
 
+                    // 7. WebChromeClient (dùng addHit + scheduleAfter)
                     webView.webChromeClient = object : WebChromeClient() {
                         override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
                             val m = msg?.message() ?: return false
@@ -200,15 +202,20 @@ object PhimVNSniffer {
                                     addHit(m.removePrefix("[HLS] ").trim(), "hls-hook")
                                     if (hits.size >= 1) scheduleAfter(waitForResultsMs)
                                 }
-                                m.startsWith("[FETCH] ") -> addHit(m.removePrefix("[FETCH] ").trim(), "fetch-hook")
-                                m.startsWith("[XHR] ") -> addHit(m.removePrefix("[XHR] ").trim(), "xhr-hook")
-                                m.startsWith("[VIDEO] ") -> addHit(m.removePrefix("[VIDEO] ").trim(), "video-hook")
-                                m.startsWith("[HOOK-INIT]") -> ClipboardLogger.logAndCopy("JS", "Hooks đã cài đặt")
+                                m.startsWith("[FETCH] ") ->
+                                    addHit(m.removePrefix("[FETCH] ").trim(), "fetch-hook")
+                                m.startsWith("[XHR] ") ->
+                                    addHit(m.removePrefix("[XHR] ").trim(), "xhr-hook")
+                                m.startsWith("[VIDEO] ") ->
+                                    addHit(m.removePrefix("[VIDEO] ").trim(), "video-hook")
+                                m.startsWith("[HOOK-INIT]") ->
+                                    ClipboardLogger.logAndCopy("JS", "Hooks đã cài đặt")
                             }
                             return true
                         }
                     }
 
+                    // 8. D-pad cho TV Box
                     webView.setOnKeyListener { _, keyCode, event ->
                         if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
                         when (keyCode) {
@@ -221,14 +228,13 @@ object PhimVNSniffer {
                         }
                     }
 
+                    // 9. Attach + load + timeout
                     try {
                         (activity.window.decorView as? ViewGroup)?.addView(overlay)
                     } catch (_: Throwable) {}
 
                     webView.loadUrl(url)
-
-                    // Gọi closeAll thay vì cleanup vì đã định nghĩa đúng ở trên
-                    main.postDelayed({ closeAll() }, timeoutMs)
+                    main.postDelayed({ cleanup() }, timeoutMs)
 
                 } catch (t: Throwable) {
                     ClipboardLogger.logAndCopy("SNIFFER", "init fail: ${t.message}")
