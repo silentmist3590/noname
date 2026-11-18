@@ -150,6 +150,32 @@ class PhimVNProvider : MainAPI() {
         ClipboardLogger.logAndCopy("SESSION", "embed=${embed ?: "null"}")
         ClipboardLogger.logAndCopy("SESSION", "apiM3u8=${apiM3u8 ?: "null"}")
 
+        // ============ TẦNG 0: CloudflareKiller ============
+    if (embed != null) {
+        ClipboardLogger.logAndCopy("LAYER-cfKiller", "→ thử CloudflareKiller trên: $embed")
+        try {
+            val response = app.get(embed, interceptor = CloudflareKiller())
+            if (response.code == 200) {
+                ClipboardLogger.logAndCopy("CF-KILLER", "✓ Lấy được HTML, code=200")
+                // Tìm m3u8 trong HTML trả về
+                val html = response.text
+                val m3u8Urls = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").findAll(html)
+                for (m in m3u8Urls) {
+                    val stream = direct(m.value, embed, "cfKiller-scan")
+                    if (stream != null && emit(stream, embed, callback)) {
+                        ClipboardLogger.logAndCopy("LINKS", "=== SUCCESS via CloudflareKiller ===")
+                        return true
+                    }
+                }
+                ClipboardLogger.logAndCopy("CF-KILLER", "✗ Không tìm thấy m3u8 trong HTML")
+            } else {
+                ClipboardLogger.logAndCopy("CF-KILLER", "✗ code=${response.code}")
+            }
+        } catch (t: Throwable) {
+            ClipboardLogger.logAndCopy("CF-KILLER", "✗ Lỗi: ${t.message?.take(120)}")
+        }
+    }
+
         // ============ TẦNG 1: API trả m3u8 trực tiếp
         if (apiM3u8 != null) {
             ClipboardLogger.logAndCopy("LAYER-api", "→ thử API m3u8 trực tiếp")
