@@ -16,20 +16,38 @@ private const val LINK_SEP = "|||"
 // Context của ứng dụng, dùng để hiện thông báo chẩn đoán
 private var appCtx: Context? = null
 
-// Máy chủ HTTP nhỏ trên 127.0.0.1 để phát playlist đã giải mã cho trình phát
+// Máy chủ HTTP nhỏ trên 127.0.0.1: phát playlist đã giải mã và tải các đoạn video giúp trình phát.
+// Các đoạn có đuôi .png / Content-Type image/png nhưng thật ra là MPEG-TS, và server chỉ nhận khi có Referer của trang embed,
+// nên đi qua proxy này để gửi đúng header và trả về video/MP2T.
 private object LocalPlaylist {
     private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var server: java.net.ServerSocket? = null
+    @Volatile private var segUa: String = ""
+    @Volatile private var segRef: String = ""
+    @Volatile private var logged = 0
 
     @Synchronized
-    fun url(text: String): String {
+    private fun port(): Int {
         val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
             server = it
             start(it)
         }
+        return s.localPort
+    }
+
+    fun url(text: String, ref: String, ua: String): String {
+        segUa = ua
+        segRef = ref
+        val p = port()
+        val rewritten = text.lines().joinToString("\n") { l ->
+            when {
+                l.isBlank() || l.startsWith("#") -> l
+                else -> "http://127.0.0.1:$p/seg?u=" + java.net.URLEncoder.encode(l.trim(), "UTF-8")
+            }
+        }
         val id = "pl_${System.nanoTime()}.m3u8"
-        store[id] = text
-        return "http://127.0.0.1:${s.localPort}/$id"
+        store[id] = rewritten
+        return "http://127.0.0.1:$p/$id"
     }
 
     private fun start(s: java.net.ServerSocket) {
@@ -50,9 +68,45 @@ private object LocalPlaylist {
                     val h = r.readLine() ?: break
                     if (h.isEmpty()) break
                 }
-                val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
-                val body = path?.let { store[it] }?.toByteArray()
+                val raw = line.split(" ").getOrNull(1) ?: return
                 val out = c.getOutputStream()
+                if (raw.startsWith("/seg?")) {
+                    val target = java.net.URLDecoder.decode(raw.substringAfter("u="), "UTF-8")
+                    var code = 0
+                    var bytes = ByteArray(0)
+                    for (attempt in 1..3) {
+                        try {
+                            val rb = okhttp3.Request.Builder().url(target).header("User-Agent", segUa).header("Referer", segRef)
+                            app.baseClient.newCall(rb.build()).execute().use { resp ->
+                                code = resp.code
+                                bytes = resp.body?.bytes() ?: ByteArray(0)
+                            }
+                            if (code == 200 && bytes.isNotEmpty()) break
+                        } catch (_: Throwable) {
+                        }
+                        Thread.sleep(300L * attempt)
+                    }
+                    if (code != 200 || bytes.isEmpty()) {
+                        if (logged++ < 10) ClipboardLogger.logAndCopy("Segment", "lỗi HTTP $code len=${bytes.size} url=${target.take(120)}")
+                        out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    } else {
+                        // cắt phần đầu ngụy trang (nếu có) cho tới khi gặp chuỗi byte đồng bộ 0x47 mỗi 188 byte
+                        var off = 0
+                        if (bytes[0] != 0x47.toByte()) {
+                            val lim = minOf(bytes.size - 376, 8192)
+                            for (i in 0 until lim) {
+                                if (bytes[i] == 0x47.toByte() && bytes[i + 188] == 0x47.toByte() && bytes[i + 376] == 0x47.toByte()) { off = i; break }
+                            }
+                        }
+                        if (logged++ < 3) ClipboardLogger.logAndCopy("Segment", "OK ${bytes.size - off}B (cắt $off) ${target.takeLast(40)}")
+                        out.write(("HTTP/1.1 200 OK\r\nContent-Type: video/MP2T\r\nContent-Length: ${bytes.size - off}\r\nConnection: close\r\n\r\n").toByteArray())
+                        if (!line.startsWith("HEAD")) out.write(bytes, off, bytes.size - off)
+                    }
+                    out.flush()
+                    return
+                }
+                val path = raw.trimStart('/').substringBefore('?')
+                val body = store[path]?.toByteArray()
                 if (body == null) {
                     out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                 } else {
@@ -172,7 +226,7 @@ class PhimNguonCProvider : MainAPI() {
     ): Boolean {
         ClipboardLogger.reset()
         fun note(msg: String) {
-            ClipboardLogger.logAndCopy("v28", msg)
+            ClipboardLogger.logAndCopy("v29", msg)
         }
         note("loadLinks data=${data.take(300)}")
         return try {
@@ -232,12 +286,12 @@ class PhimNguonCProvider : MainAPI() {
                 "Referer" to embed
             )
             val ok = runCatching {
-                val local = LocalPlaylist.url(boot)
+                val local = LocalPlaylist.url(boot, embed, UA)
                 callback(
                     newExtractorLink(name, name, local, ExtractorLinkType.M3U8) {
                         this.referer = embed
                         this.quality = Qualities.Unknown.value
-                        this.headers = segHeaders
+                        this.headers = emptyMap()
                     }
                 )
                 true
@@ -360,7 +414,6 @@ class PhimNguonCProvider : MainAPI() {
         }
         val firstUri = fixed.lines().firstOrNull { it.isNotBlank() && !it.startsWith("#") }
         note("URL đầu tiên sau khi chuẩn hoá: ${firstUri?.take(200)}")
-        if (firstUri != null) probeSegment(firstUri, embed, note)
         return fixed
     }
 
