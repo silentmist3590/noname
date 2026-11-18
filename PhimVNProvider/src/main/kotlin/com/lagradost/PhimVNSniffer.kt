@@ -32,8 +32,8 @@ data class SniffHit(
 
 object PhimVNSniffer {
 
-    private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    // ĐỔI SANG USER-AGENT CỦA ALOHA BROWSER
+    private const val UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 AlohaBrowser/5.2.0"
 
     private val AD_DOMAINS = listOf(
         "doubleclick", "googlesyndication", "googleadservices",
@@ -80,7 +80,6 @@ object PhimVNSniffer {
             val lastPageUrl = arrayOf(url)
             val resumed = AtomicBoolean(false)
 
-            // 1. finish — khai báo đầu tiên (dùng bởi cleanup)
             fun finish(value: List<SniffHit>) {
                 if (!resumed.compareAndSet(false, true)) return
                 cont.resume(value)
@@ -88,7 +87,6 @@ object PhimVNSniffer {
 
             main.post {
                 try {
-                    // 2. Khai báo UI trước
                     val overlay = FrameLayout(activity).apply {
                         setBackgroundColor(0xE6000000.toInt())
                         isFocusable = true
@@ -127,7 +125,6 @@ object PhimVNSniffer {
                     overlay.addView(webView, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
                     overlay.addView(spinner)
 
-                    // 3. cleanup — dùng overlay, webView, finish
                     fun cleanup() {
                         if (!done.compareAndSet(false, true)) return
                         try { CookieManager.getInstance().flush() } catch (_: Throwable) {}
@@ -141,7 +138,6 @@ object PhimVNSniffer {
                         }
                     }
 
-                    // 4. scheduleAfter — dùng cleanup
                     fun scheduleAfter(ms: Long) {
                         main.postDelayed({
                             val hasM3u8 = hits.keys.any { it.contains(".m3u8", true) }
@@ -150,7 +146,6 @@ object PhimVNSniffer {
                         }, ms)
                     }
 
-                    // 5. addHit — dùng hits, lastPageUrl
                     fun addHit(rawUrl: String, source: String) {
                         if (rawUrl.isBlank()) return
                         val cleanUrl = rawUrl.trim().trim('"', '\'')
@@ -169,7 +164,6 @@ object PhimVNSniffer {
                         }
                     }
 
-                    // 6. Giờ mới set WebViewClient (dùng được addHit)
                     webView.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(
                             view: WebView?,
@@ -182,18 +176,32 @@ object PhimVNSniffer {
 
                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                             if (url != null) lastPageUrl[0] = url
+                            // NGUỴ TRANG NGAY TỪ ĐẦU
+                            view?.evaluateJavascript(ANTI_BOT_JS, null)
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
                             if (url != null) lastPageUrl[0] = url
                             spinner.visibility = View.GONE
+                            
+                            // Kiểm tra xem có bị block hay không
+                            view?.evaluateJavascript("""
+                                (function() {
+                                    var text = document.body ? document.body.innerText : "";
+                                    if (text.includes("Sorry, you have been blocked") || 
+                                        text.includes("You are unable to access") ||
+                                        text.includes("Access Denied")) {
+                                        console.log("[BLOCKED]");
+                                    }
+                                })();
+                            """.trimIndent(), null)
+
                             view?.evaluateJavascript(JS_HOOKS, null)
                             view?.evaluateJavascript(AUTOPLAY_JS, null)
                             view?.evaluateJavascript(DPAD_JS, null)
                         }
                     }
 
-                    // 7. WebChromeClient (dùng addHit + scheduleAfter)
                     webView.webChromeClient = object : WebChromeClient() {
                         override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
                             val m = msg?.message() ?: return false
@@ -210,12 +218,15 @@ object PhimVNSniffer {
                                     addHit(m.removePrefix("[VIDEO] ").trim(), "video-hook")
                                 m.startsWith("[HOOK-INIT]") ->
                                     ClipboardLogger.logAndCopy("JS", "Hooks đã cài đặt")
+                                m.startsWith("[BLOCKED]") -> {
+                                    ClipboardLogger.logAndCopy("SNIFFER", "❌ Bị Cloudflare WAF chặn")
+                                    main.post { cleanup() }
+                                }
                             }
                             return true
                         }
                     }
 
-                    // 8. D-pad cho TV Box
                     webView.setOnKeyListener { _, keyCode, event ->
                         if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
                         when (keyCode) {
@@ -228,7 +239,6 @@ object PhimVNSniffer {
                         }
                     }
 
-                    // 9. Attach + load + timeout
                     try {
                         (activity.window.decorView as? ViewGroup)?.addView(overlay)
                     } catch (_: Throwable) {}
@@ -257,6 +267,47 @@ object PhimVNSniffer {
             { it.url.length }
         )
     )
+
+    // SCRIPT NGUỴ TRANG MẠNH HƠN (CẢI THIỆN KHẢ NĂNG QUA MẶT CLOUDFLARE)
+    private const val ANTI_BOT_JS = """
+    (function() {
+        // 1. Ẩn WebDriver
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        
+        // 2. Giả lập ngôn ngữ và plugin
+        Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        
+        // 3. Giả lập Chrome runtime
+        window.chrome = { runtime: {} };
+
+        // 4. Vượt qua kiểm tra WebGL (Cloudflare rất hay dùng cái này)
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
+            if (parameter === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+            return getParameter.apply(this, arguments);
+        };
+
+        // 5. Vượt qua kiểm tra Canvas (Fingerprinting)
+        const originalGetContext = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function(type, attributes) {
+            const context = originalGetContext.apply(this, arguments);
+            if (type === '2d') {
+                const originalGetImageData = context.getImageData;
+                context.getImageData = function() {
+                    const imageData = originalGetImageData.apply(this, arguments);
+                    // Thay đổi 1 chút pixel để tạo fingerprint lạ
+                    if (imageData.data.length > 0) {
+                        imageData.data[0] = imageData.data[0] + 1; 
+                    }
+                    return imageData;
+                };
+            }
+            return context;
+        };
+    })();
+    """
 
     private const val JS_HOOKS = """
     (function(){
