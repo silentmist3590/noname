@@ -15,13 +15,55 @@ private const val VS_SEP = "|||"
 // Đặt false khi đã chạy ổn để tắt việc chép log vào clipboard
 private const val DEBUG = true
 
-/** Máy chủ HTTP nhỏ trên 127.0.0.1: đưa playlist đã tải/kiểm tra sẵn cho trình phát (mỗi lần phát một địa chỉ riêng, không dính cache cũ). */
-private object LocalPlaylist {
-    private val store = java.util.concurrent.ConcurrentHashMap<String, String>()
-    private var server: java.net.ServerSocket? = null
+// Log chẩn đoán: ghi nối tiếp và chép toàn bộ vào clipboard (chỉ khi DEBUG = true)
+private object VsLog {
+    private val buf = StringBuilder()
 
     @Synchronized
-    fun url(text: String): String {
+    fun add(title: String, msg: String) {
+        android.util.Log.d("VSMov", "[$title] $msg")
+        if (!DEBUG) return
+        buf.append("=== [").append(title).append("] ===\n").append(msg).append("\n\n")
+        if (buf.length > 40_000) buf.delete(0, buf.length - 40_000)
+        val c = vsAppCtx ?: return
+        val text = buf.toString()
+        runCatching {
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                runCatching {
+                    (c.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("VSMov log", text))
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun reset() { buf.setLength(0) }
+}
+
+/**
+ * Máy chủ HTTP nhỏ trên 127.0.0.1.
+ *  - /<id>.m3u8 : playlist con (media) đã viết lại, mỗi đoạn trỏ về /s/<id>/<chỉ số>.
+ *  - /s/<id>/<n> : proxy tải đoạn n bằng OkHttp với Referer/UA đúng, có thử lại; nếu link đoạn hết hạn (403/404/410...)
+ *    thì tải lại playlist gốc để lấy link mới rồi thử tiếp. Nhờ vậy phim không bị đứt giữa chừng khi link ký tên hết hạn sau vài phút.
+ *  - /u/<id>?u=... : tải các tài nguyên phụ (khóa mã hóa, map) qua proxy.
+ */
+private object LocalPlaylist {
+    private class Stream(
+        val mediaUrl: String,
+        val ref: String,
+        val ua: String,
+        var template: List<String>,   // các dòng playlist, dòng đoạn đã thay bằng {SEG:n}
+        var segs: MutableList<String>,
+        var refreshedAt: Long
+    )
+
+    private val streams = java.util.concurrent.ConcurrentHashMap<String, Stream>()
+    private var server: java.net.ServerSocket? = null
+    @Volatile private var logged = 0
+
+    @Synchronized
+    private fun port(): Int {
         val s = server ?: java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1")).also {
             server = it
             Thread {
@@ -31,9 +73,90 @@ private object LocalPlaylist {
                 }
             }.apply { isDaemon = true }.start()
         }
-        val id = "pl_${System.nanoTime()}.m3u8"
-        store[id] = text
-        return "http://127.0.0.1:${s.localPort}/$id"
+        return s.localPort
+    }
+
+    private fun enc(x: String) = java.net.URLEncoder.encode(x, "UTF-8")
+
+    // text: playlist con đã có URL tuyệt đối. Trả về URL cục bộ.
+    fun register(text: String, mediaUrl: String, ref: String, ua: String): String {
+        val id = java.lang.Long.toHexString(System.nanoTime())
+        val st = Stream(mediaUrl, ref, ua, emptyList(), mutableListOf(), System.currentTimeMillis())
+        val (tpl, segs) = split(text, id)
+        st.template = tpl
+        st.segs = segs
+        streams[id] = st
+        return "http://127.0.0.1:${port()}/$id.m3u8"
+    }
+
+    private fun split(text: String, id: String): Pair<List<String>, MutableList<String>> {
+        val segs = mutableListOf<String>()
+        val p = port()
+        val tpl = text.lines().map { l ->
+            val t = l.trim()
+            when {
+                t.isEmpty() -> l
+                t.startsWith("#") -> Regex("""URI="([^"]+)"""").replace(l) { m -> "URI=\"http://127.0.0.1:$p/u/$id?u=" + enc(m.groupValues[1]) + "\"" }
+                else -> { segs.add(t); "http://127.0.0.1:$p/s/$id/${segs.size - 1}" }
+            }
+        }
+        return tpl to segs
+    }
+
+    private fun get(url: String, st: Stream): Pair<Int, ByteArray> {
+        val rb = okhttp3.Request.Builder().url(url)
+            .header("User-Agent", st.ua).header("Referer", st.ref).header("Accept", "*/*")
+        app.baseClient.newCall(rb.build()).execute().use { r ->
+            return r.code to (r.body?.bytes() ?: ByteArray(0))
+        }
+    }
+
+    // Tải lại playlist gốc để lấy link đoạn mới (tối đa 1 lần / 5 giây)
+    @Synchronized
+    private fun refresh(id: String, st: Stream) {
+        if (System.currentTimeMillis() - st.refreshedAt < 5_000) return
+        st.refreshedAt = System.currentTimeMillis()
+        try {
+            val (code, body) = get(st.mediaUrl, st)
+            val txt = String(body)
+            if (code == 200 && txt.trimStart().startsWith("#EXTM3U")) {
+                val fresh = txt.lines().filter { it.isNotBlank() && !it.trim().startsWith("#") }.map { resolve(it.trim(), st.mediaUrl) }
+                if (fresh.size == st.segs.size) {
+                    st.segs = fresh.toMutableList()
+                    VsLog.add("Refresh", "đã tải lại playlist, ${fresh.size} đoạn")
+                } else VsLog.add("Refresh", "số đoạn đổi ${st.segs.size} -> ${fresh.size}, bỏ qua")
+            } else VsLog.add("Refresh", "lỗi HTTP $code")
+        } catch (t: Throwable) {
+            VsLog.add("Refresh", "lỗi ${t.message?.take(100)}")
+        }
+    }
+
+    private fun resolve(u: String, base: String): String = try { java.net.URI(base).resolve(u).toString() } catch (_: Throwable) { u }
+
+    private fun cleanTs(b: ByteArray): Int {
+        if (b.isEmpty() || b[0] == 0x47.toByte()) return 0
+        if (b.size > 8 && String(b, 4, 4, Charsets.ISO_8859_1).let { it == "ftyp" || it == "moof" || it == "styp" }) return 0
+        val lim = minOf(b.size - 376, 8192)
+        for (i in 0 until lim) if (b[i] == 0x47.toByte() && b[i + 188] == 0x47.toByte() && b[i + 376] == 0x47.toByte()) return i
+        return 0
+    }
+
+    private fun segment(id: String, st: Stream, idx: Int): ByteArray? {
+        var lastCode = 0
+        for (attempt in 0 until 5) {
+            val url = st.segs.getOrNull(idx) ?: return null
+            try {
+                val (code, bytes) = get(url, st)
+                lastCode = code
+                if (code == 200 && bytes.isNotEmpty()) return bytes
+                if (code in listOf(401, 403, 404, 410) || code >= 500) refresh(id, st)
+            } catch (t: Throwable) {
+                lastCode = -1
+            }
+            Thread.sleep(400L * (attempt + 1))
+        }
+        if (logged++ < 15) VsLog.add("Segment", "đoạn $idx lỗi sau 5 lần thử (HTTP $lastCode) ${st.segs.getOrNull(idx)?.take(140)}")
+        return null
     }
 
     private fun handle(c: java.net.Socket) {
@@ -45,19 +168,45 @@ private object LocalPlaylist {
                     val h = r.readLine() ?: break
                     if (h.isEmpty()) break
                 }
-                val path = line.split(" ").getOrNull(1)?.trimStart('/')?.substringBefore('?')
-                val body = path?.let { store[it] }?.toByteArray()
+                val raw = line.split(" ").getOrNull(1) ?: return
+                val head = line.startsWith("HEAD")
                 val out = c.getOutputStream()
-                if (body == null) {
-                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
-                } else {
-                    out.write(
-                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
-                            "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray()
-                    )
-                    if (!line.startsWith("HEAD")) out.write(body)
+                fun fail(code: String) {
+                    out.write("HTTP/1.1 $code\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray()); out.flush()
                 }
-                out.flush()
+                when {
+                    raw.startsWith("/s/") -> {
+                        val seg = raw.removePrefix("/s/").substringBefore('?')
+                        val id = seg.substringBefore('/')
+                        val idx = seg.substringAfter('/').toIntOrNull()
+                        val st = streams[id]
+                        if (st == null || idx == null) return fail("404 Not Found")
+                        val bytes = segment(id, st, idx) ?: return fail("502 Bad Gateway")
+                        val off = cleanTs(bytes)
+                        val ct = if (st.segs[idx].substringBefore('?').let { it.endsWith(".m4s") || it.endsWith(".mp4") }) "video/mp4" else "video/MP2T"
+                        out.write("HTTP/1.1 200 OK\r\nContent-Type: $ct\r\nContent-Length: ${bytes.size - off}\r\nConnection: close\r\n\r\n".toByteArray())
+                        if (!head) out.write(bytes, off, bytes.size - off)
+                        out.flush()
+                    }
+                    raw.startsWith("/u/") -> {
+                        val id = raw.removePrefix("/u/").substringBefore('?')
+                        val st = streams[id] ?: return fail("404 Not Found")
+                        val target = java.net.URLDecoder.decode(raw.substringAfter("u="), "UTF-8")
+                        val (code, bytes) = get(target, st)
+                        if (code != 200) return fail("502 Bad Gateway")
+                        out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                        if (!head) out.write(bytes)
+                        out.flush()
+                    }
+                    else -> {
+                        val id = raw.trimStart('/').substringBefore('?').removeSuffix(".m3u8")
+                        val st = streams[id] ?: return fail("404 Not Found")
+                        val body = st.template.joinToString("\n").toByteArray()
+                        out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                        if (!head) out.write(body)
+                        out.flush()
+                    }
+                }
             }
         }
     }
@@ -353,22 +502,22 @@ class VsMovProvider : MainAPI() {
             }
             for (v in vs.sortedByDescending { it.bw }.take(4)) {
                 val vt = fetchPlaylist(v.url, ref) ?: continue
-                val link = LocalPlaylist.url(absAll(vt, v.url))
+                val link = LocalPlaylist.register(absAll(vt, v.url), v.url, ref, vsUa)
                 callback(
                     newExtractorLink(name, if (v.h > 0) "$name ${v.h}p" else name, link, ExtractorLinkType.M3U8) {
                         this.referer = ref
                         this.quality = if (v.h > 0) v.h else Qualities.Unknown.value
-                        this.headers = playerHeaders(ref)
+                        this.headers = emptyMap()
                     }
                 )
                 count++
             }
         } else {
             callback(
-                newExtractorLink(name, name, LocalPlaylist.url(abs), ExtractorLinkType.M3U8) {
+                newExtractorLink(name, name, LocalPlaylist.register(abs, url, ref, vsUa), ExtractorLinkType.M3U8) {
                     this.referer = ref
                     this.quality = Qualities.Unknown.value
-                    this.headers = playerHeaders(ref)
+                    this.headers = emptyMap()
                 }
             )
             count++
@@ -396,6 +545,7 @@ class VsMovProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        VsLog.reset()
         val parts = data.split(VS_SEP, limit = 3)
         val m3u8 = parts.getOrNull(0).orEmpty()
         val embed = parts.getOrNull(1).orEmpty()
