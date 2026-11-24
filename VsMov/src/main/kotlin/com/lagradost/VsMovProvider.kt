@@ -143,7 +143,7 @@ private object LocalPlaylist {
 
     private fun segment(id: String, st: Stream, idx: Int): ByteArray? {
         var lastCode = 0
-        for (attempt in 0 until 5) {
+        for (attempt in 0 until 8) {
             val url = st.segs.getOrNull(idx) ?: return null
             try {
                 val (code, bytes) = get(url, st)
@@ -153,9 +153,9 @@ private object LocalPlaylist {
             } catch (t: Throwable) {
                 lastCode = -1
             }
-            Thread.sleep(400L * (attempt + 1))
+            Thread.sleep(minOf(1500L * (attempt + 1), 6000L))
         }
-        if (logged++ < 15) VsLog.add("Segment", "đoạn $idx lỗi sau 5 lần thử (HTTP $lastCode) ${st.segs.getOrNull(idx)?.take(140)}")
+        if (logged++ < 15) VsLog.add("Segment", "đoạn $idx lỗi sau 8 lần thử (HTTP $lastCode) ${st.segs.getOrNull(idx)?.take(140)}")
         return null
     }
 
@@ -386,15 +386,56 @@ class VsMovProvider : MainAPI() {
         return r?.text?.trimStart()?.startsWith("#EXTM3U") == true
     }
 
+    private fun emitSubs(text: String, embed: String, cb: (SubtitleFile) -> Unit, log: StringBuilder) {
+        val raw = Regex("""subtitles:\s*(\[[^\n]*\])""").find(text)?.groupValues?.get(1) ?: return
+        val origin = Regex("^(https?://[^/]+)").find(embed)?.groupValues?.get(1) ?: return
+        val names = mapOf("vie" to "Tiếng Việt", "eng" to "English", "chi" to "中文", "zho" to "中文", "kor" to "한국어", "jpn" to "日本語", "tha" to "ไทย")
+        runCatching {
+            val arr = org.json.JSONArray(raw)
+            val seen = HashSet<String>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                var u = o.optString("url")
+                if (u.isBlank()) continue
+                u = when {
+                    u.startsWith("http") -> u
+                    u.startsWith("//") -> "https:$u"
+                    u.startsWith("/") -> origin + u
+                    else -> "$origin/$u"
+                }
+                if (!seen.add(u)) continue
+                val code = o.optString("code").ifBlank { o.optString("name").substringBefore(' ') }
+                val lang = names[code.lowercase()] ?: code.ifBlank { "Subtitle" }
+                cb(newSubtitleFile(url = u, lang = lang))
+                log.append("sub ").append(lang).append(" -> ").append(u).append('\n')
+            }
+        }.onFailure { log.append("lỗi đọc phụ đề: ").append(it.message).append('\n') }
+    }
+
     // Đọc trang embed bằng yêu cầu thường (Referer là vsmov.com) và tìm link .m3u8 trong mã nguồn.
     // Chỉ thành công nếu trang để lộ link playlist; không giải mã hay can thiệp gì thêm.
-    private suspend fun findM3u8(embed: String, log: StringBuilder): String? {
+    private suspend fun findM3u8(embed: String, log: StringBuilder, subtitleCallback: (SubtitleFile) -> Unit): String? {
         val embedOrigin = originOf(embed)
         val page = runCatching { app.get(embed, referer = "$mainUrl/").text }.getOrNull()
         log.append("embed=").append(embed).append('\n')
         log.append("html len=").append(page?.length).append('\n')
         log.append("html head=").append(page?.replace(Regex("\\s+"), " ")?.take(1500)).append('\n')
         val text = page?.replace("\\/", "/") ?: return null
+
+        // Phụ đề do trang embed khai báo trong playerOptions.subtitles (đường dẫn .vtt tương đối theo máy chủ embed)
+        emitSubs(text, embed, subtitleCallback, log)
+
+        // Link master.m3u8 do trang tự ghép từ baseUrl + /stream/<videoHash>/master.m3u8 (hoặc signedMasterUrl nếu bật)
+        val baseUrl = Regex("""baseUrl\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+        val videoHash = Regex("""videoHash\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+        val signed = Regex("""signedMasterUrl:\s*"([^"]*)"""").find(text)?.groupValues?.get(1).orEmpty()
+        val signedOn = Regex("""enableSignedUrl:\s*true""").containsMatchIn(text)
+        val direct = listOfNotNull(
+            signed.takeIf { signedOn && it.startsWith("http") },
+            if (!baseUrl.isNullOrBlank() && !videoHash.isNullOrBlank()) "$baseUrl/stream/$videoHash/master.m3u8" else null
+        )
+        log.append("master từ cấu hình trang=").append(direct).append('\n')
+        for (c in direct) if (isHls(c, embed)) return c
 
         val scripts = Regex("src=[\"']([^\"']+\\.js[^\"']*)[\"']").findAll(text).map { it.groupValues[1] }.toList()
         log.append("scripts=").append(scripts).append('\n')
@@ -572,7 +613,8 @@ class VsMovProvider : MainAPI() {
         // 2) Link embed: đọc trang embed, tìm link .m3u8 hiện trong mã nguồn trang (nếu có)
         if (embed.startsWith("http")) {
             val log = StringBuilder()
-            val found = findM3u8(embed, log)
+            val found = findM3u8(embed, log, subtitleCallback)
+            if (DEBUG) VsLog.add("Embed", log.toString().take(3000) + "found=$found")
             if (found != null) {
                 if (emitHls(found, originOf(embed), callback) > 0) return true
                 var ok = false
