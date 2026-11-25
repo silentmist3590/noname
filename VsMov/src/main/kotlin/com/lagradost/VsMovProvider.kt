@@ -386,7 +386,7 @@ class VsMovProvider : MainAPI() {
         return r?.text?.trimStart()?.startsWith("#EXTM3U") == true
     }
 
-    private fun emitSubs(text: String, embed: String, cb: (SubtitleFile) -> Unit, log: StringBuilder) {
+    private suspend fun emitSubs(text: String, embed: String, cb: (SubtitleFile) -> Unit, log: StringBuilder) {
         val raw = Regex("""subtitles:\s*(\[[^\n]*\])""").find(text)?.groupValues?.get(1) ?: return
         val origin = Regex("^(https?://[^/]+)").find(embed)?.groupValues?.get(1) ?: return
         val names = mapOf("vie" to "Tiếng Việt", "eng" to "English", "chi" to "中文", "zho" to "中文", "kor" to "한국어", "jpn" to "日本語", "tha" to "ไทย")
