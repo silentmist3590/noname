@@ -103,10 +103,29 @@ private object LocalPlaylist {
         return tpl to segs
     }
 
+    // Đoạn video lớn tải chậm: nới thời gian chờ để không bị ngắt giữa chừng
+    private val client by lazy {
+        app.baseClient.newBuilder()
+            .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(90, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    // Tải trước các đoạn kế tiếp để trình phát không phải chờ (đặc biệt khi phim nặng, chỉ có 1 chất lượng)
+    private val pool = java.util.concurrent.Executors.newFixedThreadPool(4) { r -> Thread(r).apply { isDaemon = true } }
+    private val cache = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.Future<ByteArray?>>()
+    private const val AHEAD = 4
+
+    private fun fut(id: String, st: Stream, idx: Int): java.util.concurrent.Future<ByteArray?>? {
+        if (idx < 0 || idx >= st.segs.size) return null
+        return cache.computeIfAbsent("$id/$idx") { pool.submit<ByteArray?> { fetchSeg(id, st, idx) } }
+    }
+
     private fun get(url: String, st: Stream): Pair<Int, ByteArray> {
         val rb = okhttp3.Request.Builder().url(url)
             .header("User-Agent", st.ua).header("Referer", st.ref).header("Accept", "*/*")
-        app.baseClient.newCall(rb.build()).execute().use { r ->
+        client.newCall(rb.build()).execute().use { r ->
             return r.code to (r.body?.bytes() ?: ByteArray(0))
         }
     }
@@ -141,7 +160,7 @@ private object LocalPlaylist {
         return 0
     }
 
-    private fun segment(id: String, st: Stream, idx: Int): ByteArray? {
+    private fun fetchSeg(id: String, st: Stream, idx: Int): ByteArray? {
         var lastCode = 0
         for (attempt in 0 until 8) {
             val url = st.segs.getOrNull(idx) ?: return null
@@ -157,6 +176,16 @@ private object LocalPlaylist {
         }
         if (logged++ < 15) VsLog.add("Segment", "đoạn $idx lỗi sau 8 lần thử (HTTP $lastCode) ${st.segs.getOrNull(idx)?.take(140)}")
         return null
+    }
+
+    private fun segment(id: String, st: Stream, idx: Int): ByteArray? {
+        val f = fut(id, st, idx) ?: return null
+        val bytes = try { f.get(300, java.util.concurrent.TimeUnit.SECONDS) } catch (t: Throwable) { null }
+        if (bytes == null) cache.remove("$id/$idx")
+        // dọn các đoạn đã phát qua, rồi tải trước các đoạn tiếp theo
+        cache.keys.filter { k -> k.startsWith("$id/") && (k.substringAfter('/').toIntOrNull() ?: 0) < idx - 1 }.forEach { cache.remove(it) }
+        for (n in 1..AHEAD) fut(id, st, idx + n)
+        return bytes
     }
 
     private fun handle(c: java.net.Socket) {
@@ -387,8 +416,14 @@ class VsMovProvider : MainAPI() {
     }
 
     private suspend fun emitSubs(text: String, embed: String, cb: (SubtitleFile) -> Unit, log: StringBuilder) {
-        val raw = Regex("""subtitles:\s*(\[[^\n]*\])""").find(text)?.groupValues?.get(1) ?: return
         val origin = Regex("^(https?://[^/]+)").find(embed)?.groupValues?.get(1) ?: return
+        val raw = Regex("""subtitles["']?\s*:\s*(\[[\s\S]*?\])\s*[,}]""").find(text)?.groupValues?.get(1)
+            ?: run {
+                // Dự phòng: gom mọi đường dẫn .vtt/.srt xuất hiện trong trang
+                val urls = Regex("""["']([^"'\s]+\.(?:vtt|srt)(?:\?[^"'\s]*)?)["']""").findAll(text).map { it.groupValues[1] }.distinct().toList()
+                if (urls.isEmpty()) return
+                org.json.JSONArray(urls.map { org.json.JSONObject().put("url", it).put("code", if (it.contains("vie", true) || it.contains("vi.", true)) "vie" else "") }).toString()
+            }
         val names = mapOf("vie" to "Tiếng Việt", "eng" to "English", "chi" to "中文", "zho" to "中文", "kor" to "한국어", "jpn" to "日本語", "tha" to "ไทย")
         runCatching {
             val arr = org.json.JSONArray(raw)
@@ -421,9 +456,6 @@ class VsMovProvider : MainAPI() {
         log.append("html len=").append(page?.length).append('\n')
         log.append("html head=").append(page?.replace(Regex("\\s+"), " ")?.take(1500)).append('\n')
         val text = page?.replace("\\/", "/") ?: return null
-
-        // Phụ đề do trang embed khai báo trong playerOptions.subtitles (đường dẫn .vtt tương đối theo máy chủ embed)
-        emitSubs(text, embed, subtitleCallback, log)
 
         // Link master.m3u8 do trang tự ghép từ baseUrl + /stream/<videoHash>/master.m3u8 (hoặc signedMasterUrl nếu bật)
         val baseUrl = Regex("""baseUrl\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
@@ -592,6 +624,18 @@ class VsMovProvider : MainAPI() {
         val embed = parts.getOrNull(1).orEmpty()
         val page = parts.getOrNull(2).orEmpty().ifBlank { mainUrl }
         val ref = "$mainUrl/"
+
+        // 0) Phụ đề: luôn đọc từ trang embed trước (kể cả khi link m3u8 lấy được từ API)
+        if (embed.startsWith("http")) {
+            val slog = StringBuilder()
+            runCatching {
+                val html = app.get(embed, referer = "$mainUrl/").text.replace("\\/", "/")
+                slog.append("embed html len=").append(html.length).append('\n')
+                emitSubs(html, embed, subtitleCallback, slog)
+                if (!html.contains("subtitles")) slog.append("trang không có 'subtitles'\n")
+            }.onFailure { slog.append("lỗi tải embed: ").append(it.message).append('\n') }
+            if (DEBUG) VsLog.add("Subs", slog.toString().take(2000))
+        }
 
         // 1) Link m3u8 từ API: chỉ dùng nếu là playlist HLS thật
         if (m3u8.startsWith("http")) {
