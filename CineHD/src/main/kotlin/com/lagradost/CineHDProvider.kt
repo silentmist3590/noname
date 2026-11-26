@@ -942,7 +942,7 @@ class CineHDProvider : MainAPI() {
         try {
             loadSubtitlesFromData(parsed, subtitleCallback, d)
         } catch (e: Throwable) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
+            if (e is java.util.concurrent.CancellationException) throw e
             d.err("Không tải được danh sách phụ đề", e)
         }
 
