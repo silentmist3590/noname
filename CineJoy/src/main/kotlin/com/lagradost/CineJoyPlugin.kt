@@ -22,6 +22,18 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import org.json.JSONArray
+import java.io.BufferedReader
+import java.io.ByteArrayInputStream
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.ZipInputStream
 
 // ============================================================================
 // LOG + CLIPBOARD
@@ -152,7 +164,8 @@ class CineJoyProvider : MainAPI() {
         { url -> "https://cors.eu.org/$url" },
         { url -> "https://corsproxy.io/?url=${URLEncoder.encode(url, "UTF-8")}" },
     )
-
+    // API key mặc định được chuyển từ Vidup; thay giá trị này nếu bạn dùng key SubDL riêng.
+    private val defaultSubdlApiKey = "xHeOWlCfS9o4EKmK7OwbeOBIhfbIHr2Y"
     private val vidloveBase = "https://api.vidlove.cc"
     private val vidloveReferer = "https://player.vidlove.cc/"
     private val vidrockBase = "https://vidrock.net"
@@ -340,7 +353,568 @@ class CineJoyProvider : MainAPI() {
         CJLog.log("search", "query=$query: ${out.size} items")
         return out
     }
-
+// ─────────────────────── phụ đề: OpenSubtitles + SubDL ───────────────────────
+ 
+    private data class SubtitleMediaRef(
+        val type: String, // movie | tv
+        val tmdbId: Int,
+        val season: Int?,
+        val episode: Int?
+    )
+ 
+    private data class SubtitleIdentity(val tmdbId: Int, val imdbId: String)
+ 
+    private data class SubtitleCandidate(
+        val source: String,
+        val langLabel: String,
+        val url: String,
+        val releaseHint: String
+    )
+ 
+    private fun extractImdbId(text: String): String =
+        Regex("""(?i)\btt\d{7,10}\b""").find(text)?.value.orEmpty()
+ 
+    private fun appendSubExtFragment(url: String, formatHint: String = "srt"): String {
+        val lower = url.lowercase()
+        if (lower.contains(".srt") || lower.contains(".vtt") || lower.contains(".ass") || lower.contains(".ssa")) {
+            return url
+        }
+        val ext = when (formatHint.lowercase()) {
+            "vtt", "webvtt" -> "vtt"
+            "ass" -> "ass"
+            "ssa" -> "ssa"
+            else -> "srt"
+        }
+        return "$url#file.$ext"
+    }
+ 
+    private suspend fun tmdbGet(path: String): JSONObject? {
+        val sep = if (path.contains("?")) "&" else "?"
+        for (k in tmdbHosts.indices) {
+            val hi = (tmdbPrefer + k) % tmdbHosts.size
+            val host = tmdbHosts[hi]
+            for (apiKey in tmdbKeys) {
+                val text = runCatching {
+                    app.get(
+                        "$host$path${sep}api_key=$apiKey",
+                        headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json"),
+                        timeout = 10L
+                    ).text
+                }.getOrNull()
+                if (!text.isNullOrBlank()) {
+                    val json = runCatching { JSONObject(text) }.getOrNull()
+                    if (json != null && !json.has("status_code")) {
+                        tmdbPrefer = hi
+                        return json
+                    }
+                    if (json?.optInt("status_code") == 34) return null
+                }
+            }
+            val bearerText = runCatching {
+                app.get(
+                    "$host$path",
+                    headers = mapOf(
+                        "User-Agent" to userAgent,
+                        "Authorization" to "Bearer $tmdbBearerToken",
+                        "Accept" to "application/json"
+                    ),
+                    timeout = 10L
+                ).text
+            }.getOrNull()
+            if (!bearerText.isNullOrBlank()) {
+                val json = runCatching { JSONObject(bearerText) }.getOrNull()
+                if (json != null && !json.has("status_code")) {
+                    tmdbPrefer = hi
+                    return json
+                }
+            }
+        }
+        return null
+    }
+ 
+    private fun normalizeSubtitleTitle(value: String): String = value
+        .replace(Regex("""\b(19\d{2}|20\d{2})\b"""), " ")
+        .replace(
+            Regex("""\b(hindi|english|dubbed|dual audio|multi audio|uncut|full movie|watch online|movie|web series|series|season|complete|anime|cartoon|k drama)\b""", RegexOption.IGNORE_CASE),
+            " "
+        )
+        .replace(Regex("""\b(s\d{1,2}|e\d{1,3}|480p|720p|1080p|2160p|4k|hdrip|webrip|web-dl|bluray)\b""", RegexOption.IGNORE_CASE), " ")
+        .replace(Regex("""[^a-zA-Z0-9]+"""), " ")
+        .trim()
+        .lowercase()
+ 
+    private fun subtitleTitleScore(a: String, b: String): Double {
+        val left = normalizeSubtitleTitle(a)
+        val right = normalizeSubtitleTitle(b)
+        if (left.isBlank() || right.isBlank()) return 0.0
+        if (left == right) return 1.0
+        if (left.contains(right) || right.contains(left)) {
+            return minOf(left.length, right.length).toDouble() / maxOf(left.length, right.length).toDouble()
+        }
+        val la = left.split(Regex("\\s+")).filter { it.length > 1 }.toSet()
+        val rb = right.split(Regex("\\s+")).filter { it.length > 1 }.toSet()
+        if (la.isEmpty() || rb.isEmpty()) return 0.0
+        return la.intersect(rb).size.toDouble() / la.union(rb).size.toDouble()
+    }
+ 
+    /** Tìm TMDB/IMDb ID khi HTML CineFreak không nhúng IMDb ID. */
+    private suspend fun resolveSubtitleIdentity(
+        title: String,
+        year: Int?,
+        type: String
+    ): SubtitleIdentity? {
+        if (title.isBlank()) return null
+        val query = URLEncoder.encode(normalizeSubtitleTitle(title), "UTF-8")
+        if (query.isBlank()) return null
+        val yearParam = if (year != null) {
+            if (type == "tv") "&first_air_date_year=$year" else "&year=$year"
+        } else ""
+        val search = tmdbGet("/search/$type?query=$query&include_adult=false&page=1$yearParam") ?: return null
+        val results = search.optJSONArray("results") ?: return null
+        data class TmdbCandidate(val id: Int, val score: Double, val year: Int?)
+        val candidates = mutableListOf<TmdbCandidate>()
+        for (i in 0 until results.length()) {
+            val item = results.optJSONObject(i) ?: continue
+            val id = item.optInt("id", 0)
+            if (id <= 0) continue
+            val candidateTitle = item.optString(if (type == "tv") "name" else "title", "")
+            val date = item.optString(if (type == "tv") "first_air_date" else "release_date", "")
+            val candidateYear = Regex("""^(\d{4})""").find(date)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val score = subtitleTitleScore(title, candidateTitle)
+            if (score < 0.62) continue
+            if (year != null && candidateYear != null && kotlin.math.abs(year - candidateYear) > 1) continue
+            candidates.add(TmdbCandidate(id, score, candidateYear))
+        }
+        candidates.sortWith(
+            compareByDescending<TmdbCandidate> { it.score }
+                .thenBy { candidate ->
+                    val candidateYear = candidate.year
+                    if (year == null || candidateYear == null) 0 else kotlin.math.abs(year - candidateYear)
+                }
+        )
+ 
+        for (candidate in candidates.take(4)) {
+            val details = tmdbGet("/$type/${candidate.id}?append_to_response=external_ids") ?: continue
+            val imdbId = details.optString("imdb_id", "").ifBlank {
+                details.optJSONObject("external_ids")?.optString("imdb_id", "") ?: ""
+            }
+            return SubtitleIdentity(candidate.id, imdbId.takeIf { it.startsWith("tt") }.orEmpty())
+        }
+        return null
+    }
+ 
+    // Proxy loopback: chỉ tải và giải nén ZIP SubDL khi người xem thực sự chọn subtitle.
+    private object CineFreakSubdlProxy {
+        private data class Entry(
+            val zipUrl: String,
+            val isTv: Boolean,
+            val season: Int?,
+            val episode: Int?,
+            val userAgent: String
+        )
+ 
+        private var serverSocket: ServerSocket? = null
+        private var port: Int = -1
+        private val sequence = AtomicInteger(0)
+        private val entries = ConcurrentHashMap<String, Entry>()
+        private val memoryCache = ConcurrentHashMap<String, Pair<String, ByteArray>>()
+ 
+        @Synchronized
+        fun ensureStarted(): Int {
+            if (port > 0 && serverSocket?.isClosed == false) return port
+            return runCatching {
+                val server = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+                serverSocket = server
+                port = server.localPort
+                Thread {
+                    while (!server.isClosed) {
+                        try {
+                            val client = server.accept()
+                            Thread { handleClient(client) }.apply { isDaemon = true }.start()
+                        } catch (_: Exception) {
+                            if (server.isClosed) break
+                        }
+                    }
+                }.apply { isDaemon = true }.start()
+                port
+            }.getOrDefault(-1)
+        }
+ 
+        fun register(
+            zipUrl: String,
+            isTv: Boolean,
+            season: Int?,
+            episode: Int?,
+            userAgent: String
+        ): String? {
+            val localPort = ensureStarted()
+            if (localPort <= 0) return null
+            if (entries.size > 200) entries.clear()
+            val token = sequence.incrementAndGet().toString()
+            entries[token] = Entry(zipUrl, isTv, season, episode, userAgent)
+            return "http://127.0.0.1:$localPort/subdl/$token.srt"
+        }
+ 
+        private fun handleClient(socket: Socket) {
+            try {
+                socket.soTimeout = 15_000
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+                val requestLine = reader.readLine() ?: return
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    if (line.isEmpty()) break
+                }
+                val parts = requestLine.split(" ")
+                val method = parts.getOrNull(0)?.uppercase() ?: "GET"
+                val rawPath = parts.getOrNull(1) ?: ""
+                val token = Regex("""/subdl/(\d+)\.srt""").find(rawPath)?.groupValues?.getOrNull(1)
+                val entry = token?.let { entries[it] }
+                val output = socket.getOutputStream()
+                if (token == null || entry == null) {
+                    output.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    output.flush()
+                    return
+                }
+                val resolved = memoryCache[token] ?: fetchAndUnzip(entry)?.also {
+                    if (memoryCache.size >= 12) memoryCache.clear()
+                    memoryCache[token] = it
+                }
+                if (resolved == null) {
+                    output.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    output.flush()
+                    return
+                }
+                val (mime, bytes) = resolved
+                val headers = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: $mime\r\n" +
+                    "Content-Length: ${bytes.size}\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n" +
+                    "Connection: close\r\n\r\n"
+                output.write(headers.toByteArray(Charsets.US_ASCII))
+                if (method != "HEAD") output.write(bytes)
+                output.flush()
+            } catch (_: Exception) {
+            } finally {
+                try { socket.close() } catch (_: Exception) { }
+            }
+        }
+ 
+        private fun fetchAndUnzip(entry: Entry): Pair<String, ByteArray>? {
+            val zipBytes = downloadBlocking(
+                entry.zipUrl,
+                mapOf("User-Agent" to entry.userAgent, "Referer" to "https://subdl.com/", "Accept" to "*/*")
+            ) ?: return null
+            if (zipBytes.isEmpty()) return null
+            if (zipBytes.size >= 4 && zipBytes[0] == 0x50.toByte() && zipBytes[1] == 0x4B.toByte()) {
+                val validExts = listOf(".srt", ".vtt", ".ass", ".ssa")
+                val found = mutableListOf<Pair<String, ByteArray>>()
+                ZipInputStream(ByteArrayInputStream(zipBytes)).use { zis ->
+                    var item = zis.nextEntry
+                    while (item != null) {
+                        val name = item.name ?: ""
+                        val lower = name.lowercase()
+                        if (!item.isDirectory && !lower.contains("__macosx/") && validExts.any { lower.endsWith(it) }) {
+                            val bytes = zis.readBytes()
+                            if (bytes.isNotEmpty()) found.add(name to bytes)
+                        }
+                        zis.closeEntry()
+                        item = zis.nextEntry
+                    }
+                }
+                if (found.isEmpty()) return null
+                val best = found.sortedWith(
+                    compareBy<Pair<String, ByteArray>>(
+                        { if (entry.isTv && !matchesEpisodeHint(it.first, entry.season, entry.episode)) 1 else 0 },
+                        {
+                            when {
+                                it.first.endsWith(".srt", true) -> 0
+                                it.first.endsWith(".vtt", true) -> 1
+                                else -> 2
+                            }
+                        }
+                    )
+                ).first()
+                val mime = if (best.first.endsWith(".vtt", true)) {
+                    "text/vtt; charset=utf-8"
+                } else "application/x-subrip; charset=utf-8"
+                return mime to best.second
+            }
+            val head = zipBytes.take(150).toByteArray().toString(Charsets.UTF_8).trimStart()
+            if (head.startsWith("<!doctype", true) || head.startsWith("<html", true)) return null
+            val mime = if (head.contains("WEBVTT", true)) "text/vtt; charset=utf-8" else "application/x-subrip; charset=utf-8"
+            return mime to zipBytes
+        }
+ 
+        private fun matchesEpisodeHint(fileName: String, season: Int?, episode: Int?): Boolean {
+            if (season == null || episode == null) return true
+            val lower = fileName.lowercase()
+            val s2 = season.toString().padStart(2, '0')
+            val e2 = episode.toString().padStart(2, '0')
+            return listOf(
+                "s${s2}e${e2}", "s${season}e${e2}", "s${s2}e${episode}",
+                "${season}x${e2}", "${s2}x${e2}", "episode.${e2}", "episode_${e2}", "ep${e2}"
+            ).any { lower.contains(it) }
+        }
+ 
+        private fun downloadBlocking(url: String, headers: Map<String, String>): ByteArray? {
+            var current = url
+            for (hop in 0..3) {
+                var connection: HttpURLConnection? = null
+                try {
+                    connection = (URL(current).openConnection() as HttpURLConnection).apply {
+                        instanceFollowRedirects = false
+                        connectTimeout = 12_000
+                        readTimeout = 12_000
+                        requestMethod = "GET"
+                        headers.forEach { (key, value) -> setRequestProperty(key, value) }
+                    }
+                    val code = connection.responseCode
+                    if (code in 300..399) {
+                        val location = connection.getHeaderField("Location")?.trim()
+                        if (!location.isNullOrBlank()) {
+                            current = if (location.startsWith("http", true)) location else URL(URL(current), location).toString()
+                            continue
+                        }
+                    }
+                    if (code in 200..299) return connection.inputStream.use { it.readBytes() }
+                    return null
+                } catch (_: Exception) {
+                    return null
+                } finally {
+                    connection?.disconnect()
+                }
+            }
+            return null
+        }
+    }
+ 
+    private suspend fun queryOpenSubtitlesRest(
+        ref: SubtitleMediaRef,
+        imdbId: String
+    ): List<SubtitleCandidate> {
+        if (imdbId.isBlank()) return emptyList()
+        val cleanId = imdbId.removePrefix("tt").trimStart('0').ifEmpty { imdbId.removePrefix("tt") }
+        val headers = mapOf("User-Agent" to "trailers.to-UA", "X-User-Agent" to "trailers.to-UA")
+        return listOf("vie" to "Vietnamese", "eng" to "English").amap { (langCode, fallback) ->
+            val out = mutableListOf<SubtitleCandidate>()
+            runCatching {
+                val url = if (ref.type == "tv" && ref.season != null && ref.episode != null) {
+                    "https://rest.opensubtitles.org/search/episode-${ref.episode}/imdbid-$cleanId/season-${ref.season}/sublanguageid-$langCode"
+                } else {
+                    "https://rest.opensubtitles.org/search/imdbid-$cleanId/sublanguageid-$langCode"
+                }
+                val text = app.get(url, headers = headers, timeout = 8L).text.trim()
+                if (!text.startsWith("[")) return@runCatching
+                val array = JSONArray(text)
+                val items = (0 until array.length()).mapNotNull { array.optJSONObject(it) }
+                    .sortedBy { item -> if (item.optString("SubFormat", "").lowercase() in listOf("srt", "vtt")) 0 else 1 }
+                for (item in items.take(6)) {
+                    val raw = item.optString("SubDownloadLink", "").trim()
+                    if (!raw.startsWith("http")) continue
+                    val direct = raw.replace("/filead/", "/subencoding-utf8/filead/")
+                        .replace("/file/", "/subencoding-utf8/file/").removeSuffix(".gz")
+                    out.add(
+                        SubtitleCandidate(
+                            "OpenSubtitles",
+                            item.optString("LanguageName", fallback).trim(),
+                            appendSubExtFragment(direct, item.optString("SubFormat", "srt")),
+                            item.optString("MovieReleaseName", "").trim()
+                        )
+                    )
+                }
+            }
+            out
+        }.flatten()
+    }
+ 
+    private suspend fun queryOpenSubtitlesStremio(
+        ref: SubtitleMediaRef,
+        imdbId: String
+    ): List<SubtitleCandidate> {
+        if (imdbId.isBlank()) return emptyList()
+        val url = if (ref.type == "tv") {
+            "https://opensubtitles-v3.strem.io/subtitles/series/$imdbId:${ref.season ?: 1}:${ref.episode ?: 1}.json"
+        } else {
+            "https://opensubtitles-v3.strem.io/subtitles/movie/$imdbId.json"
+        }
+        val output = mutableListOf<SubtitleCandidate>()
+        runCatching {
+            val text = app.get(url, headers = mapOf("User-Agent" to userAgent), timeout = 8L).text.trim()
+            if (!text.startsWith("{")) return@runCatching
+            val array = JSONObject(text).optJSONArray("subtitles") ?: return@runCatching
+            val vi = mutableListOf<SubtitleCandidate>()
+            val en = mutableListOf<SubtitleCandidate>()
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val subUrl = item.optString("url", "").trim()
+                if (!subUrl.startsWith("http")) continue
+                val lang = item.optString("lang", "").lowercase()
+                val release = item.optString("releaseGroup", "").ifBlank {
+                    item.optString("movieReleaseName", "")
+                }.trim()
+                val candidate = SubtitleCandidate(
+                    "OpenSubtitles-V3", if (lang == "vie" || lang == "vi") "Vietnamese" else "English",
+                    appendSubExtFragment(subUrl), release
+                )
+                when (lang) {
+                    "vie", "vi" -> if (vi.size < 5) vi.add(candidate)
+                    "eng", "en" -> if (en.size < 5) en.add(candidate)
+                }
+            }
+            output.addAll(vi)
+            output.addAll(en)
+        }
+        return output
+    }
+ 
+    private suspend fun querySubdl(
+        ref: SubtitleMediaRef,
+        imdbId: String,
+        apiKey: String,
+        d: Dbg
+    ): List<SubtitleCandidate> {
+        if (apiKey.isBlank() || (imdbId.isBlank() && ref.tmdbId <= 0)) return emptyList()
+        val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
+        val idParam = if (imdbId.startsWith("tt")) {
+            "imdb_id=${URLEncoder.encode(imdbId, "UTF-8")}"
+        } else "tmdb_id=${ref.tmdbId}"
+        val queryUrl = if (ref.type == "tv") {
+            "https://api.subdl.com/api/v1/subtitles?api_key=$encodedKey&$idParam&type=tv&season_number=${ref.season ?: 1}&episode_number=${ref.episode ?: 1}&languages=VI,EN"
+        } else {
+            "https://api.subdl.com/api/v1/subtitles?api_key=$encodedKey&$idParam&type=movie&languages=VI,EN"
+        }
+        val output = mutableListOf<SubtitleCandidate>()
+        runCatching {
+            val response = app.get(
+                queryUrl,
+                headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json"),
+                timeout = 10L
+            )
+            if (response.code !in 200..299) {
+                d.log("SubDL HTTP ${response.code}: ${response.text.take(120)}")
+                return@runCatching
+            }
+            val json = JSONObject(response.text)
+            if (!json.optBoolean("status", false)) {
+                d.log("SubDL status=false: ${json.optString("error")}")
+                return@runCatching
+            }
+            val subtitles = json.optJSONArray("subtitles") ?: return@runCatching
+            val viItems = mutableListOf<JSONObject>()
+            val enItems = mutableListOf<JSONObject>()
+            for (i in 0 until subtitles.length()) {
+                val item = subtitles.optJSONObject(i) ?: continue
+                val language = item.optString("language", "").lowercase()
+                if (language.contains("vietnam") || language == "vi" || language == "vie") viItems.add(item)
+                else if (language.contains("english") || language == "en" || language == "eng") enItems.add(item)
+            }
+            val groups = listOf(
+                "Vietnamese" to viItems.sortedBy { if (it.optBoolean("hi", false)) 1 else 0 }.take(5),
+                "English" to enItems.sortedBy { if (it.optBoolean("hi", false)) 1 else 0 }.take(5)
+            )
+            for ((language, items) in groups) {
+                for (item in items) {
+                    val rawPath = item.optString("url", "").trim()
+                    if (rawPath.isBlank()) continue
+                    val zipUrl = when {
+                        rawPath.startsWith("http", true) -> rawPath
+                        rawPath.startsWith("/") -> "https://dl.subdl.com$rawPath"
+                        else -> "https://dl.subdl.com/$rawPath"
+                    }
+                    val localUrl = CineFreakSubdlProxy.register(
+                        zipUrl, ref.type == "tv", ref.season, ref.episode, userAgent
+                    ) ?: continue
+                    val release = item.optString("release_name", "").ifBlank {
+                        item.optString("name", "")
+                    }.trim()
+                    output.add(SubtitleCandidate("SubDL", language, localUrl, release))
+                }
+            }
+        }.onFailure { d.err("querySubdl", it) }
+        return output
+    }
+ 
+    private suspend fun fetchSubtitleList(
+        ref: SubtitleMediaRef,
+        imdbId: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        d: Dbg
+    ): Int {
+        val results = listOf(0, 1, 2).amap { index ->
+            when (index) {
+                0 -> queryOpenSubtitlesRest(ref, imdbId)
+                1 -> queryOpenSubtitlesStremio(ref, imdbId)
+                else -> querySubdl(ref, imdbId, defaultSubdlApiKey, d)
+            }
+        }.flatten()
+        val seen = HashSet<String>()
+        var count = 0
+        for (candidate in results) {
+            if (!seen.add(candidate.url)) continue
+            val label = "${candidate.langLabel} • ${candidate.source}" +
+                if (candidate.releaseHint.isNotBlank()) " (${candidate.releaseHint.take(28)})" else ""
+            subtitleCallback.invoke(SubtitleFile(label, candidate.url))
+            count++
+        }
+        d.log("Đã nạp $count phụ đề OpenSubtitles/SubDL (IMDb=${imdbId.ifBlank { "không có" }}, TMDB=${ref.tmdbId})")
+        return count
+    }
+ 
+    /** Nạp danh sách phụ đề dựa trên metadata đã gắn vào payload ở bước load(). */
+    private suspend fun loadSubtitlesFromPayload(
+        parts: List<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        d: Dbg
+    ): Int {
+        val episodeKey = parts.getOrNull(1).orEmpty()
+        val pageUrl = parts.getOrNull(2).orEmpty()
+        var title = parts.getOrNull(4).orEmpty()
+        var year = parts.getOrNull(5)?.toIntOrNull()
+        var imdbId = parts.getOrNull(6).orEmpty().let { extractImdbId(it) }
+ 
+        // Payload của bản CineFreak cũ chỉ có 4 trường; đọc lại HTML để lấy metadata khi cần.
+        if (pageUrl.startsWith("http") && title.isBlank()) {
+            val html = runCatching {
+                app.get(pageUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"), timeout = 12L).text
+            }.getOrDefault("")
+            if (html.isNotBlank()) {
+                val doc = Jsoup.parse(html, pageUrl)
+                title = cleanTitle(
+                    doc.selectFirst("meta[property=og:title]")?.attr("content")
+                        ?: doc.selectFirst("h1.entry-title, h1, .post-title")?.text().orEmpty()
+                )
+                if (year == null) year = Regex("""\b(19\d{2}|20\d{2})\b""").find(title)?.value?.toIntOrNull()
+                if (imdbId.isBlank()) imdbId = extractImdbId(html)
+            }
+        }
+ 
+        if (title.isBlank() && imdbId.isBlank()) {
+            d.log("Bỏ qua tra cứu phụ đề: payload cũ không có title/IMDb ID và không đọc lại được trang phim")
+            return 0
+        }
+ 
+        val episodeMatch = Regex("""(?i)^e(\d+)_(\d+)""").find(episodeKey)
+            ?: Regex("""(?i)^s(\d+)e(\d+)""").find(episodeKey)
+        val isTv = episodeMatch != null || isSeries(title, pageUrl)
+        val type = if (isTv) "tv" else "movie"
+        val season = episodeMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: if (isTv) 1 else null
+        val episode = episodeMatch?.groupValues?.getOrNull(2)?.toIntOrNull() ?: if (isTv) 1 else null
+ 
+        var tmdbId = 0
+        if (imdbId.isBlank()) {
+            val identity = resolveSubtitleIdentity(title, year, type)
+            if (identity != null) {
+                tmdbId = identity.tmdbId
+                imdbId = identity.imdbId
+                d.log("TMDB match: id=$tmdbId IMDb=${imdbId.ifBlank { "không có" }}")
+            } else {
+                d.log("Không tìm được TMDB/IMDb ID cho '$title'${year?.let { " ($it)" } ?: ""}")
+            }
+        }
+ 
+        val ref = SubtitleMediaRef(type, tmdbId, season, episode)
+        return fetchSubtitleList(ref, imdbId, subtitleCallback, d)
+    }
     // ================================================================
     // LOAD
     // ================================================================
