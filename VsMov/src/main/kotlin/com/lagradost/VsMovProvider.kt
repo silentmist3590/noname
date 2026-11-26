@@ -115,7 +115,7 @@ private object LocalPlaylist {
     // Tải trước các đoạn kế tiếp để trình phát không phải chờ (đặc biệt khi phim nặng, chỉ có 1 chất lượng)
     private val pool = java.util.concurrent.Executors.newFixedThreadPool(4) { r -> Thread(r).apply { isDaemon = true } }
     private val cache = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.Future<ByteArray?>>()
-    private const val AHEAD = 4
+    private const val AHEAD = 2
 
     private fun fut(id: String, st: Stream, idx: Int): java.util.concurrent.Future<ByteArray?>? {
         if (idx < 0 || idx >= st.segs.size) return null
@@ -178,14 +178,71 @@ private object LocalPlaylist {
         return null
     }
 
-    private fun segment(id: String, st: Stream, idx: Int): ByteArray? {
-        val f = fut(id, st, idx) ?: return null
-        val bytes = try { f.get(300, java.util.concurrent.TimeUnit.SECONDS) } catch (t: Throwable) { null }
-        if (bytes == null) cache.remove("$id/$idx")
-        // dọn các đoạn đã phát qua, rồi tải trước các đoạn tiếp theo
-        cache.keys.filter { k -> k.startsWith("$id/") && (k.substringAfter('/').toIntOrNull() ?: 0) < idx - 1 }.forEach { cache.remove(it) }
+    // Đoạn đã được tải trước xong (chờ tối đa 4 giây nếu đang tải dở)
+    private fun cached(id: String, idx: Int): ByteArray? {
+        val key = "$id/$idx"
+        val f = cache[key] ?: return null
+        return try { f.get(4, java.util.concurrent.TimeUnit.SECONDS) }
+        catch (t: java.util.concurrent.TimeoutException) { null }
+        catch (t: Throwable) { cache.remove(key); null }
+    }
+
+    private fun prefetch(id: String, st: Stream, idx: Int) {
+        cache.keys.filter { k -> k.startsWith("$id/") && (k.substringAfter('/').toIntOrNull() ?: 0) < idx }.forEach { cache.remove(it) }
         for (n in 1..AHEAD) fut(id, st, idx + n)
-        return bytes
+    }
+
+    private fun ctOf(st: Stream, idx: Int) =
+        if (st.segs[idx].substringBefore('?').let { it.endsWith(".m4s") || it.endsWith(".mp4") }) "video/mp4" else "video/MP2T"
+
+    // Truyền dữ liệu về trình phát NGAY khi có byte đầu tiên (không đợi tải xong cả đoạn),
+    // tránh lỗi hết thời gian chờ 2002 khi đoạn video lớn.
+    private fun streamSeg(id: String, st: Stream, idx: Int, out: java.io.OutputStream, head: Boolean): Boolean {
+        var lastCode = 0
+        for (attempt in 0 until 4) {
+            val url = st.segs.getOrNull(idx) ?: return false
+            try {
+                val rb = okhttp3.Request.Builder().url(url)
+                    .header("User-Agent", st.ua).header("Referer", st.ref).header("Accept", "*/*")
+                client.newCall(rb.build()).execute().use { r ->
+                    lastCode = r.code
+                    if (r.code != 200) { refresh(id, st); return@use }
+                    val body = r.body ?: return@use
+                    val inp = body.byteStream()
+                    val first = ByteArray(9000)
+                    var n = 0
+                    while (n < first.size) {
+                        val k = inp.read(first, n, first.size - n)
+                        if (k < 0) break
+                        n += k
+                    }
+                    if (n == 0) return@use
+                    val off = cleanTs(first.copyOf(n))
+                    out.write("HTTP/1.1 200 OK\r\nContent-Type: ${ctOf(st, idx)}\r\nConnection: close\r\n\r\n".toByteArray())
+                    if (!head) {
+                        out.write(first, off, n - off)
+                        out.flush()
+                        val buf = ByteArray(32 * 1024)
+                        while (true) {
+                            val k = inp.read(buf)
+                            if (k < 0) break
+                            out.write(buf, 0, k)
+                        }
+                    }
+                    out.flush()
+                    return true
+                }
+            } catch (t: java.io.IOException) {
+                // lỗi khi đã gửi dở: không thể thử lại trên cùng kết nối
+                if (lastCode == 200) return false
+                lastCode = -1
+            } catch (t: Throwable) {
+                lastCode = -1
+            }
+            Thread.sleep(800L * (attempt + 1))
+        }
+        if (logged++ < 15) VsLog.add("Segment", "đoạn $idx lỗi sau 4 lần thử (HTTP $lastCode) ${st.segs.getOrNull(idx)?.take(140)}")
+        return false
     }
 
     private fun handle(c: java.net.Socket) {
@@ -210,12 +267,16 @@ private object LocalPlaylist {
                         val idx = seg.substringAfter('/').toIntOrNull()
                         val st = streams[id]
                         if (st == null || idx == null) return fail("404 Not Found")
-                        val bytes = segment(id, st, idx) ?: return fail("502 Bad Gateway")
-                        val off = cleanTs(bytes)
-                        val ct = if (st.segs[idx].substringBefore('?').let { it.endsWith(".m4s") || it.endsWith(".mp4") }) "video/mp4" else "video/MP2T"
-                        out.write("HTTP/1.1 200 OK\r\nContent-Type: $ct\r\nContent-Length: ${bytes.size - off}\r\nConnection: close\r\n\r\n".toByteArray())
-                        if (!head) out.write(bytes, off, bytes.size - off)
-                        out.flush()
+                        prefetch(id, st, idx)
+                        val bytes = cached(id, idx)
+                        if (bytes != null) {
+                            val off = cleanTs(bytes)
+                            out.write("HTTP/1.1 200 OK\r\nContent-Type: ${ctOf(st, idx)}\r\nContent-Length: ${bytes.size - off}\r\nConnection: close\r\n\r\n".toByteArray())
+                            if (!head) out.write(bytes, off, bytes.size - off)
+                            out.flush()
+                        } else if (!streamSeg(id, st, idx, out, head)) {
+                            return fail("502 Bad Gateway")
+                        }
                     }
                     raw.startsWith("/u/") -> {
                         val id = raw.removePrefix("/u/").substringBefore('?')
@@ -415,7 +476,7 @@ class VsMovProvider : MainAPI() {
         return r?.text?.trimStart()?.startsWith("#EXTM3U") == true
     }
 
-    private suspend fun emitSubs(text: String, embed: String, cb: (SubtitleFile) -> Unit, log: StringBuilder) {
+    private fun emitSubs(text: String, embed: String, cb: (SubtitleFile) -> Unit, log: StringBuilder) {
         val origin = Regex("^(https?://[^/]+)").find(embed)?.groupValues?.get(1) ?: return
         val raw = Regex("""subtitles["']?\s*:\s*(\[[\s\S]*?\])\s*[,}]""").find(text)?.groupValues?.get(1)
             ?: run {
@@ -441,7 +502,7 @@ class VsMovProvider : MainAPI() {
                 if (!seen.add(u)) continue
                 val code = o.optString("code").ifBlank { o.optString("name").substringBefore(' ') }
                 val lang = names[code.lowercase()] ?: code.ifBlank { "Subtitle" }
-                cb(newSubtitleFile(url = u, lang = lang))
+                cb(SubtitleFile(lang, u))
                 log.append("sub ").append(lang).append(" -> ").append(u).append('\n')
             }
         }.onFailure { log.append("lỗi đọc phụ đề: ").append(it.message).append('\n') }
