@@ -19,7 +19,6 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import org.json.JSONArray
 import java.io.BufferedReader
 import java.io.ByteArrayInputStream
 import java.io.InputStreamReader
@@ -50,6 +49,17 @@ class CineHDProvider : MainAPI() {
     override var lang = "en"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
+
+
+    private inner class Dbg(private val tag: String) {
+        fun log(message: String) {
+            android.util.Log.d("CineHD", "[$tag] $message")
+        }
+
+        fun err(message: String, error: Throwable?) {
+            android.util.Log.e("CineHD", "[$tag] $message: ${error?.message}", error)
+        }
+    }
 
     private val ua =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -262,6 +272,9 @@ class CineHDProvider : MainAPI() {
             val year = parseYear(json.optString("release_date", ""))
             val overview = json.optString("overview", "")
             val runtime = json.optInt("runtime", 0).takeIf { it > 0 }
+            val imdbId = json.optString("imdb_id", "").ifBlank {
+                json.optJSONObject("external_ids")?.optString("imdb_id", "") ?: ""
+            }
             val genres = (0 until (json.optJSONArray("genres")?.length() ?: 0)).mapNotNull {
                 json.optJSONArray("genres")?.optJSONObject(it)?.optString("name")
             }
@@ -271,6 +284,7 @@ class CineHDProvider : MainAPI() {
                 put("id", id)
                 put("title", title)
                 put("year", year ?: 0)
+                put("imdb_id", imdbId)
             }.toString()
 
             return newMovieLoadResponse(title, url, TvType.Movie, linkData) {
@@ -291,6 +305,9 @@ class CineHDProvider : MainAPI() {
             val year = parseYear(json.optString("first_air_date", ""))
             val overview = json.optString("overview", "")
             val status = if (json.optString("status") == "Ended") ShowStatus.Completed else ShowStatus.Ongoing
+            val imdbId = json.optString("imdb_id", "").ifBlank {
+                json.optJSONObject("external_ids")?.optString("imdb_id", "") ?: ""
+            }
             val genres = (0 until (json.optJSONArray("genres")?.length() ?: 0)).mapNotNull {
                 json.optJSONArray("genres")?.optJSONObject(it)?.optString("name")
             }
@@ -304,10 +321,6 @@ class CineHDProvider : MainAPI() {
                 if (sn > 0 && ec > 0) seasonNums.add(sn)
             }
             seasonNums.sort()
-            val pageImdbId = extractImdbId(html)
-            fun payload(ep: String) = listOf(
-                playApi, ep, url, siteKey, title, year?.toString().orEmpty(), pageImdbId
-            ).joinToString("|||")
             val episodes = mutableListOf<Episode>()
             for (sNum in seasonNums) {
                 val sJson = tmdbGet("/tv/$id/season/$sNum")
@@ -326,6 +339,7 @@ class CineHDProvider : MainAPI() {
                         put("e", epNum)
                         put("title", title)
                         put("year", year ?: 0)
+                        put("imdb_id", imdbId)
                     }.toString()
 
                     episodes.add(newEpisode(epData) {
@@ -442,50 +456,6 @@ class CineHDProvider : MainAPI() {
         return "$url#file.$ext"
     }
  
-    private suspend fun tmdbGet(path: String): JSONObject? {
-        val sep = if (path.contains("?")) "&" else "?"
-        for (k in tmdbHosts.indices) {
-            val hi = (tmdbPrefer + k) % tmdbHosts.size
-            val host = tmdbHosts[hi]
-            for (apiKey in tmdbKeys) {
-                val text = runCatching {
-                    app.get(
-                        "$host$path${sep}api_key=$apiKey",
-                        headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json"),
-                        timeout = 10L
-                    ).text
-                }.getOrNull()
-                if (!text.isNullOrBlank()) {
-                    val json = runCatching { JSONObject(text) }.getOrNull()
-                    if (json != null && !json.has("status_code")) {
-                        tmdbPrefer = hi
-                        return json
-                    }
-                    if (json?.optInt("status_code") == 34) return null
-                }
-            }
-            val bearerText = runCatching {
-                app.get(
-                    "$host$path",
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Authorization" to "Bearer $tmdbBearerToken",
-                        "Accept" to "application/json"
-                    ),
-                    timeout = 10L
-                ).text
-            }.getOrNull()
-            if (!bearerText.isNullOrBlank()) {
-                val json = runCatching { JSONObject(bearerText) }.getOrNull()
-                if (json != null && !json.has("status_code")) {
-                    tmdbPrefer = hi
-                    return json
-                }
-            }
-        }
-        return null
-    }
- 
     private fun normalizeSubtitleTitle(value: String): String = value
         .replace(Regex("""\b(19\d{2}|20\d{2})\b"""), " ")
         .replace(
@@ -564,7 +534,7 @@ class CineHDProvider : MainAPI() {
             val isTv: Boolean,
             val season: Int?,
             val episode: Int?,
-            val userAgent: String
+            val ua: String
         )
  
         private var serverSocket: ServerSocket? = null
@@ -599,13 +569,13 @@ class CineHDProvider : MainAPI() {
             isTv: Boolean,
             season: Int?,
             episode: Int?,
-            userAgent: String
+            ua: String
         ): String? {
             val localPort = ensureStarted()
             if (localPort <= 0) return null
             if (entries.size > 200) entries.clear()
             val token = sequence.incrementAndGet().toString()
-            entries[token] = Entry(zipUrl, isTv, season, episode, userAgent)
+            entries[token] = Entry(zipUrl, isTv, season, episode, ua)
             return "http://127.0.0.1:$localPort/subdl/$token.srt"
         }
  
@@ -656,7 +626,7 @@ class CineHDProvider : MainAPI() {
         private fun fetchAndUnzip(entry: Entry): Pair<String, ByteArray>? {
             val zipBytes = downloadBlocking(
                 entry.zipUrl,
-                mapOf("User-Agent" to entry.userAgent, "Referer" to "https://subdl.com/", "Accept" to "*/*")
+                mapOf("User-Agent" to entry.ua, "Referer" to "https://subdl.com/", "Accept" to "*/*")
             ) ?: return null
             if (zipBytes.isEmpty()) return null
             if (zipBytes.size >= 4 && zipBytes[0] == 0x50.toByte() && zipBytes[1] == 0x4B.toByte()) {
@@ -793,7 +763,7 @@ class CineHDProvider : MainAPI() {
         }
         val output = mutableListOf<SubtitleCandidate>()
         runCatching {
-            val text = app.get(url, headers = mapOf("User-Agent" to userAgent), timeout = 8L).text.trim()
+            val text = app.get(url, headers = mapOf("User-Agent" to ua), timeout = 8L).text.trim()
             if (!text.startsWith("{")) return@runCatching
             val array = JSONObject(text).optJSONArray("subtitles") ?: return@runCatching
             val vi = mutableListOf<SubtitleCandidate>()
@@ -841,7 +811,7 @@ class CineHDProvider : MainAPI() {
         runCatching {
             val response = app.get(
                 queryUrl,
-                headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json"),
+                headers = mapOf("User-Agent" to ua, "Accept" to "application/json"),
                 timeout = 10L
             )
             if (response.code !in 200..299) {
@@ -876,7 +846,7 @@ class CineHDProvider : MainAPI() {
                         else -> "https://dl.subdl.com/$rawPath"
                     }
                     val localUrl = CineFreakSubdlProxy.register(
-                        zipUrl, ref.type == "tv", ref.season, ref.episode, userAgent
+                        zipUrl, ref.type == "tv", ref.season, ref.episode, ua
                     ) ?: continue
                     val release = item.optString("release_name", "").ifBlank {
                         item.optString("name", "")
@@ -914,60 +884,49 @@ class CineHDProvider : MainAPI() {
         return count
     }
  
-    /** Nạp danh sách phụ đề dựa trên metadata đã gắn vào payload ở bước load(). */
-    private suspend fun loadSubtitlesFromPayload(
-        parts: List<String>,
+    /** Nạp phụ đề từ JSON data mà CineHD gắn vào movie/episode trong load(). */
+    private suspend fun loadSubtitlesFromData(
+        parsed: JSONObject,
         subtitleCallback: (SubtitleFile) -> Unit,
         d: Dbg
     ): Int {
-        val episodeKey = parts.getOrNull(1).orEmpty()
-        val pageUrl = parts.getOrNull(2).orEmpty()
-        var title = parts.getOrNull(4).orEmpty()
-        var year = parts.getOrNull(5)?.toIntOrNull()
-        var imdbId = parts.getOrNull(6).orEmpty().let { extractImdbId(it) }
- 
-        // Payload của bản CineFreak cũ chỉ có 4 trường; đọc lại HTML để lấy metadata khi cần.
-        if (pageUrl.startsWith("http") && title.isBlank()) {
-            val html = runCatching {
-                app.get(pageUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"), timeout = 12L).text
-            }.getOrDefault("")
-            if (html.isNotBlank()) {
-                val doc = Jsoup.parse(html, pageUrl)
-                title = cleanTitle(
-                    doc.selectFirst("meta[property=og:title]")?.attr("content")
-                        ?: doc.selectFirst("h1.entry-title, h1, .post-title")?.text().orEmpty()
-                )
-                if (year == null) year = Regex("""\b(19\d{2}|20\d{2})\b""").find(title)?.value?.toIntOrNull()
-                if (imdbId.isBlank()) imdbId = extractImdbId(html)
-            }
+        val type = if (parsed.optString("type").equals("tv", ignoreCase = true)) "tv" else "movie"
+        var tmdbId = parsed.optInt("id", 0)
+        val season = parsed.optInt("s", 0).takeIf { it > 0 }
+        val episode = parsed.optInt("e", 0).takeIf { it > 0 }
+        val title = parsed.optString("title", "").trim()
+        val year = parsed.optInt("year", 0).takeIf { it > 0 }
+        var imdbId = extractImdbId(parsed.optString("imdb_id", ""))
+
+        // Lấy IMDb ID trực tiếp từ TMDB trước; không cần tìm lại phim nếu đã có TMDB ID.
+        if (imdbId.isBlank() && tmdbId > 0) {
+            val details = tmdbGet("/$type/$tmdbId?append_to_response=external_ids")
+            imdbId = extractImdbId(
+                details?.optString("imdb_id", "").orEmpty().ifBlank {
+                    details?.optJSONObject("external_ids")?.optString("imdb_id", "").orEmpty()
+                }
+            )
         }
- 
-        if (title.isBlank() && imdbId.isBlank()) {
-            d.log("Bỏ qua tra cứu phụ đề: payload cũ không có title/IMDb ID và không đọc lại được trang phim")
-            return 0
-        }
- 
-        val episodeMatch = Regex("""(?i)^e(\d+)_(\d+)""").find(episodeKey)
-            ?: Regex("""(?i)^s(\d+)e(\d+)""").find(episodeKey)
-        val isTv = episodeMatch != null || isSeries(title, pageUrl)
-        val type = if (isTv) "tv" else "movie"
-        val season = episodeMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: if (isTv) 1 else null
-        val episode = episodeMatch?.groupValues?.getOrNull(2)?.toIntOrNull() ?: if (isTv) 1 else null
- 
-        var tmdbId = 0
-        if (imdbId.isBlank()) {
+
+        // Fallback: tìm theo tên/năm khi payload cũ không có TMDB ID.
+        if (tmdbId <= 0 && title.isNotBlank()) {
             val identity = resolveSubtitleIdentity(title, year, type)
             if (identity != null) {
                 tmdbId = identity.tmdbId
-                imdbId = identity.imdbId
+                if (imdbId.isBlank()) imdbId = identity.imdbId
                 d.log("TMDB match: id=$tmdbId IMDb=${imdbId.ifBlank { "không có" }}")
-            } else {
-                d.log("Không tìm được TMDB/IMDb ID cho '$title'${year?.let { " ($it)" } ?: ""}")
             }
         }
- 
+
+        if (imdbId.isBlank() && tmdbId <= 0) {
+            d.log("Bỏ qua phụ đề: không có IMDb ID hoặc TMDB ID (title='$title')")
+            return 0
+        }
+
         val ref = SubtitleMediaRef(type, tmdbId, season, episode)
         return fetchSubtitleList(ref, imdbId, subtitleCallback, d)
+    }
+
     // =========================================================================
     // Link Extraction: Ưu tiên nguồn chuẩn xác 100%, không phát sai phim
     // =========================================================================
@@ -979,6 +938,14 @@ class CineHDProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parsed = parseDataUrl(data) ?: return false
+        val d = Dbg("loadLinks")
+        try {
+            loadSubtitlesFromData(parsed, subtitleCallback, d)
+        } catch (e: Throwable) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            d.err("Không tải được danh sách phụ đề", e)
+        }
+
         val type = parsed.optString("type", "movie")
         val id = parsed.optInt("id", 0)
         val title = parsed.optString("title", "")
