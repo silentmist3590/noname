@@ -35,6 +35,7 @@ import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -1002,23 +1003,27 @@ class Movies321Provider : MainAPI() {
         val siteH = siteHeaders(activeHost)
         val bareH = mapOf("User-Agent" to ua)
 
-        // Ưu tiên kiểm tra link gốc ở tầng sâu nhất trước nếu proxy tầng ngoài hay trả 403
-        val orderedLevels = if (levels.size > 1) listOf(levels.last()) + levels.dropLast(1) else levels
+        // Ưu tiên kiểm tra link gốc ở tầng sâu nhất trước để bỏ qua proxy 403
+        val deepest = levels.last()
         var bestFallback: Verdict? = null
 
-        for (target in orderedLevels) {
-            val headerSets = listOfNotNull(
-                bareH,
-                emb,
-                siteH
-            ).distinctBy { it["Referer"] ?: "" }
+        val deepHeaders = listOfNotNull(bareH, emb).distinctBy { it["Referer"] ?: "" }
+        for (hs in deepHeaders) {
+            val v = chainCheck(client, deepest, hs)
+            if (v.state == "ok") return v
+            if (bestFallback == null || (bestFallback.state == "dead" && v.state == "unknown")) {
+                bestFallback = v
+            }
+            // Nếu host gốc đã trả HTML/403 Cloudflare hoặc DNS chết thì không thử lặp header vô ích
+            if (v.note == "HTML" || v.note == "DNS") break
+        }
 
-            for (hs in headerSets) {
-                val v = chainCheck(client, target, hs)
-                if (v.state == "ok") return v
-                if (bestFallback == null || (bestFallback.state == "dead" && v.state == "unknown")) {
-                    bestFallback = v
-                }
+        // Chỉ thử lại proxy ngoài một lần với siteHeaders nếu nó khác link gốc
+        if (levels.size > 1 && rawUrl != deepest) {
+            val v = chainCheck(client, rawUrl, siteH)
+            if (v.state == "ok") return v
+            if (bestFallback == null || (bestFallback.state == "dead" && v.state == "unknown")) {
+                bestFallback = v
             }
         }
         return bestFallback ?: Verdict("dead", false, note = "no route")
@@ -1166,17 +1171,23 @@ class Movies321Provider : MainAPI() {
                 Movies321Clipboard.log("LINKS", "Giải mã được ${cands.size} nguồn từ $activeHost")
             }
 
+            val rankedCands = cands
+                .sortedBy { it.rank }
+                .distinctBy { unwrapLevels(it.url).last() }
+                .take(12)
+
             val probeClient = app.baseClient.newBuilder()
                 .dns(if (usedDohFallback) Movies321Dns.dohFirst else Movies321Dns.ipv4SystemFirst)
-                .connectTimeout(6, TimeUnit.SECONDS)
-                .readTimeout(8, TimeUnit.SECONDS)
-                .callTimeout(10, TimeUnit.SECONDS)
+                .connectTimeout(4, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
+                .callTimeout(6, TimeUnit.SECONDS)
                 .followRedirects(true)
                 .build()
 
-            // 3. Đưa các link video vào pool (tối đa 3 luồng) chạy trước, đồng thời thu hoạch phụ đề & gọi suspend newSubtitleFile
-            val probeFutures: List<Future<Pair<Cand, Verdict>>> = cands.take(24).map { c ->
-                pool.submit(Callable<Pair<Cand, Verdict>> {
+            // 3. Dùng ExecutorCompletionService để không bị nghẽn sau các server chết ở đầu danh sách
+            val ecs = ExecutorCompletionService<Pair<Cand, Verdict>>(pool)
+            for (c in rankedCands) {
+                ecs.submit(Callable<Pair<Cand, Verdict>> {
                     c to probeOne(probeClient, c.url, activeHost)
                 })
             }
@@ -1189,25 +1200,53 @@ class Movies321Provider : MainAPI() {
                 subtitleCallback(newSubtitleFile(lang = sub.label, url = sub.url))
             }
 
-            // 4. Thu kết quả probe & trả link phát (suspend newExtractorLink + M3u8Helper.generateM3u8 gọi trực tiếp trong loadLinks)
-            if (probeFutures.isNotEmpty()) {
-                val probeDeadline = System.currentTimeMillis() + 18_000L
-                val results = ArrayList<Pair<Cand, Verdict>>(probeFutures.size)
-                for (f in probeFutures) {
+            // 4. Thu kết quả probe theo thứ tự xong trước (dừng sớm khi đủ 5 nguồn sống hoặc hết 8.5s)
+            if (rankedCands.isNotEmpty()) {
+                val probeStart = System.currentTimeMillis()
+                val probeDeadline = probeStart + 8_500L
+                val results = ArrayList<Pair<Cand, Verdict>>(rankedCands.size)
+                var okCount = 0
+
+                for (i in rankedCands.indices) {
                     val rem = probeDeadline - System.currentTimeMillis()
                     if (rem <= 0L) break
-                    val pair = runCatching { f.get(minOf(rem, 9000L), TimeUnit.MILLISECONDS) }.getOrNull()
-                    if (pair != null) results.add(pair)
+                    val fut = runCatching { ecs.poll(rem, TimeUnit.MILLISECONDS) }.getOrNull() ?: break
+                    val pair = runCatching { fut.get() }.getOrNull() ?: continue
+                    results.add(pair)
+                    if (pair.second.state == "ok") {
+                        okCount++
+                        if (okCount >= 5) break
+                    }
                 }
+
                 val ok = results.filter { it.second.state == "ok" }
                     .sortedBy { it.first.rank }
-                val fallback = if (ok.isEmpty()) {
-                    results.filter { it.second.state == "unknown" }.take(4)
-                } else emptyList()
+                val unk = results.filter { it.second.state == "unknown" }
+                val deadCount = results.count { it.second.state == "dead" }
+                Movies321Clipboard.log(
+                    "PROBE",
+                    "Xong ${results.size}/${rankedCands.size} trong ${System.currentTimeMillis() - probeStart}ms (ok=${ok.size}, unk=${unk.size}, dead=$deadCount)"
+                )
 
-                val picked = ok + fallback
+                val picked: List<Pair<Cand, Verdict>> = when {
+                    ok.isNotEmpty() -> ok
+                    unk.isNotEmpty() -> unk.take(4)
+                    else -> rankedCands.take(4).map { c ->
+                        val deep = unwrapLevels(c.url).last()
+                        val hs = embeddedHeaders(c.url) ?: mapOf("User-Agent" to ua)
+                        c to Verdict(
+                            state = "unknown",
+                            m3u8 = c.declared.equals("hls", true) || deep.contains(".m3u8", true),
+                            headers = hs,
+                            note = "unverified-fallback",
+                            url = deep
+                        )
+                    }
+                }
+
                 val names = HashMap<String, Int>()
                 var emitted = 0
+                var m3u8Expanded = 0
 
                 for ((c, v) in picked) {
                     if (emitted >= maxStreams) break
@@ -1220,7 +1259,7 @@ class Movies321Provider : MainAPI() {
                         .ifBlank { fam }
 
                     val targetUrl = v.url ?: c.url
-                    val isM3u8 = if (v.state == "ok") v.m3u8 else c.declared.equals("hls", true)
+                    val isM3u8 = if (v.state == "ok") v.m3u8 else (c.declared.equals("hls", true) || targetUrl.contains(".m3u8", true))
                     val hs = v.headers ?: siteHeaders(activeHost)
                     val isUnverified = v.state != "ok"
 
@@ -1246,8 +1285,9 @@ class Movies321Provider : MainAPI() {
                     emitted++
                     found = true
 
-                    // Nếu là M3U8 gộp âm thanh (không tách EXT-X-MEDIA:TYPE=AUDIO), tách thêm từng chất lượng 1080p/720p/480p
-                    if (v.state == "ok" && isM3u8 && !v.hasSeparateAudio && emitted < maxStreams) {
+                    // Nếu là M3U8 gộp âm thanh, tách thêm từng chất lượng 1080p/720p/480p (giới hạn 2 lần để không trễ)
+                    if (v.state == "ok" && isM3u8 && !v.hasSeparateAudio && m3u8Expanded < 2 && emitted < maxStreams) {
+                        m3u8Expanded++
                         val variants = runCatching {
                             M3u8Helper.generateM3u8(
                                 source = fam,
@@ -1269,9 +1309,9 @@ class Movies321Provider : MainAPI() {
             }
         } finally {
             pool.shutdownNow()
+            Movies321Clipboard.flushNow()
         }
 
-        Movies321Clipboard.flushNow()
         return found
     }
 }
