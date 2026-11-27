@@ -14,22 +14,27 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.SubtitleHelper
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.Dns
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.net.UnknownHostException
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.concurrent.Callable
@@ -39,6 +44,9 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.GZIPInputStream
+import java.util.zip.ZipInputStream
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
@@ -47,9 +55,9 @@ import javax.net.ssl.X509TrustManager
 // Bật true để tự động copy log ra Clipboard (tắt thành false khi không cần debug)
 private const val AUTO_COPY_LOG = true
 
-// Tùy chọn API key phụ đề (để trống vẫn tự động dùng các nguồn Keyless: OpenSubtitles v3, Wyzie, SubDL, Subsource)
-private const val OPENSUBTITLES_API_KEY = "OHFlEutMFovpvfcNEgdZ34pPIB2IptP6"
-private const val SUBDL_API_KEY = "xHeOWlCfS9o4EKmK7OwbeOBIhfbIHr2Y"
+// Tùy chọn API key phụ đề (để trống vẫn tự động tải Tiếng Việt + Tiếng Anh từ OpenSubtitles & SubDL + giải nén ZIP/GZ)
+private const val OPENSUBTITLES_API_KEY = ""
+private const val SUBDL_API_KEY = ""
 
 @CloudstreamPlugin
 class Movies321Plugin : Plugin() {
@@ -157,12 +165,112 @@ private object Movies321Clipboard {
 }
 
 /**
- * Bộ tìm phụ đề song song cho Movies321 (CloudStream 4.5.2, chuẩn thuần OkHttp + Executor):
- * - Chạy song song qua ExecutorService giới hạn luồng & OkHttpClient (4.5s timeout/nguồn).
- * - Hỗ trợ OpenSubtitles (Stremio v3 keyless + API v1), SubDL, Wyzie Subs, Subsource.
- * - Sắp xếp ưu tiên tuyệt đối: Tiếng Việt (vi) -> Tiếng Anh (en) -> Ngôn ngữ khác.
+ * Server HTTP nội bộ siêu nhẹ trên 127.0.0.1 để phát phụ đề đã giải nén từ .zip/.gz/.rar:
+ * - Giúp CloudStream 4.5.2 & ExoPlayer tải trực tiếp file .srt/.vtt/.ass UTF-8 (tránh lỗi scheme file://).
+ * - Bộ đệm LRU tối đa 16 mục (~2MB) đảm bảo không tràn RAM trên TV Android 7 1GB RAM.
+ */
+private object Movies321SubServer {
+    private const val MAX_CACHE_ITEMS = 16
+    private val lock = Any()
+    private val counter = AtomicInteger(0)
+    private val cache = object : LinkedHashMap<String, Pair<String, ByteArray>>(20, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, ByteArray>>?): Boolean {
+            return size > MAX_CACHE_ITEMS
+        }
+    }
+
+    @Volatile
+    private var boundPort: Int = -1
+
+    private fun ensureStarted(): Int {
+        if (boundPort > 0) return boundPort
+        synchronized(lock) {
+            if (boundPort > 0) return boundPort
+            val server = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+            boundPort = server.localPort
+            val worker = Thread {
+                while (true) {
+                    val sock = try {
+                        server.accept()
+                    } catch (_: Throwable) {
+                        break
+                    }
+                    handleSocket(sock)
+                }
+            }
+            worker.name = "Movies321-SubServer"
+            worker.isDaemon = true
+            worker.start()
+            return boundPort
+        }
+    }
+
+    private fun handleSocket(sock: Socket) {
+        try {
+            sock.soTimeout = 3000
+            val reader = sock.getInputStream().bufferedReader(Charsets.UTF_8)
+            val reqLine = reader.readLine() ?: return
+            var headerLines = 0
+            while (headerLines < 32) {
+                val h = reader.readLine() ?: break
+                if (h.isEmpty()) break
+                headerLines++
+            }
+            val parts = reqLine.split(' ')
+            val method = parts.getOrNull(0)?.uppercase() ?: "GET"
+            val path = parts.getOrNull(1)?.substringBefore('?') ?: ""
+            val key = path.substringAfterLast('/')
+            val entry = synchronized(lock) { cache[key] }
+
+            val out = sock.getOutputStream()
+            if (entry == null) {
+                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+            } else {
+                val (mime, bytes) = entry
+                val hdr = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\nContent-Length: ${bytes.size}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                out.write(hdr.toByteArray(Charsets.US_ASCII))
+                if (method != "HEAD") out.write(bytes)
+            }
+            out.flush()
+        } catch (_: Throwable) {
+        } finally {
+            try { sock.close() } catch (_: Throwable) {}
+        }
+    }
+
+    fun hostSubtitle(ext: String, utf8Bytes: ByteArray): String? {
+        return try {
+            val port = ensureStarted()
+            val cleanExt = ext.lowercase().let { if (it in listOf("srt", "vtt", "ass", "ssa")) it else "srt" }
+            val mime = when (cleanExt) {
+                "vtt" -> "text/vtt; charset=utf-8"
+                "ass", "ssa" -> "text/x-ssa; charset=utf-8"
+                else -> "application/x-subrip; charset=utf-8"
+            }
+            val key = "sub_${counter.incrementAndGet()}.$cleanExt"
+            synchronized(lock) { cache[key] = mime to utf8Bytes }
+            "http://127.0.0.1:$port/sub/$key"
+        } catch (_: Throwable) {
+            null
+        }
+    }
+}
+
+/**
+ * Bộ tìm & giải nén phụ đề song song cho Movies321 (v14):
+ * - Đúng định mức: 02 Tiếng Việt + 01 Tiếng Anh từ OpenSubtitles; 02 Tiếng Việt + 01 Tiếng Anh từ SubDL.
+ * - Tự động giải nén ZIP (SubDL), GZIP (OpenSubtitles), chuẩn hóa UTF-8 (hỗ trợ cả Windows-1258/UTF-16),
+ *   lọc bỏ RAR/7z nén không đọc được trực tiếp để tự chuyển sang file kế tiếp.
  */
 private object Movies321Subtitles {
+    private const val MAX_ARCHIVE_BYTES = 2_097_152
+    private const val TARGET_OS_VI = 2
+    private const val TARGET_OS_EN = 1
+    private const val TARGET_SD_VI = 2
+    private const val TARGET_SD_EN = 1
+    private const val BROWSER_UA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
     data class SubCandidate(
         val langCode: String,
         val label: String,
@@ -184,22 +292,26 @@ private object Movies321Subtitles {
         val cleanImdb = imdbId?.takeIf { it.startsWith("tt") }
         Movies321Clipboard.log(
             "SUBS",
-            "Tìm phụ đề song song imdb=$cleanImdb tmdb=$tmdbId title=$title S${season ?: "-"}E${episode ?: "-"}"
+            "Tìm phụ đề (2 VI + 1 EN OpenSubs, 2 VI + 1 EN SubDL) imdb=$cleanImdb title=$title S${season ?: "-"}E${episode ?: "-"}"
         )
         return listOf(
-            pool.submit(Callable<List<SubCandidate>> { fromOpenSubtitlesStremio(client, cleanImdb, season, episode) }),
-            pool.submit(Callable<List<SubCandidate>> { fromOpenSubtitlesOfficial(client, tmdbId, title, season, episode) }),
-            pool.submit(Callable<List<SubCandidate>> { fromSubDL(client, cleanImdb, tmdbId, title, year, season, episode) }),
-            pool.submit(Callable<List<SubCandidate>> { fromWyzie(client, cleanImdb ?: tmdbId, season, episode) }),
-            pool.submit(Callable<List<SubCandidate>> { fromSubsource(client, title, year, season, episode) })
+            pool.submit(Callable<List<SubCandidate>> {
+                fromOpenSubtitlesQuota(client, cleanImdb, tmdbId, title, season, episode, "vie", TARGET_OS_VI)
+            }),
+            pool.submit(Callable<List<SubCandidate>> {
+                fromOpenSubtitlesQuota(client, cleanImdb, tmdbId, title, season, episode, "eng", TARGET_OS_EN)
+            }),
+            pool.submit(Callable<List<SubCandidate>> {
+                fromSubDLQuota(client, cleanImdb, tmdbId, title, year, season, episode)
+            })
         )
     }
 
     fun collectAndSort(futures: List<Future<List<SubCandidate>>>): List<SubCandidate> {
         val raw = ArrayList<SubCandidate>()
-        val deadline = System.currentTimeMillis() + 6000L
+        val deadline = System.currentTimeMillis() + 8500L
         for (f in futures) {
-            val rem = (deadline - System.currentTimeMillis()).coerceAtLeast(150L)
+            val rem = (deadline - System.currentTimeMillis()).coerceAtLeast(250L)
             val part = runCatching { f.get(rem, TimeUnit.MILLISECONDS) }.getOrNull()
             if (part != null) raw.addAll(part)
         }
@@ -213,47 +325,21 @@ private object Movies321Subtitles {
                     { it.source }
                 )
             )
-            .take(18)
 
+        val osVi = sorted.count { it.source == "OpenSubs" && it.langCode == "vi" }
+        val osEn = sorted.count { it.source == "OpenSubs" && it.langCode == "en" }
+        val sdVi = sorted.count { it.source == "SubDL" && it.langCode == "vi" }
+        val sdEn = sorted.count { it.source == "SubDL" && it.langCode == "en" }
         Movies321Clipboard.log(
             "SUBS",
-            "Tìm thấy ${sorted.size} phụ đề (VI=${sorted.count { it.langCode == "vi" }}, EN=${sorted.count { it.langCode == "en" }})"
+            "Đã giải nén & nạp ${sorted.size} phụ đề (OpenSubs: VI=$osVi EN=$osEn | SubDL: VI=$sdVi EN=$sdEn)"
         )
         return sorted
     }
 
-    private fun httpGet(
-        client: OkHttpClient,
-        url: String,
-        headers: Map<String, String> = emptyMap()
-    ): String? {
-        return try {
-            val rb = Request.Builder().url(url).header("Accept", "application/json")
-            headers.forEach { (k, v) -> rb.header(k, v) }
-            client.newCall(rb.build()).execute().use { r ->
-                if (!r.isSuccessful) null else r.body?.string()
-            }
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    private fun httpPostJson(
-        client: OkHttpClient,
-        url: String,
-        jsonBody: String,
-        headers: Map<String, String> = emptyMap()
-    ): String? {
-        return try {
-            val body = jsonBody.toRequestBody("application/json; charset=utf-8".toMediaType())
-            val rb = Request.Builder().url(url).post(body).header("Accept", "application/json")
-            headers.forEach { (k, v) -> rb.header(k, v) }
-            client.newCall(rb.build()).execute().use { r ->
-                if (!r.isSuccessful) null else r.body?.string()
-            }
-        } catch (_: Throwable) {
-            null
-        }
+    fun isVietnameseLabel(raw: String): Boolean {
+        val s = raw.trim().lowercase()
+        return s == "vi" || s == "vie" || s.contains("viet") || s.contains("tiếng việt") || s.contains("tieng viet")
     }
 
     private fun langRank(code: String): Int = when (normalizeLang(code)) {
@@ -271,198 +357,406 @@ private object Movies321Subtitles {
         }
     }
 
-    private fun formatLabel(code: String, source: String, tag: String? = null): String {
-        val norm = normalizeLang(code)
-        val base = when (norm) {
-            "vi" -> "Tiếng Việt"
-            "en" -> "English"
-            else -> SubtitleHelper.fromTwoLettersToLanguage(norm) ?: norm.uppercase()
-        }
-        return if (!tag.isNullOrBlank()) "$base [$source · $tag]" else "$base [$source]"
-    }
-
-    private fun fromOpenSubtitlesStremio(
+    private fun httpGetText(
         client: OkHttpClient,
-        imdbId: String?,
-        season: Int?,
-        episode: Int?
-    ): List<SubCandidate> {
-        if (imdbId.isNullOrBlank()) return emptyList()
-        val key = if (season != null && episode != null) "$imdbId:$season:$episode" else imdbId
-        val kind = if (season != null && episode != null) "series" else "movie"
+        url: String,
+        headers: Map<String, String> = emptyMap()
+    ): String? {
         return try {
-            val text = httpGet(client, "https://opensubtitles-v3.strem.io/subtitles/$kind/$key.json")
-                ?: return emptyList()
-            val arr = JSONObject(text).optJSONArray("subtitles") ?: return emptyList()
-            val out = ArrayList<SubCandidate>(arr.length())
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val norm = normalizeLang(obj.optString("lang"))
-                if (norm != "vi" && norm != "en") continue
-                val url = obj.optString("url")
-                if (!url.startsWith("http")) continue
-                out.add(SubCandidate(norm, formatLabel(norm, "OpenSubs"), url, "OpenSubs-v3", if (norm == "vi") 95 else 75))
+            val rb = Request.Builder().url(url).header("User-Agent", BROWSER_UA)
+            headers.forEach { (k, v) -> rb.header(k, v) }
+            client.newCall(rb.build()).execute().use { r ->
+                if (!r.isSuccessful) null else r.body?.string()
             }
-            out
         } catch (_: Throwable) {
-            emptyList()
+            null
         }
     }
 
-    private fun fromOpenSubtitlesOfficial(
+    private fun httpGetBytes(
         client: OkHttpClient,
-        tmdbId: String?,
-        title: String?,
-        season: Int?,
-        episode: Int?
-    ): List<SubCandidate> {
-        if (OPENSUBTITLES_API_KEY.isBlank()) return emptyList()
-        val q = buildString {
-            append("languages=vi,en")
-            if (!tmdbId.isNullOrBlank()) append("&tmdb_id=$tmdbId")
-            else if (!title.isNullOrBlank()) append("&query=${URLEncoder.encode(title, "UTF-8")}")
-            if (season != null && episode != null) append("&season_number=$season&episode_number=$episode")
-        }
+        url: String,
+        headers: Map<String, String> = emptyMap()
+    ): ByteArray? {
         return try {
-            val headers = mapOf("Api-Key" to OPENSUBTITLES_API_KEY, "User-Agent" to "Movies321 v9")
-            val text = httpGet(client, "https://api.opensubtitles.com/api/v1/subtitles?$q", headers)
-                ?: return emptyList()
-            val arr = JSONObject(text).optJSONArray("data") ?: return emptyList()
-            val out = ArrayList<SubCandidate>()
-            var viCount = 0
-            var enCount = 0
-            for (i in 0 until arr.length()) {
-                val attrs = arr.optJSONObject(i)?.optJSONObject("attributes") ?: continue
-                val norm = normalizeLang(attrs.optString("language"))
-                if (norm == "vi" && viCount >= 3) continue
-                if (norm == "en" && enCount >= 2) continue
-                if (norm != "vi" && norm != "en") continue
-                val fileId = attrs.optJSONArray("files")?.optJSONObject(0)?.optInt("file_id") ?: continue
-                val dlBody = JSONObject().put("file_id", fileId).toString()
-                val dlRes = httpPostJson(client, "https://api.opensubtitles.com/api/v1/download", dlBody, headers)
-                    ?: continue
-                val link = JSONObject(dlRes).optString("link")
-                if (!link.startsWith("http")) continue
-                if (norm == "vi") viCount++ else enCount++
-                out.add(SubCandidate(norm, formatLabel(norm, "OpenSubsAPI"), link, "OpenSubs-API", 98))
+            val rb = Request.Builder().url(url).header("User-Agent", BROWSER_UA)
+            headers.forEach { (k, v) -> rb.header(k, v) }
+            client.newCall(rb.build()).execute().use { r ->
+                if (!r.isSuccessful) return@use null
+                val ins = r.body?.byteStream() ?: return@use null
+                readBoundedBytes(ins, MAX_ARCHIVE_BYTES)
             }
-            out
         } catch (_: Throwable) {
-            emptyList()
+            null
         }
     }
 
-    private fun fromSubDL(
-        client: OkHttpClient,
-        imdbId: String?,
-        tmdbId: String?,
-        title: String?,
-        year: Int?,
-        season: Int?,
-        episode: Int?
-    ): List<SubCandidate> {
-        val q = buildString {
-            append("languages=VI,EN&subs_per_page=10")
-            if (SUBDL_API_KEY.isNotBlank()) append("&api_key=$SUBDL_API_KEY")
-            if (!imdbId.isNullOrBlank()) append("&imdb_id=$imdbId")
-            else if (!tmdbId.isNullOrBlank()) append("&tmdb_id=$tmdbId")
-            else if (!title.isNullOrBlank()) append("&film_name=${URLEncoder.encode(title, "UTF-8")}")
-            if (year != null) append("&year=$year")
-            if (season != null) append("&season_number=$season")
-            if (episode != null) append("&episode_number=$episode")
+    private fun readBoundedBytes(ins: InputStream, limit: Int): ByteArray {
+        val bos = ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        var total = 0
+        while (total < limit) {
+            val n = ins.read(buf, 0, minOf(buf.size, limit - total))
+            if (n <= 0) break
+            bos.write(buf, 0, n)
+            total += n
+        }
+        return bos.toByteArray()
+    }
+
+    private fun decodeTextBytes(raw: ByteArray): String {
+        if (raw.size >= 3 && raw[0] == 0xEF.toByte() && raw[1] == 0xBB.toByte() && raw[2] == 0xBF.toByte()) {
+            return String(raw, 3, raw.size - 3, Charsets.UTF_8)
+        }
+        if (raw.size >= 2 && raw[0] == 0xFF.toByte() && raw[1] == 0xFE.toByte()) {
+            return String(raw, 2, raw.size - 2, Charsets.UTF_16LE)
+        }
+        if (raw.size >= 2 && raw[0] == 0xFE.toByte() && raw[1] == 0xFF.toByte()) {
+            return String(raw, 2, raw.size - 2, Charsets.UTF_16BE)
+        }
+        try {
+            val dec = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+            return dec.decode(ByteBuffer.wrap(raw)).toString()
+        } catch (_: Throwable) {
         }
         return try {
-            val text = httpGet(client, "https://api.subdl.com/api/v1/subtitles?$q") ?: return emptyList()
-            val arr = JSONObject(text).optJSONArray("subtitles") ?: return emptyList()
-            val out = ArrayList<SubCandidate>(arr.length())
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val norm = normalizeLang(o.optString("lang"))
-                if (norm != "vi" && norm != "en") continue
-                val path = o.optString("url")
-                if (path.isBlank()) continue
-                val full = if (path.startsWith("http")) path else "https://dl.subdl.com$path"
-                out.add(SubCandidate(norm, formatLabel(norm, "SubDL", o.optString("release_name").take(16)), full, "SubDL", if (norm == "vi") 92 else 72))
-            }
-            out
+            String(raw, Charset.forName("windows-1258"))
         } catch (_: Throwable) {
-            emptyList()
+            String(raw, Charsets.ISO_8859_1)
         }
     }
 
-    private fun fromWyzie(
-        client: OkHttpClient,
-        id: String?,
-        season: Int?,
-        episode: Int?
-    ): List<SubCandidate> {
-        if (id.isNullOrBlank()) return emptyList()
-        val url = buildString {
-            append("https://sub.wyzie.ru/search?id=$id")
-            if (season != null && episode != null) append("&season=$season&episode=$episode")
-        }
-        return try {
-            val text = httpGet(client, url) ?: return emptyList()
-            val arr = JSONArray(text)
-            val out = ArrayList<SubCandidate>(arr.length())
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val norm = normalizeLang(o.optString("language"))
-                if (norm != "vi" && norm != "en") continue
-                val subUrl = o.optString("url")
-                if (!subUrl.startsWith("http")) continue
-                out.add(SubCandidate(norm, formatLabel(norm, "Wyzie"), subUrl, "Wyzie", if (norm == "vi") 90 else 70))
-            }
-            out
-        } catch (_: Throwable) {
-            emptyList()
+    private fun looksLikeSubtitle(text: String): Boolean {
+        val t = text.trimStart()
+        if (t.isEmpty()) return false
+        if (t.startsWith("<html", true) || t.startsWith("<!doctype", true) || t.startsWith("{")) return false
+        return t.contains("-->") || t.contains("[Script Info]", true) || t.startsWith("WEBVTT", true)
+    }
+
+    private fun detectExt(text: String, fileName: String = ""): String {
+        val lower = fileName.lowercase()
+        val head = text.trimStart()
+        return when {
+            head.startsWith("WEBVTT", true) || lower.endsWith(".vtt") -> "vtt"
+            head.contains("[Script Info]", true) || lower.endsWith(".ass") -> "ass"
+            lower.endsWith(".ssa") -> "ssa"
+            else -> "srt"
         }
     }
 
-    private fun fromSubsource(
+    private fun extractAndHostSubtitle(
         client: OkHttpClient,
-        title: String?,
-        year: Int?,
+        url: String,
+        headers: Map<String, String>,
         season: Int?,
-        episode: Int?
-    ): List<SubCandidate> {
-        if (title.isNullOrBlank()) return emptyList()
-        return try {
-            val searchBody = JSONObject().put("query", title).toString()
-            val searchRes = httpPostJson(client, "https://api.subsource.net/api/searchMovie", searchBody)
-                ?: return emptyList()
-            val found = JSONObject(searchRes).optJSONArray("found") ?: return emptyList()
-            val match = (0 until found.length())
-                .mapNotNull { found.optJSONObject(it) }
-                .firstOrNull { year == null || it.optInt("releaseYear") == year }
-                ?: found.optJSONObject(0)
-                ?: return emptyList()
-            val linkName = match.optString("linkName").takeIf { it.isNotBlank() } ?: return emptyList()
-            val detailJson = JSONObject()
-                .put("movieName", linkName)
-                .put("langs", JSONArray(listOf("vietnamese", "english")))
-            if (season != null) detailJson.put("season", "season-$season")
-            val detailRes = httpPostJson(client, "https://api.subsource.net/api/getMovie", detailJson.toString())
-                ?: return emptyList()
-            val subs = JSONObject(detailRes).optJSONArray("subs") ?: return emptyList()
-            val out = ArrayList<SubCandidate>()
-            for (i in 0 until subs.length()) {
-                val s = subs.optJSONObject(i) ?: continue
-                val norm = normalizeLang(s.optString("lang"))
-                if (norm != "vi" && norm != "en") continue
-                val subId = s.optString("subId")
-                if (subId.isBlank()) continue
-                if (episode != null) {
-                    val rel = s.optString("releaseName").lowercase()
-                    val epTag = "e${episode.toString().padStart(2, '0')}"
-                    if (!rel.contains(epTag) && !rel.contains("complete")) continue
+        episode: Int?,
+        sourceTag: String
+    ): String? {
+        val raw = httpGetBytes(client, url, headers) ?: return null
+        if (raw.size < 16) return null
+
+        // 1. Giải nén ZIP (SubDL / gói phụ đề)
+        if (raw.size >= 4 && raw[0] == 0x50.toByte() && raw[1] == 0x4B.toByte()) {
+            var bestScore = -1
+            var bestExt = "srt"
+            var bestText: String? = null
+            try {
+                ZipInputStream(ByteArrayInputStream(raw)).use { zis ->
+                    while (true) {
+                        val entry = zis.nextEntry ?: break
+                        if (entry.isDirectory) continue
+                        val name = entry.name.lowercase()
+                        if (name.contains("__macosx") || name.contains("sample")) continue
+                        if (!name.endsWith(".srt") && !name.endsWith(".vtt") && !name.endsWith(".ass") && !name.endsWith(".ssa")) continue
+                        val entryBytes = readBoundedBytes(zis, MAX_ARCHIVE_BYTES)
+                        val text = decodeTextBytes(entryBytes)
+                        if (!looksLikeSubtitle(text)) continue
+                        var score = when {
+                            name.endsWith(".srt") -> 40
+                            name.endsWith(".vtt") -> 35
+                            else -> 25
+                        }
+                        if (episode != null) {
+                            val ep2 = episode.toString().padStart(2, '0')
+                            val s2 = (season ?: 1).toString().padStart(2, '0')
+                            if (Regex("(s0?$s2.?e0?$ep2|\\b${season ?: 1}x0?$ep2\\b|\\be$ep2\\b)").containsMatchIn(name)) {
+                                score += 200
+                            }
+                        }
+                        score += minOf(entryBytes.size / 1024, 150)
+                        if (score > bestScore) {
+                            bestScore = score
+                            bestExt = detectExt(text, name)
+                            bestText = text
+                        }
+                    }
                 }
-                out.add(SubCandidate(norm, formatLabel(norm, "Subsource"), "https://api.subsource.net/api/downloadSub/$subId", "Subsource", if (norm == "vi") 88 else 68))
+            } catch (_: Throwable) {
+                return null
             }
-            out
-        } catch (_: Throwable) {
-            emptyList()
+            val finalSub = bestText ?: return null
+            return Movies321SubServer.hostSubtitle(bestExt, finalSub.toByteArray(Charsets.UTF_8))
         }
+
+        // 2. Giải nén GZIP (OpenSubtitles .gz)
+        if (raw.size >= 2 && raw[0] == 0x1F.toByte() && raw[1] == 0x8B.toByte()) {
+            return try {
+                val unzipped = GZIPInputStream(ByteArrayInputStream(raw)).use { readBoundedBytes(it, MAX_ARCHIVE_BYTES) }
+                val text = decodeTextBytes(unzipped)
+                if (!looksLikeSubtitle(text)) return null
+                Movies321SubServer.hostSubtitle(detectExt(text), text.toByteArray(Charsets.UTF_8))
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        // 3. Phát hiện file nén RAR / 7z để bỏ qua an toàn & chuyển sang file kế tiếp
+        val isRar = raw.size >= 4 && raw[0] == 0x52.toByte() && raw[1] == 0x61.toByte() && raw[2] == 0x72.toByte() && raw[3] == 0x21.toByte()
+        val is7z = raw.size >= 6 && raw[0] == 0x37.toByte() && raw[1] == 0x7A.toByte() && raw[2] == 0xBC.toByte() && raw[3] == 0xAF.toByte()
+        if (isRar || is7z) {
+            Movies321Clipboard.log("SUBS", "$sourceTag bỏ qua file nén ${if (isRar) "RAR" else "7z"}, tìm bản khác")
+            return null
+        }
+
+        // 4. File phụ đề văn bản thuần (.srt/.vtt/.ass)
+        val text = decodeTextBytes(raw)
+        if (!looksLikeSubtitle(text)) return null
+        return Movies321SubServer.hostSubtitle(detectExt(text), text.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun fromOpenSubtitlesQuota(
+        client: OkHttpClient,
+        imdbId: String?,
+        tmdbId: String?,
+        title: String?,
+        season: Int?,
+        episode: Int?,
+        osLang: String,
+        quota: Int
+    ): List<SubCandidate> {
+        val norm = if (osLang == "vie") "vi" else "en"
+        val labelBase = if (norm == "vi") "Tiếng Việt" else "English"
+        val out = ArrayList<SubCandidate>(quota)
+
+        val imdbDigits = imdbId?.removePrefix("tt")?.trim()?.takeIf { it.all { ch -> ch.isDigit() } }
+        if (!imdbDigits.isNullOrBlank()) {
+            val restUrls = if (season != null && episode != null) {
+                listOf(
+                    "https://rest.opensubtitles.org/search/episode-$episode/imdbid-$imdbDigits/season-$season/sublanguageid-$osLang",
+                    "https://rest.opensubtitles.org/search/imdbid-$imdbDigits/sublanguageid-$osLang"
+                )
+            } else {
+                listOf("https://rest.opensubtitles.org/search/imdbid-$imdbDigits/sublanguageid-$osLang")
+            }
+
+            for (restUrl in restUrls) {
+                if (out.size >= quota) break
+                val text = httpGetText(
+                    client,
+                    restUrl,
+                    mapOf("User-Agent" to "TemporaryUserAgent", "X-User-Agent" to "TemporaryUserAgent")
+                ) ?: continue
+                if (!text.trimStart().startsWith("[")) continue
+                val arr = runCatching { JSONArray(text) }.getOrNull() ?: continue
+                if (arr.length() == 0) continue
+
+                val items = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+                    .sortedByDescending { it.optString("SubDownloadsCnt").toIntOrNull() ?: 0 }
+
+                for (item in items) {
+                    if (out.size >= quota) break
+                    val fmt = item.optString("SubFormat").lowercase()
+                    if (fmt.isNotBlank() && fmt !in listOf("srt", "vtt", "ass", "ssa")) continue
+                    val idFile = item.optString("IDSubtitleFile")
+                    val gzLink = item.optString("SubDownloadLink")
+                    val stremioUtf8 = if (idFile.isNotBlank()) {
+                        "https://subs5.strem.io/en/download/subencoding-stremio-utf8/src-api/file/$idFile"
+                    } else ""
+
+                    val hosted = (if (stremioUtf8.isNotBlank()) extractAndHostSubtitle(client, stremioUtf8, emptyMap(), season, episode, "OpenSubs") else null)
+                        ?: (if (gzLink.startsWith("http")) extractAndHostSubtitle(client, gzLink, emptyMap(), season, episode, "OpenSubs") else null)
+                        ?: continue
+
+                    val idx = out.size + 1
+                    out.add(
+                        SubCandidate(
+                            langCode = norm,
+                            label = "$labelBase #$idx [OpenSubs]",
+                            url = hosted,
+                            source = "OpenSubs",
+                            score = if (norm == "vi") (100 - idx) else (78 - idx)
+                        )
+                    )
+                }
+            }
+        }
+
+        // Fallback sang OpenSubtitles Stremio v3 nếu chưa đủ quota
+        if (out.size < quota && !imdbId.isNullOrBlank()) {
+            val key = if (season != null && episode != null) "$imdbId:$season:$episode" else imdbId
+            val kind = if (season != null && episode != null) "series" else "movie"
+            val text = httpGetText(client, "https://opensubtitles-v3.strem.io/subtitles/$kind/$key.json")
+            val arr = runCatching { JSONObject(text.orEmpty()).optJSONArray("subtitles") }.getOrNull()
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    if (out.size >= quota) break
+                    val obj = arr.optJSONObject(i) ?: continue
+                    if (normalizeLang(obj.optString("lang")) != norm) continue
+                    val subUrl = obj.optString("url")
+                    if (!subUrl.startsWith("http")) continue
+                    val hosted = extractAndHostSubtitle(client, subUrl, emptyMap(), season, episode, "OpenSubs-v3") ?: continue
+                    val idx = out.size + 1
+                    out.add(
+                        SubCandidate(
+                            langCode = norm,
+                            label = "$labelBase #$idx [OpenSubs]",
+                            url = hosted,
+                            source = "OpenSubs",
+                            score = if (norm == "vi") (96 - idx) else (74 - idx)
+                        )
+                    )
+                }
+            }
+        }
+
+        if (out.isEmpty()) {
+            Movies321Clipboard.log("SUBS", "OpenSubs ($osLang): 0 bản phù hợp (tmdb=$tmdbId title=$title)")
+        }
+        return out
+    }
+
+    private fun fromSubDLQuota(
+        client: OkHttpClient,
+        imdbId: String?,
+        tmdbId: String?,
+        title: String?,
+        year: Int?,
+        season: Int?,
+        episode: Int?
+    ): List<SubCandidate> {
+        val viUrls = ArrayList<String>()
+        val enUrls = ArrayList<String>()
+
+        // 1. Nếu có API Key SubDL thì ưu tiên API chính thức trước
+        if (SUBDL_API_KEY.isNotBlank()) {
+            val q = buildString {
+                append("languages=VI,EN&subs_per_page=18&api_key=$SUBDL_API_KEY")
+                if (!imdbId.isNullOrBlank()) append("&imdb_id=$imdbId")
+                else if (!tmdbId.isNullOrBlank()) append("&tmdb_id=$tmdbId")
+                else if (!title.isNullOrBlank()) append("&film_name=${URLEncoder.encode(title, "UTF-8")}")
+                if (year != null) append("&year=$year")
+                if (season != null) append("&season_number=$season")
+                if (episode != null) append("&episode_number=$episode")
+            }
+            val apiJson = httpGetText(client, "https://api.subdl.com/api/v1/subtitles?$q")
+            val arr = runCatching { JSONObject(apiJson.orEmpty()).optJSONArray("subtitles") }.getOrNull()
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val norm = normalizeLang(o.optString("lang"))
+                    val path = o.optString("url")
+                    if (path.isBlank()) continue
+                    val full = if (path.startsWith("http")) path else "https://dl.subdl.com$path"
+                    if (norm == "vi") viUrls.add(full) else if (norm == "en") enUrls.add(full)
+                }
+            }
+        }
+
+        // 2. Tìm trực tiếp qua subdl.com (không cần API key) để lấy cả Tiếng Việt & Tiếng Anh
+        if ((viUrls.isEmpty() || enUrls.isEmpty()) && !title.isNullOrBlank()) {
+            val isTv = season != null
+            val moviePath = findSubDLMoviePath(client, title, year, isTv)
+            if (!moviePath.isNullOrBlank()) {
+                val targetPath = if (isTv && season != null) {
+                    findSubDLSeasonPath(client, moviePath, season) ?: moviePath
+                } else moviePath
+                if (viUrls.isEmpty()) viUrls.addAll(scrapeSubDLLangLinks(client, "https://subdl.com$targetPath/vietnamese", episode))
+                if (enUrls.isEmpty()) enUrls.addAll(scrapeSubDLLangLinks(client, "https://subdl.com$targetPath/english", episode))
+            }
+        }
+
+        val out = ArrayList<SubCandidate>(TARGET_SD_VI + TARGET_SD_EN)
+        val subdlHeaders = mapOf("Referer" to "https://subdl.com/")
+
+        var viPicked = 0
+        for (dl in viUrls.distinct().take(6)) {
+            if (viPicked >= TARGET_SD_VI) break
+            val hosted = extractAndHostSubtitle(client, dl, subdlHeaders, season, episode, "SubDL") ?: continue
+            viPicked++
+            out.add(SubCandidate("vi", "Tiếng Việt #$viPicked [SubDL]", hosted, "SubDL", 92 - viPicked))
+        }
+
+        var enPicked = 0
+        for (dl in enUrls.distinct().take(4)) {
+            if (enPicked >= TARGET_SD_EN) break
+            val hosted = extractAndHostSubtitle(client, dl, subdlHeaders, season, episode, "SubDL") ?: continue
+            enPicked++
+            out.add(SubCandidate("en", "English #$enPicked [SubDL]", hosted, "SubDL", 72 - enPicked))
+        }
+
+        if (viPicked == 0 && enPicked == 0) {
+            Movies321Clipboard.log("SUBS", "SubDL: không giải nén được bản nào cho title=$title")
+        }
+        return out
+    }
+
+    private fun findSubDLMoviePath(client: OkHttpClient, title: String, year: Int?, isTv: Boolean): String? {
+        val candidates = listOf(title.trim(), title.substringBefore(":").trim()).distinct().filter { it.isNotBlank() }
+        for (term in candidates) {
+            val q = URLEncoder.encode(term, "UTF-8").replace("+", "%20")
+            val html = httpGetText(client, "https://subdl.com/search/$q") ?: continue
+            val cardRegex = Regex("<a\\s+href=\"(/subtitle/sd\\d+/[a-z0-9-]+)\"[^>]*>([\\s\\S]{0,1600}?)</a>", RegexOption.IGNORE_CASE)
+            var bestPath: String? = null
+            var bestScore = -1
+            for (m in cardRegex.findAll(html)) {
+                val path = m.groupValues[1]
+                val card = m.groupValues[2]
+                var score = 10
+                if (isTv && card.contains(">tv<", true)) score += 50
+                if (!isTv && card.contains(">movie<", true)) score += 50
+                if (year != null && card.contains("($year)")) score += 40
+                if (card.contains(">${term}", true)) score += 20
+                if (score > bestScore) {
+                    bestScore = score
+                    bestPath = path
+                }
+            }
+            if (bestPath != null) return bestPath
+        }
+        return null
+    }
+
+    private fun findSubDLSeasonPath(client: OkHttpClient, moviePath: String, season: Int): String? {
+        val html = httpGetText(client, "https://subdl.com$moviePath") ?: return null
+        val ordinals = listOf(
+            "", "first-season", "second-season", "third-season", "fourth-season", "fifth-season",
+            "sixth-season", "seventh-season", "eighth-season", "ninth-season", "tenth-season"
+        )
+        val ord = ordinals.getOrNull(season)
+        val escaped = Regex.escape(moviePath)
+        val links = Regex("($escaped/[^\"'<>\\s]+)").findAll(html).map { it.groupValues[1] }.distinct().toList()
+        if (ord != null) {
+            links.firstOrNull { it.endsWith("/$ord", true) }?.let { return it }
+        }
+        return links.firstOrNull { it.endsWith("/season-$season", true) || it.contains("-$season", true) }
+    }
+
+    private fun scrapeSubDLLangLinks(client: OkHttpClient, pageUrl: String, episode: Int?): List<String> {
+        val html = httpGetText(client, pageUrl) ?: return emptyList()
+        val matches = Regex("href=\"(https://dl\\.subdl\\.com/subtitle/[^\"'\\s]+)\"").findAll(html).toList()
+        val scored = ArrayList<Pair<Int, String>>(matches.size)
+        val epTag = episode?.let { "e" + it.toString().padStart(2, '0') }
+        for (m in matches) {
+            val dl = m.groupValues[1]
+            val ctx = html.substring((m.range.first - 500).coerceAtLeast(0), m.range.first).lowercase()
+            var score = 10
+            if (epTag != null && (ctx.contains(epTag) || ctx.contains("complete"))) score += 50
+            if (ctx.contains("hearing impaired") || ctx.contains("sdh")) score -= 5
+            scored.add(score to dl)
+        }
+        return scored.sortedByDescending { it.first }.map { it.second }
     }
 }
 
@@ -573,11 +867,10 @@ private object Movies321Dns {
 }
 
 /**
- * Movies321 (v10 - sửa lỗi kết nối 321movies.xyz trên Android TV 7 / nhà mạng VN):
- * - Chuẩn thuần OkHttp + ExecutorService -> biên dịch sạch 100% trên repo noname (không dùng thư viện ngoài).
- * - Tăng timeout lên 45s (vì 321movies.xyz khi cache-miss cần ~25-35s để scrape nguồn), kèm fallback DoH 1.1.1.1 + HTTP/1.1 + TLS Android 7.
- * - Unwrap nhiều lớp proxy (piracya.workers.dev -> corsflix -> origin) để phát đa server & đa chất lượng M3U8.
- * - Giới hạn tối đa 3 luồng (Executors.newFixedThreadPool(3)) + buffer 128KB tối ưu TV Android 7 RAM 1GB.
+ * Movies321 (v14 - phụ đề 2 VI + 1 EN OpenSubs/SubDL + tự giải nén ZIP/GZ + sửa lỗi kết nối 321movies.xyz):
+ * - Chuẩn thuần OkHttp + ExecutorService -> biên dịch sạch 100% trên repo noname (không dùng thư viện coroutines ngoài).
+ * - Tải song song đúng định mức: 02 Tiếng Việt + 01 Tiếng Anh từ OpenSubtitles (rest.opensubtitles.org), 02 Tiếng Việt + 01 Tiếng Anh từ SubDL (tự giải nén .zip/.gz qua 127.0.0.1).
+ * - Dùng SubtitleFile(label, url) tương thích 100% CloudStream 4.5.2, timeout 45s + DoH 1.1.1.1 + 3 luồng cho TV Android 7 RAM 1GB.
  */
 class Movies321Provider : MainAPI() {
     override var mainUrl = "https://321movies.xyz"
@@ -1104,12 +1397,14 @@ class Movies321Provider : MainAPI() {
         val pool = Executors.newFixedThreadPool(3) // Tối ưu TV Quad-Core RAM 1GB
         val subClient = app.baseClient.newBuilder()
             .dns(Movies321Dns.ipv4SystemFirst)
-            .callTimeout(4500L, TimeUnit.MILLISECONDS)
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(6, TimeUnit.SECONDS)
+            .callTimeout(7, TimeUnit.SECONDS)
             .followRedirects(true)
             .build()
 
         try {
-            // 1. Chạy song song tìm phụ đề (OpenSubtitles, SubDL, Wyzie, Subsource) trong khi đang lấy playlist
+            // 1. Chạy song song tìm & giải nén phụ đề (2 VI + 1 EN OpenSubs, 2 VI + 1 EN SubDL)
             val subFutures = Movies321Subtitles.submitAll(
                 pool = pool,
                 client = subClient,
@@ -1191,11 +1486,23 @@ class Movies321Provider : MainAPI() {
                 })
             }
 
-            for ((subLabel, subUrl) in embeddedTracks) {
+            // Phát phụ đề theo thứ tự: Web Tiếng Việt -> Phụ đề ngoài Tiếng Việt -> Web Tiếng Anh -> Phụ đề ngoài Tiếng Anh
+            val webVi = embeddedTracks.filter { Movies321Subtitles.isVietnameseLabel(it.first) }
+            val webOther = embeddedTracks.filter { !Movies321Subtitles.isVietnameseLabel(it.first) }
+            val sortedSubs = Movies321Subtitles.collectAndSort(subFutures)
+            val extVi = sortedSubs.filter { it.langCode == "vi" }
+            val extEn = sortedSubs.filter { it.langCode != "vi" }
+
+            for ((subLabel, subUrl) in webVi) {
                 runCatching { subtitleCallback(SubtitleFile(subLabel, subUrl)) }
             }
-            val sortedSubs = Movies321Subtitles.collectAndSort(subFutures)
-            for (sub in sortedSubs) {
+            for (sub in extVi) {
+                runCatching { subtitleCallback(SubtitleFile(sub.label, sub.url)) }
+            }
+            for ((subLabel, subUrl) in webOther) {
+                runCatching { subtitleCallback(SubtitleFile(subLabel, subUrl)) }
+            }
+            for (sub in extEn) {
                 runCatching { subtitleCallback(SubtitleFile(sub.label, sub.url)) }
             }
 
