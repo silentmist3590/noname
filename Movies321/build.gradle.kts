@@ -1,4 +1,4 @@
-version = 13
+version = 14
 
 cloudstream {
     description = "Phim lẻ và phim bộ từ 321movies.xyz (đa server, đa chất lượng M3U8, phụ đề song song VI/EN, tối ưu Android TV 7 RAM 1GB)"
