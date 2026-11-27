@@ -48,8 +48,8 @@ import javax.net.ssl.X509TrustManager
 private const val AUTO_COPY_LOG = true
 
 // Tùy chọn API key phụ đề (để trống vẫn tự động dùng các nguồn Keyless: OpenSubtitles v3, Wyzie, SubDL, Subsource)
-private const val OPENSUBTITLES_API_KEY = ""
-private const val SUBDL_API_KEY = ""
+private const val OPENSUBTITLES_API_KEY = "OHFlEutMFovpvfcNEgdZ34pPIB2IptP6"
+private const val SUBDL_API_KEY = "xHeOWlCfS9o4EKmK7OwbeOBIhfbIHr2Y"
 
 @CloudstreamPlugin
 class Movies321Plugin : Plugin() {
