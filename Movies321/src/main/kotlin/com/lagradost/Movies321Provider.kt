@@ -8,7 +8,6 @@ import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -1193,11 +1192,11 @@ class Movies321Provider : MainAPI() {
             }
 
             for ((subLabel, subUrl) in embeddedTracks) {
-                subtitleCallback(newSubtitleFile(lang = subLabel, url = subUrl))
+                runCatching { subtitleCallback(SubtitleFile(subLabel, subUrl)) }
             }
             val sortedSubs = Movies321Subtitles.collectAndSort(subFutures)
             for (sub in sortedSubs) {
-                subtitleCallback(newSubtitleFile(lang = sub.label, url = sub.url))
+                runCatching { subtitleCallback(SubtitleFile(sub.label, sub.url)) }
             }
 
             // 4. Thu kết quả probe theo thứ tự xong trước (dừng sớm khi đủ 5 nguồn sống hoặc hết 8.5s)
@@ -1269,21 +1268,25 @@ class Movies321Provider : MainAPI() {
                     if (cnt > 1) disp += " #$cnt"
 
                     // Phát Master M3U8 trước (đảm bảo âm thanh hoạt động nếu HLS v7 tách audio riêng)
-                    callback(
-                        newExtractorLink(
-                            source = fam,
-                            name = disp,
-                            url = targetUrl,
-                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = hs["Referer"] ?: ""
-                            this.headers = hs
-                            this.quality = if (isUnverified) 100
-                            else heightOf(c.label).let { if (it > 0) qualityValue(it) else Qualities.P720.value }
-                        }
-                    )
-                    emitted++
-                    found = true
+                    try {
+                        callback(
+                            newExtractorLink(
+                                source = fam,
+                                name = disp,
+                                url = targetUrl,
+                                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = hs["Referer"] ?: ""
+                                this.headers = hs
+                                this.quality = if (isUnverified) 100
+                                else heightOf(c.label).let { if (it > 0) qualityValue(it) else Qualities.P720.value }
+                            }
+                        )
+                        emitted++
+                        found = true
+                    } catch (t: Throwable) {
+                        Movies321Clipboard.log("EMIT", "$fam err: ${t.javaClass.simpleName}: ${t.message?.take(90)}")
+                    }
 
                     // Nếu là M3U8 gộp âm thanh, tách thêm từng chất lượng 1080p/720p/480p (giới hạn 2 lần để không trễ)
                     if (v.state == "ok" && isM3u8 && !v.hasSeparateAudio && m3u8Expanded < 2 && emitted < maxStreams) {
@@ -1307,6 +1310,8 @@ class Movies321Provider : MainAPI() {
                 }
                 Movies321Clipboard.log("LINKS", "Đã trả về $emitted link phát (verified=${ok.size})")
             }
+        } catch (t: Throwable) {
+            Movies321Clipboard.log("LINKS", "Lỗi loadLinks: ${t.javaClass.simpleName}: ${t.message?.take(120)}")
         } finally {
             pool.shutdownNow()
             Movies321Clipboard.flushNow()
