@@ -17,21 +17,32 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.SubtitleHelper
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.net.UnknownHostException
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 // Bật true để tự động copy log ra Clipboard (tắt thành false khi không cần debug)
 private const val AUTO_COPY_LOG = true
@@ -456,10 +467,116 @@ private object Movies321Subtitles {
 }
 
 /**
- * Movies321 (đã sửa lỗi chuyển domain 321movies.co.uk -> 321movies.xyz):
- * - Chuẩn thuần OkHttp + ExecutorService -> biên dịch sạch 100% trên repo noname.
- * - Bóc tách đa server (Rivestream/Cascade, Bcine, CineSrc, Pstream...) và đa chất lượng M3U8/MP4.
- * - Unwrap nhiều lớp proxy (piracya.workers.dev -> corsflix -> origin) để phát trực tiếp không bị 403.
+ * Bộ giải DNS IPv4-ưu-tiên + DoH (1.1.1.1 & 8.8.8.8) cho Android 7 TV Box:
+ * - Tránh treo kết nối do IPv6 lỗi trên TV Box / mạng nhà mạng VN.
+ * - Tự động chuyển sang DoH nếu DNS hệ thống bị chặn hoặc không phân giải được domain.
+ * - dohClient chỉ gọi IP thuần (1.1.1.1 / 8.8.8.8) nên không bao giờ lặp đệ quy.
+ */
+private object Movies321Dns {
+    private val cache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
+    private const val TTL_MS = 300_000L
+
+    private val dohClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(4, TimeUnit.SECONDS)
+            .readTimeout(4, TimeUnit.SECONDS)
+            .callTimeout(5, TimeUnit.SECONDS)
+            .build()
+    }
+
+    val ipv4SystemFirst: Dns = Dns { hostname ->
+        lookup(hostname, preferDohFirst = false)
+    }
+
+    val dohFirst: Dns = Dns { hostname ->
+        lookup(hostname, preferDohFirst = true)
+    }
+
+    private fun isIpLiteral(host: String): Boolean {
+        return host.all { it.isDigit() || it == '.' } || host.contains(':')
+    }
+
+    private fun isUsableIpv4(addr: InetAddress): Boolean {
+        return addr is Inet4Address && !addr.isLoopbackAddress && !addr.isAnyLocalAddress
+    }
+
+    private fun lookup(hostname: String, preferDohFirst: Boolean): List<InetAddress> {
+        if (isIpLiteral(hostname)) return Dns.SYSTEM.lookup(hostname)
+
+        val now = System.currentTimeMillis()
+        if (!preferDohFirst) {
+            cache[hostname]?.let { (ts, list) ->
+                if (now - ts < TTL_MS && list.isNotEmpty()) return list
+            }
+        }
+
+        if (preferDohFirst) {
+            val doh = queryDoh(hostname)
+            if (doh.isNotEmpty()) {
+                cache[hostname] = now to doh
+                return doh
+            }
+        }
+
+        val sysAll = runCatching { Dns.SYSTEM.lookup(hostname) }.getOrNull().orEmpty()
+        val sysV4 = sysAll.filter { isUsableIpv4(it) }
+        if (sysV4.isNotEmpty() && !preferDohFirst) {
+            cache[hostname] = now to sysV4
+            return sysV4
+        }
+
+        if (!preferDohFirst) {
+            val doh = queryDoh(hostname)
+            if (doh.isNotEmpty()) {
+                cache[hostname] = now to doh
+                return doh
+            }
+        }
+
+        if (sysV4.isNotEmpty()) return sysV4
+        if (sysAll.isNotEmpty()) return sysAll
+        throw UnknownHostException("Không phân giải được DNS cho $hostname")
+    }
+
+    private fun queryDoh(hostname: String): List<InetAddress> {
+        val encoded = URLEncoder.encode(hostname, "UTF-8")
+        val endpoints = listOf(
+            "https://1.1.1.1/dns-query?name=$encoded&type=A",
+            "https://8.8.8.8/resolve?name=$encoded&type=A"
+        )
+        for (ep in endpoints) {
+            val addrs = runCatching {
+                val req = Request.Builder()
+                    .url(ep)
+                    .header("Accept", "application/dns-json")
+                    .build()
+                dohClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use emptyList()
+                    val json = JSONObject(resp.body?.string().orEmpty())
+                    val ans = json.optJSONArray("Answer") ?: return@use emptyList()
+                    val out = ArrayList<InetAddress>(ans.length())
+                    for (i in 0 until ans.length()) {
+                        val item = ans.optJSONObject(i) ?: continue
+                        if (item.optInt("type", 0) != 1) continue
+                        val ip = item.optString("data").trim()
+                        if (ip.isEmpty()) continue
+                        val addr = InetAddress.getByName(ip)
+                        if (isUsableIpv4(addr)) out.add(addr)
+                    }
+                    out
+                }
+            }.getOrNull().orEmpty()
+            if (addrs.isNotEmpty()) return addrs
+        }
+        return emptyList()
+    }
+}
+
+/**
+ * Movies321 (v10 - sửa lỗi kết nối 321movies.xyz trên Android TV 7 / nhà mạng VN):
+ * - Chuẩn thuần OkHttp + ExecutorService -> biên dịch sạch 100% trên repo noname (không dùng thư viện ngoài).
+ * - Tăng timeout lên 45s (vì 321movies.xyz khi cache-miss cần ~25-35s để scrape nguồn), kèm fallback DoH 1.1.1.1 + HTTP/1.1 + TLS Android 7.
+ * - Unwrap nhiều lớp proxy (piracya.workers.dev -> corsflix -> origin) để phát đa server & đa chất lượng M3U8.
  * - Giới hạn tối đa 3 luồng (Executors.newFixedThreadPool(3)) + buffer 128KB tối ưu TV Android 7 RAM 1GB.
  */
 class Movies321Provider : MainAPI() {
@@ -472,8 +589,7 @@ class Movies321Provider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val playerHosts = listOf(
-        "https://321movies.xyz",
-        "https://321movies.co.uk"
+        "https://321movies.xyz"
     )
     private val img = "https://image.tmdb.org/t/p/"
     private val tmdbToken =
@@ -713,32 +829,80 @@ class Movies321Provider : MainAPI() {
         "Origin" to host
     )
 
-    private suspend fun fetchPlaylistJson(ref: Ref): Pair<String, JSONObject>? {
+    private fun buildPlaylistClients(): List<Pair<String, OkHttpClient>> {
+        val primary = app.baseClient.newBuilder()
+            .dns(Movies321Dns.ipv4SystemFirst)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .callTimeout(50, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .build()
+
+        val fallbackBuilder = OkHttpClient.Builder()
+            .dns(Movies321Dns.dohFirst)
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .callTimeout(50, TimeUnit.SECONDS)
+            .followRedirects(true)
+
+        // Android 7.0 (API 24) ROM cũ đôi khi thiếu GTS/Cloudflare Root CA -> chỉ bật trust fallback ở lượt #2
+        runCatching {
+            val trustAll = object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+            }
+            val sslCtx = SSLContext.getInstance("TLS")
+            sslCtx.init(null, arrayOf<TrustManager>(trustAll), SecureRandom())
+            fallbackBuilder.sslSocketFactory(sslCtx.socketFactory, trustAll)
+            fallbackBuilder.hostnameVerifier(HostnameVerifier { _, _ -> true })
+        }
+
+        return listOf(
+            "IPv4-45s" to primary,
+            "DoH-HTTP1.1" to fallbackBuilder.build()
+        )
+    }
+
+    private fun fetchPlaylistJson(ref: Ref): Triple<String, JSONObject, Boolean>? {
         var q = "type=${if (ref.tv) "tv" else "movie"}&id=${ref.id}"
         if (ref.tv) q += "&season=${ref.season ?: 1}&episode=${ref.episode ?: 1}"
 
+        val clients = buildPlaylistClients()
         for (host in playerHosts) {
             val url = "$host/api/player/vixsrc-playlist?$q"
             val headers = siteHeaders(host) + ("Accept" to "application/json")
-            for (attempt in 1..2) {
-                val resp = runCatching { app.get(url, headers = headers, timeout = 25L) }.getOrNull()
-                if (resp == null) {
-                    Movies321Clipboard.log("PLAYER", "$host #$attempt lỗi kết nối")
-                    continue
-                }
-                val body = runCatching { resp.text }.getOrDefault("")
-                Movies321Clipboard.log("PLAYER", "$host #$attempt HTTP ${resp.code} len=${body.length}")
-
-                val trimmed = body.trimStart()
-                if (trimmed.startsWith("<")) {
-                    // Site trả HTML (ví dụ 321movies.co.uk đã chuyển sang .xyz) -> nhảy host ngay không chờ
-                    Movies321Clipboard.log("PLAYER", "$host trả HTML, chuyển host kế tiếp")
-                    break
-                }
-                val j = runCatching { JSONObject(trimmed) }.getOrNull()
-                if (j != null && (j.optJSONArray("playlist")?.length() ?: 0) > 0) {
-                    mainUrl = host
-                    return host to j
+            for (idx in clients.indices) {
+                val attempt = idx + 1
+                val (mode, client) = clients[idx]
+                try {
+                    val rb = Request.Builder().url(url)
+                    headers.forEach { (k, v) -> rb.header(k, v) }
+                    client.newCall(rb.build()).execute().use { resp ->
+                        val body = resp.body?.string().orEmpty()
+                        val cacheSt = resp.header("x-playlist-cache") ?: "-"
+                        Movies321Clipboard.log(
+                            "PLAYER",
+                            "$host #$attempt ($mode) HTTP ${resp.code} len=${body.length} cache=$cacheSt"
+                        )
+                        val trimmed = body.trimStart()
+                        if (trimmed.startsWith("<")) {
+                            Movies321Clipboard.log("PLAYER", "$host #$attempt trả HTML, thử chế độ kế tiếp")
+                            return@use
+                        }
+                        val j = runCatching { JSONObject(trimmed) }.getOrNull()
+                        if (j != null && (j.optJSONArray("playlist")?.length() ?: 0) > 0) {
+                            mainUrl = host
+                            return Triple(host, j, idx > 0)
+                        }
+                    }
+                } catch (e: Throwable) {
+                    val detail = e.message?.take(100) ?: "no-msg"
+                    Movies321Clipboard.log(
+                        "PLAYER",
+                        "$host #$attempt ($mode) lỗi: ${e.javaClass.simpleName}: $detail"
+                    )
                 }
             }
         }
@@ -935,11 +1099,8 @@ class Movies321Provider : MainAPI() {
         var found = false
         val pool = Executors.newFixedThreadPool(3) // Tối ưu TV Quad-Core RAM 1GB
         val subClient = app.baseClient.newBuilder()
+            .dns(Movies321Dns.ipv4SystemFirst)
             .callTimeout(4500L, TimeUnit.MILLISECONDS)
-            .followRedirects(true)
-            .build()
-        val probeClient = app.baseClient.newBuilder()
-            .callTimeout(7L, TimeUnit.SECONDS)
             .followRedirects(true)
             .build()
 
@@ -956,17 +1117,19 @@ class Movies321Provider : MainAPI() {
                 episode = ref.episode ?: parsed.episode
             )
 
-            // 2. Lấy playlist từ 321movies.xyz
+            // 2. Lấy playlist từ 321movies.xyz (tự động thử IPv4-45s rồi DoH 1.1.1.1 + HTTP/1.1)
             val res = fetchPlaylistJson(ref)
             val embeddedTracks = ArrayList<Pair<String, String>>()
             val cands = mutableListOf<Cand>()
             var activeHost = mainUrl
+            var usedDohFallback = false
 
             if (res == null) {
                 Movies321Clipboard.log("LINKS", "PLAYER_OFFLINE trên tất cả host")
             } else {
                 activeHost = res.first
                 val payload = res.second
+                usedDohFallback = res.third
                 val seen = HashSet<String>()
                 val groups = payload.optJSONArray("playlist") ?: JSONArray()
                 for (gi in 0 until groups.length()) {
@@ -1002,6 +1165,14 @@ class Movies321Provider : MainAPI() {
                 }
                 Movies321Clipboard.log("LINKS", "Giải mã được ${cands.size} nguồn từ $activeHost")
             }
+
+            val probeClient = app.baseClient.newBuilder()
+                .dns(if (usedDohFallback) Movies321Dns.dohFirst else Movies321Dns.ipv4SystemFirst)
+                .connectTimeout(6, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .callTimeout(10, TimeUnit.SECONDS)
+                .followRedirects(true)
+                .build()
 
             // 3. Đưa các link video vào pool (tối đa 3 luồng) chạy trước, đồng thời thu hoạch phụ đề & gọi suspend newSubtitleFile
             val probeFutures: List<Future<Pair<Cand, Verdict>>> = cands.take(24).map { c ->
