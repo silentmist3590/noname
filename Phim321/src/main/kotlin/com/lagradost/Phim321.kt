@@ -37,7 +37,7 @@ class Phim321Plugin : Plugin() {
  * - Phụ đề: Trích xuất phụ đề sạch từ playlist nguồn, loại bỏ link chết tránh lỗi không hiển thị phụ đề khi chọn.
  */
 class Phim321Provider : MainAPI() {
-    override var mainUrl = "https://321movies.co.uk"
+    override var mainUrl = "https://321movies.xyz"
     override var name = "321Phim"
     override val hasMainPage = true
     override var lang = "vi"
