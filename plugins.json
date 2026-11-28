@@ -1,0 +1,324 @@
+[
+    {
+        "fileHash": "sha256-e7393358d001e6f208daf5b7f1d7391622dccd399b48f074161aec22b1711b79",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 90545,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AsianDrama"
+        ],
+        "version": 18,
+        "internalName": "CineFreak",
+        "description": "CineFreak catalog provider for CloudStream: homepage, search and detail pages",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/CineFreak.cs3",
+        "name": "CineFreak"
+    },
+    {
+        "iconUrl": "https://cinehd.vc/favicon.ico",
+        "fileHash": "sha256-86111608d6bc9e7a79b599ba4cd4a89104e7045e83e3025c019ab8930c6a3b6a",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 85732,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "TJ-Plugins"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 4,
+        "internalName": "CineHD",
+        "description": "CineHD (cinehd.vc) - Movies & TV Series with Vietsub, 1080p Original Audio & Fast HLS Servers",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/CineHD.cs3",
+        "name": "CineHD"
+    },
+    {
+        "iconUrl": "https://cinejoy.to/favicon.ico",
+        "fileHash": "sha256-b6c3dc7f503d0cdcc99614c69c214b89279cc112e21c70f4181295e717a2b8e4",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 65501,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "TJ-Plugins"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 16,
+        "internalName": "CineJoy",
+        "description": "CineJoy (cinejoy.to) - Movies & TV series",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/CineJoy.cs3",
+        "name": "CineJoy"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=hicine.sbs&sz=%size%",
+        "fileHash": "sha256-52b7b6facfae9e3d78d43d18a3c4d061d8fb30bf33558f62ba5f5cd94f647c32",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 68069,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 2,
+        "internalName": "Hicine",
+        "description": "HiCine - Bollywood & Hollywood movies, series, K-drama, anime (Hindi dual-audio). Direct FSL / Server 1 / PixelDrain links.",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/Hicine.cs3",
+        "name": "Hicine"
+    },
+    {
+        "iconUrl": "https://archive.org/favicon.ico",
+        "fileHash": "sha256-0c2b175f93241867ac5daba88fc7db1682cf64ad2eab93bc9af9b8afd324d101",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 15999,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie"
+        ],
+        "version": 2,
+        "internalName": "InternetArchive",
+        "description": "Phim thu\u1ed9c ph\u1ea1m vi c\u00f4ng c\u1ed9ng t\u1eeb Internet Archive (archive.org)",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/InternetArchive.cs3",
+        "name": "InternetArchive"
+    },
+    {
+        "fileHash": "sha256-0ca344c8ee35c2448490199b8259c8a4518788aa3f1ee2630539c3ad2a3273b5",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 30344,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AsianDrama"
+        ],
+        "version": 4,
+        "internalName": "Kkphim",
+        "description": "Xem phim t\u1eeb API c\u1ee7a kkphim.com",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/Kkphim.cs3",
+        "name": "Kkphim"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=moviesapi.to&sz=%size%",
+        "fileHash": "sha256-59c9d11f09fbacb37f183b8ec0394e81bbb5e1b239fe7a7869367082401bd0dd",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 45758,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 9,
+        "internalName": "MovieAPI",
+        "description": "Phim & TV Series t\u1eeb moviesapi.to (TMDB / IMDb ID)",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/MovieAPI.cs3",
+        "name": "MovieAPI"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=movieshubhd.com&sz=%size%",
+        "fileHash": "sha256-b3d61d6e9dfcd34ced67f8671fd24b0221b82adf67207f96c29eb0764a2c2888",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 40215,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 3,
+        "internalName": "Moviehub",
+        "description": "MoviesHubHD (movieshubhd.com): danh m\u1ee5c TMDB + stream tr\u1ef1c ti\u1ebfp t\u1eeb m\u1ea1ng player VidNest (Hindi/English, \u0111a \u00e2m thanh, ph\u1ee5 \u0111\u1ec1)",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/Moviehub.cs3",
+        "name": "Moviehub"
+    },
+    {
+        "iconUrl": "https://321movies.xyz/favicon.ico",
+        "fileHash": "sha256-93ce050cd5a2b766617e4576d3cfb6b715b35de0f67cd7bd79f5b30f27800e1f",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 73882,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 14,
+        "internalName": "Movies321",
+        "description": "Phim l\u1ebb v\u00e0 phim b\u1ed9 t\u1eeb 321movies.xyz (\u0111a server, \u0111a ch\u1ea5t l\u01b0\u1ee3ng M3U8, ph\u1ee5 \u0111\u1ec1 song song VI/EN, t\u1ed1i \u01b0u Android TV 7 RAM 1GB)",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/Movies321.cs3",
+        "name": "Movies321"
+    },
+    {
+        "fileHash": "sha256-c83e54ae2c10ccd01c2ef36d837ab48808e193960aff7fa9ed3a7570e1247dcf",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 79890,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Local build"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "Cartoon"
+        ],
+        "version": 2,
+        "internalName": "NgonTV",
+        "description": "NgonTV movie and series provider. Uses embedded playback hosts when available.",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/NgonTV.cs3",
+        "name": "NgonTV"
+    },
+    {
+        "fileHash": "sha256-15ac1392caf82a29207ee4dd7f3b9608dbe3177ab4dbd35d200d4696adbd0ba2",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 111551,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Local build"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "Cartoon"
+        ],
+        "version": 31,
+        "internalName": "NguonTV",
+        "description": "NguonTV movie and series provider. Ph\u1ee5 \u0111\u1ec1 Vi\u1ec7t/Anh, t\u1ef1 \u0111\u1ed9ng \u0111\u1ed5i ch\u1ea5t l\u01b0\u1ee3ng theo m\u1ea1ng. VPN may be needed for some titles.",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/NguonTV.cs3",
+        "name": "NguonTV"
+    },
+    {
+        "iconUrl": "https://321movies.co.uk/favicon.ico",
+        "fileHash": "sha256-0a6b3d61435e338d411f75c27c3f46057cfc53ea197d95741f2870b8f2e3c625",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 41128,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 2,
+        "internalName": "Phim321",
+        "description": "Phim l\u1ebb v\u00e0 phim b\u1ed9 t\u1eeb 321movies.co.uk (danh m\u1ee5c TMDB, link HLS t\u1eeb player c\u1ee7a site, m\u1ed7i link \u0111\u01b0\u1ee3c ki\u1ec3m tra tr\u01b0\u1edbc)",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/Phim321.cs3",
+        "name": "Phim321"
+    },
+    {
+        "iconUrl": "https://phim.nguonc.com/favicon.ico",
+        "fileHash": "sha256-e782ed89be899974a39a57983fddfd15e4979568dbfe1d40ad7512810fc9248d",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 38395,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "AsianDrama"
+        ],
+        "version": 29,
+        "internalName": "PhimNguonC",
+        "description": "Xem phim t\u1eeb ngu\u1ed3n phim.nguonc.com tr\u00ean CloudStream",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/PhimNguonC.cs3",
+        "name": "PhimNguonC"
+    },
+    {
+        "fileHash": "sha256-168bf0c55e1122fd3bd13484962a60499d5faa1d36e9dd233584eead790b5248",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 49075,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 7,
+        "internalName": "PhimVNProvider",
+        "description": "Plugin PhimVN",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/PhimVNProvider.cs3",
+        "name": "PhimVNProvider"
+    },
+    {
+        "iconUrl": "https://vsmov.com/VSmov.png",
+        "fileHash": "sha256-331ac9ff4ebd1707e7671c40d2349cbdb46517e877298f8f11eeb63e9528139e",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/silentmist3590/noname",
+        "fileSize": 58059,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "silentmist3590"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AsianDrama"
+        ],
+        "version": 8,
+        "internalName": "VsMov",
+        "description": "Xem phim t\u1eeb API c\u00f4ng khai c\u1ee7a vsmov.com",
+        "url": "https://raw.githubusercontent.com/silentmist3590/noname/builds/VsMov.cs3",
+        "name": "VsMov"
+    }
+]

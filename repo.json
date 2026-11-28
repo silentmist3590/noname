@@ -1,0 +1,8 @@
+{
+  "name": "Noname CloudStream Repository",
+  "description": "Kho plugin phim tiếng Việt: NguonTV, PhimNguonC, Kkphim, VsMov, InternetArchive",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/silentmist3590/noname/builds/plugins.json"
+  ]
+}
